@@ -1,0 +1,8 @@
+# JetBrains
+.idea
+
+/target
+
+# Claude Code local-only scratch (git worktrees, machine-specific settings)
+.claude/worktrees/
+.claude/settings.local.json
