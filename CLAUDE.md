@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-`vault` is a single Rust binary that injects relevant project context into every Claude Code prompt before it reaches the Anthropic API — at zero Claude token cost. It indexes stable artifacts (proto contracts, design docs, conventions, CLAUDE.md files) into a local SQLite store and decorates prompts via a pre-send hook using Gemma for local routing.
+`vault` is a single Rust binary that injects relevant project context into every Claude Code prompt before it reaches the Anthropic API. It indexes stable artifacts (proto contracts, design docs, conventions, CLAUDE.md files) into a local SQLite store and decorates prompts via a pre-send hook.
+
+Routing is local-first via Gemma (zero Claude token cost). When Gemma is unreachable, vault falls back to Anthropic Haiku via API — minimal cost (~$0.0002/hook call with prompt caching) so the hook keeps working on machines without MLX.
 
 ## Build & Run
 
@@ -20,19 +22,21 @@ cargo run -- <subcommand>    # e.g. cargo run -- diagnose "what does BuildReques
 
 Three execution modes from one binary, dispatched by subcommand in `main.rs`:
 - **`vault hook`** — pre-send hook (registered globally in `~/.claude/settings.json`); reads prompt JSON from stdin, returns decorated prompt to stdout
-- **`vault index sync <repo>`** — explicit manual indexing; Gemma classifies files, you confirm, chunks written to SQLite
+- **`vault index sync <repo>`** — explicit manual indexing; the classifier (Gemma local or Haiku fallback) labels files, you confirm, chunks written to SQLite
 - **`vault diagnose "<prompt>"`** — full retrieval trace for tuning alpha and token budget
 
 ### Request Flow (hook mode)
 
 ```
-prompt → vault hook → Gemma (localhost:8080) extracts query plan
+prompt → vault hook → Router extracts query plan
+                      ├── primary:  Gemma at localhost:8080 (zero token cost)
+                      └── fallback: Haiku via Anthropic API (~$0.0002/call cached)
        → SQLite hybrid query (FTS5 BM25 + sqlite-vec cosine)
        → score merge (α=0.6 BM25, 0.4 cosine) + token budget (10k)
        → prepend <{domain-context}> block → Claude Code → Anthropic API
 ```
 
-Gemma returns `{ skip: true }` for prompts that need no context — immediate passthrough with no SQLite query. 3-second timeout on all Gemma calls; silent passthrough on timeout or unavailability.
+The router returns `{ skip: true }` for prompts that need no context — immediate passthrough with no SQLite query. 3-second timeout on all router calls (Gemma or Haiku); silent passthrough on timeout or unavailability.
 
 ### Key modules
 
@@ -40,20 +44,47 @@ Gemma returns `{ skip: true }` for prompts that need no context — immediate pa
 |------|---------------|
 | `src/hook/mod.rs` | stdin→stdout hook protocol, full pipeline entry |
 | `src/store/schema.rs` | embedded SQL, migration runner |
-| `src/store/writer.rs` | upsert project/document/chunk/vec |
+| `src/store/writer.rs` | upsert + sync-time prune (file/document/chunk diff); reconciles deletions every sync |
 | `src/store/query.rs` | FTS5 + sqlite-vec hybrid retrieval, score merge, budget trim |
-| `src/retrieve/router.rs` | Gemma query plan extraction |
+| `src/retrieve/router/mod.rs` | Router trait + auto/gemma/haiku mode selection |
+| `src/retrieve/router/gemma.rs` | Local Gemma impl (mlx_lm.server HTTP) |
+| `src/retrieve/router/haiku.rs` | Anthropic Haiku impl (with prompt caching) |
 | `src/retrieve/hybrid.rs` | BM25 + cosine score merge |
 | `src/retrieve/budget.rs` | token-aware chunk selection |
 | `src/parse/` | per-language parsers (proto, go, rust, openapi, markdown) |
-| `src/index/classify.rs` | Gemma content classification during sync |
-| `src/embed/mlx.rs` | nomic-embed-text embeddings via MLX subprocess |
+| `src/index/classify/mod.rs` | Classifier trait + auto/gemma/haiku selection |
+| `src/index/classify/gemma.rs` | Local Gemma classifier |
+| `src/index/classify/haiku.rs` | Anthropic Haiku classifier (cost prompt on first use) |
+| `src/embed/tei.rs` | nomic-embed-text-v1.5 embeddings via TEI HTTP (`localhost:8081`) |
+| `src/tei/launcher.rs` | `vault tei start\|stop\|status\|logs` — spawn TEI from `[embeddings].launcher_cmd` with env scrubbing; PID + log in `~/.vault/`; cross-platform detach |
+
+### Router selection
+
+Both the runtime router (hook mode) and the index-time classifier follow the same trait-based pattern. Mode is set in `vault.toml`:
+
+```toml
+[router]
+mode  = "auto"      # "auto" | "gemma" | "haiku"
+model = "haiku"     # alias — vault resolves to the current latest Haiku model
+
+[classifier]
+mode  = "auto"
+model = "haiku"
+```
+
+- **`auto`** (default) — probe `localhost:8080` once at startup with a 200ms timeout. If reachable, use Gemma; otherwise fall back to Haiku. Decision is cached for the process lifetime; no per-call probing.
+- **`gemma`** — force local Gemma. Silent passthrough if unavailable (preserves the zero-token-cost guarantee).
+- **`haiku`** — force remote Haiku. Requires `ANTHROPIC_API_KEY`.
+
+Haiku impls use `cache_control: ephemeral` on the system block so the JSON schema and few-shot examples don't burn input tokens on every call. Without caching, hook overhead is roughly 25× higher.
+
+`vault index sync` shows a one-time cost estimate the first time a session falls back to Haiku for classification — e.g. *"Gemma not detected. Use Haiku for classification? Estimated cost: ~$0.03 for 200 files. [y/N]"*.
 
 ### Runtime data
 
 ```
 ~/.vault/vault.db      # SQLite store — projects, documents, chunks, FTS5, vec, retrieval_log
-~/.vault/vault.toml    # domain assignments, context tags, classification cache, tuning defaults
+~/.vault/vault.toml    # domain assignments, context tags, router/classifier mode, classification cache, tuning defaults
 ```
 
 Nothing is written to indexed repositories.
@@ -63,27 +94,39 @@ Nothing is written to indexed repositories.
 The store layer must come before retrieval; `vault diagnose` must work before parsers:
 
 ```
-Step 0  Confirm embedding dims (curl mlx_lm.server /v1/embeddings) — locks chunks_vec FLOAT[N]
+Step 0  Confirm embedding stack (TEI reachable, nomic-embed-text-v1.5 = 768 dims) — locks chunks_vec FLOAT[768]
 Step 1  store/schema.rs
-Step 2  store/writer.rs
+Step 2  store/writer.rs (upsert + sync-time prune)
 Step 3  store/query.rs
 Step 4  vault diagnose — validate retrieval with manually seeded data before building parsers
 Step 5  parse/proto.rs
 Step 6  parse/go_source.rs
 Step 7  parse/rust_source.rs
-Step 8  embed/mlx.rs
-Step 9  index/classify.rs
-Step 10 retrieve/router.rs
+Step 8a embed/tei.rs                          — HTTP client against TEI /embeddings
+Step 8b tei/launcher.rs                       — `vault tei start|stop|status|logs` subcommands
+Step 9  index/classify/{mod,gemma,haiku}.rs   — Classifier trait + impls (cost prompt on first Haiku use)
+Step 10 retrieve/router/{mod,gemma,haiku}.rs  — Router trait + impls (auto-mode startup probe, prompt caching)
 Step 11 retrieve/hybrid.rs
 Step 12 retrieve/budget.rs
 Step 13 hook/mod.rs
 Step 14 first-run UX (domain + classification prompts on new project sync)
 ```
 
-## Open Decisions (must resolve before writing schema)
+## Embeddings
 
-- **Embedding dimensions** — `chunks_vec FLOAT[N]` is locked at schema creation. Confirm Gemma 4 output dims via `curl http://localhost:8080/v1/embeddings` before Step 1.
-- **Embedding approach** — fastembed-rs (Rust-native, recommended) vs separate mlx-embeddings server. Decision locks dimensions and whether an extra process is needed.
+See `docs/embeddings.md` for the full write-up. Current decisions (subject to change):
+
+- **Backend** — HuggingFace [text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference) (TEI), an official Rust HTTP server. Single binary, no Python deps, OpenAI-compatible `/embeddings` endpoint. Endpoint defaults to `http://localhost:8081`.
+- **Model** — `nomic-ai/nomic-embed-text-v1.5`. Apply the `search_document:` prefix at index time and `search_query:` at query time.
+- **Dimensions** — **768, locked**. `chunks_vec FLOAT[768]` is fixed at schema creation; changing the model means a full reindex.
+
+`vault index sync` requires TEI reachable (hard error if not). At hook time, TEI unreachable falls under the same 3-second silent passthrough as any other backend failure.
+
+The remaining open knobs are empirical, not blocking:
+
+- α tuning (BM25 vs cosine weight) — start 0.6, validate with `vault diagnose`
+- Token budget ceiling — start 10k, validate with `vault diagnose`
+- Context block ordering — score-descending within project grouping for now
 
 ## Chunking
 
@@ -123,6 +166,21 @@ Confirm exact hook key against Claude Code docs — wrong key = silent failure w
 ## Context Tags
 
 Tags are domain-level (not project-level), configured in `vault.toml`. Adding a new domain requires a two-file change: `vault.toml` + `~/.claude/CLAUDE.md` (so Claude knows how to interpret the new tag).
+
+## Security
+
+Vault is on the hot path of every Claude Code prompt. Full design constraints, threat model, and trust-boundary table are in `docs/security.md`. Non-negotiable rules to apply when writing code:
+
+- **Indexed content is untrusted data, not instructions.** The global `~/.claude/CLAUDE.md` framing handles this for Claude; vault never sanitizes chunk text. Don't change that without revisiting the trust model.
+- **SQL parameter binding everywhere.** Router output (`projects`, `type_names`, `topics`, `doc_types`, `languages`) is untrusted-shaped — bind it via rusqlite's named/positional params. Never `format!` into SQL.
+- **`ANTHROPIC_API_KEY` is environment-only.** Never read it from `vault.toml` or any file vault writes. Never log or echo it; redact in `vault diagnose`.
+- **Loopback only.** Vault talks to `127.0.0.1:8080` (mlx_lm.server) and `127.0.0.1:8081` (TEI). Treating localhost as authoritative is a documented assumption, not a guarantee.
+- **`~/.vault/` is `0700`, files inside `0600`.** Indexed content is plaintext and may be proprietary.
+- **Indexer never follows symlinks** and is bounded to the canonical repo root. Default exclusion list (`.env`, `*.pem`, `.ssh/**`, etc.) is non-removable in v1.
+- **Index-time secret pre-scan.** Chunks matching common secret patterns (AWS keys, GitHub/Anthropic/OpenAI tokens, JWT, PEM headers) are dropped before storage.
+- **Classifier sees filename + extension + first 1KB only**, never full files. Full content reaches Anthropic only via retrieval-time injection, which the user controls via `vault diagnose`.
+- **Hook fails open.** Any error → stdin to stdout passthrough, exit 0. Never block the user.
+- **`~/.claude/settings.json` should reference vault by absolute path** (not `vault hook` resolved via PATH).
 
 ## v1 Scope Boundaries
 

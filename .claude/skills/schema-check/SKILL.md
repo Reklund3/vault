@@ -22,9 +22,9 @@ The `vault` project's SQLite schema is locked once the database is created. Vect
 3. **Compare against this checklist:**
    - `projects`: `id` PK, `name` UNIQUE NOT NULL, `repo_path`, `created_at` NOT NULL
    - `documents`: `doc_type` CHECK in `('contract','plan','convention','meta')`, `content_hash` NOT NULL (sha256), `UNIQUE(project_id, source_path)`
-   - `chunks`: `language` CHECK in `('go','rust','scala','proto','openapi','helm','markdown','unknown')`, `project_id` and `doc_type` denormalized, `token_est` NOT NULL, `ON DELETE CASCADE` from documents
+   - `chunks`: `language` CHECK in `('go','rust','scala','proto','openapi','helm','markdown','unknown')`, `project_id` and `doc_type` denormalized, `content_hash` NOT NULL (sha256 of chunk body, distinct from `documents.content_hash`), `token_est` NOT NULL, `ON DELETE CASCADE` from documents, `UNIQUE(document_id, label)` for sync-time prune diffing
    - `chunks_fts`: `USING fts5(label, content, content='chunks', content_rowid='id', tokenize='porter unicode61')` — must be content-table linked, must use porter stemming
-   - `chunks_vec`: `USING vec0(chunk_id INTEGER PRIMARY KEY, embedding FLOAT[N])` — N must match `[mlx].embed_dims` in `vault.toml`. **Flag if N is unset or doesn't match.**
+   - `chunks_vec`: `USING vec0(chunk_id INTEGER PRIMARY KEY, embedding FLOAT[N])` — N must match `[embeddings].dims` in `vault.toml` (currently 768 for `nomic-ai/nomic-embed-text-v1.5`). **Flag if N is unset or doesn't match.**
    - Triggers: `chunks_ai` (insert), `chunks_au` (update — must delete then insert in FTS5), `chunks_ad` (delete) all present and correct
    - `retrieval_log` present with `prompt_hash`, `query_plan` (TEXT for JSON), `chunks_returned`, `tokens_injected`
 
@@ -33,7 +33,7 @@ The `vault` project's SQLite schema is locked once the database is created. Vect
    - ✗ with a specific diff for any deviation
    - ⚠ for any field present in the spec but not in the implementation (or vice versa)
 
-5. **Embedding dimension gate.** If `chunks_vec` uses a placeholder dimension (e.g. `FLOAT[768]` without confirmation, or `FLOAT[0]`), block with a clear message: "Step 0 not complete — confirm Gemma 4 embedding dimensions via `curl http://localhost:8080/v1/embeddings` before locking schema."
+5. **Embedding dimension gate.** If `chunks_vec` uses a placeholder dimension (e.g. `FLOAT[0]`), or `vault.toml` lacks an `[embeddings]` block with `dims`, block with a clear message: "Step 0 not complete — stand up TEI on `localhost:8081` with `nomic-ai/nomic-embed-text-v1.5` (768 dims) and write `[embeddings]` block in `vault.toml` before locking schema."
 
 ## Output format
 
@@ -44,7 +44,7 @@ Schema Check — src/store/schema.rs
 ✓ documents table
 ✗ chunks.language CHECK missing 'helm' value
 ✓ chunks_fts virtual table
-⚠ chunks_vec uses FLOAT[768] but vault.toml embed_dims unset — confirm Step 0
+⚠ chunks_vec uses FLOAT[768] but vault.toml [embeddings].dims unset — confirm Step 0
 ✓ chunks_ai trigger
 ✗ chunks_au trigger missing — required for FTS5/chunks sync on update
 ✓ chunks_ad trigger
