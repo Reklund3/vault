@@ -1,0 +1,42 @@
+use crate::retrieve::QueryPlan;
+use crate::store::traits::{Store, StoreError};
+use crate::store::types::{ChunkWithEmbedding, Document, Hit, RetrievalLogEntry};
+
+// Placeholder for the future distributed backend (tsvector + pgvector).
+// Methods stay as `todo!()` until vault gains a real distribution requirement.
+pub struct PostgresStore {}
+
+impl Store for PostgresStore {
+    fn migrate(&mut self) -> Result<(), StoreError> {
+        todo!()
+    }
+
+    fn upsert_document(
+        &mut self,
+        _doc: &Document,
+        _chunks: &[ChunkWithEmbedding],
+    ) -> Result<(), StoreError> {
+        todo!()
+    }
+
+    fn prune_orphans(
+        &mut self,
+        _project_id: i64,
+        _kept_paths: &[String],
+    ) -> Result<usize, StoreError> {
+        todo!()
+    }
+
+    fn hybrid_search(
+        &self,
+        _plan: &QueryPlan,
+        _embedding: &[f32],
+        _alpha: f32,
+    ) -> Result<Vec<Hit>, StoreError> {
+        todo!()
+    }
+
+    fn log_retrieval(&mut self, _entry: &RetrievalLogEntry) -> Result<(), StoreError> {
+        todo!()
+    }
+}

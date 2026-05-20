@@ -70,6 +70,37 @@ impl Config {
         let config: Config = toml::from_str(&content)?;
         Ok(config)
     }
+
+    pub fn embedding_dim(&self) -> usize {
+        self.embeddings.dims as usize
+    }
+
+    pub fn embedding_model(&self) -> &str {
+        &self.embeddings.model
+    }
+
+    pub fn embedding_endpoint(&self) -> &str {
+        &self.embeddings.endpoint
+    }
+
+    pub fn alpha(&self) -> f32 {
+        self.defaults.alpha
+    }
+
+    pub fn token_budget(&self) -> u16 {
+        self.defaults.token_budget
+    }
+
+    pub fn min_score(&self) -> f32 {
+        self.defaults.min_score
+    }
+
+    pub fn db_path(&self) -> Result<PathBuf, ConfigError> {
+        Ok(home_dir()
+            .ok_or(ConfigError::HomeNotFound)?
+            .join(CONFIG_DIR)
+            .join(CONFIG_DB))
+    }
 }
 
 impl Default for Config {
@@ -78,7 +109,7 @@ impl Default for Config {
             defaults: Defaults {
                 context_tag: "vault-context".to_string(),
                 token_budget: 10000,
-                alpha: 0.5,
+                alpha: 0.6,
                 min_score: 0.15,
                 timeout: 3,
             },

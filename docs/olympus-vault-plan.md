@@ -586,10 +586,12 @@ vault/                           -- source repository
     ├── mcp/
     │   └── mod.rs               -- MCP stdio protocol (optional future)
     ├── store/
-    │   ├── mod.rs
-    │   ├── schema.rs            -- embedded SQL, migration runner
-    │   ├── writer.rs            -- upsert documents + chunks
-    │   └── query.rs             -- FTS5 + vec retrieval
+    │   ├── mod.rs               -- re-exports Store, StoreError, SqliteStore, types
+    │   ├── traits.rs            -- Store trait + StoreError (backend-neutral)
+    │   ├── types.rs             -- Document, Chunk, ChunkWithEmbedding, Hit, RetrievalLogEntry
+    │   ├── schema.rs            -- SQLite DDL, sqlite-vec auto-extension, migration runner
+    │   ├── sqlite_store.rs      -- SqliteStore impl: upsert/prune/hybrid_search/log (Steps 2+3+11)
+    │   └── postgresql_store.rs  -- stub for future distributed backend
     ├── parse/
     │   ├── mod.rs               -- Parser trait + registry (ext → parser)
     │   ├── proto.rs
@@ -601,22 +603,49 @@ vault/                           -- source repository
     ├── embed/
     │   └── tei.rs               -- nomic-embed-text-v1.5 via TEI HTTP (localhost:8081)
     ├── retrieve/
+    │   ├── mod.rs               -- QueryPlan, RouterOutput
     │   ├── router/
     │   │   ├── mod.rs           -- Router trait + auto/gemma/haiku selection
     │   │   ├── gemma.rs         -- Gemma impl (mlx_lm.server HTTP)
     │   │   └── haiku.rs         -- Haiku impl (Anthropic API, prompt caching)
-    │   ├── hybrid.rs            -- FTS5 + vec merge + scoring
     │   └── budget.rs            -- token-aware chunk selection
-    └── index/
-        └── classify/
-            ├── mod.rs           -- Classifier trait + auto/gemma/haiku selection
-            ├── gemma.rs         -- Gemma classifier
-            └── haiku.rs         -- Haiku classifier (cost-prompt on first session use)
+    │
+    │   -- NOTE: score merge lives in store/sqlite_store.rs::hybrid_search.
+    │   -- The Store trait's hybrid_search returns merged Hits with component
+    │   -- scores preserved, so callers (vault diagnose, hook) consume one
+    │   -- ranked list. retrieve/hybrid.rs from earlier drafts is absorbed.
+    ├── index/
+    │   └── classify/
+    │       ├── mod.rs           -- Classifier trait + auto/gemma/haiku selection
+    │       ├── gemma.rs         -- Gemma classifier
+    │       └── haiku.rs         -- Haiku classifier (cost-prompt on first session use)
+    └── types.rs                 -- DocType, Language (cross-cutting domain enums)
 
 ~/.vault/                        -- runtime data (never in source repo)
 ├── vault.db                     -- SQLite store
 └── vault.toml                   -- domains, classification cache, defaults
 ```
+
+### Store backend abstraction
+
+`Store` is a trait, not a concrete struct. `SqliteStore` is the v1 implementation;
+`PostgresStore` is a future placeholder for distributed deployments. This deviates
+from earlier drafts that split SQLite logic across `writer.rs` and `query.rs` —
+both now live as methods on `SqliteStore`. The trait surface is:
+
+```rust
+pub trait Store {
+    fn migrate(&mut self) -> Result<(), StoreError>;
+    fn upsert_document(&mut self, doc: &Document, chunks: &[ChunkWithEmbedding]) -> Result<(), StoreError>;
+    fn prune_orphans(&mut self, project_id: i64, kept_paths: &[String]) -> Result<usize, StoreError>;
+    fn hybrid_search(&self, plan: &QueryPlan, embedding: &[f32]) -> Result<Vec<Hit>, StoreError>;
+    fn log_retrieval(&mut self, entry: &RetrievalLogEntry) -> Result<(), StoreError>;
+}
+```
+
+Operations are vault's domain verbs, not SQL primitives. `Hit` carries
+`bm25_score`, `cosine_score`, and `final_score` separately so `vault diagnose`
+can show component contributions without exposing per-backend query shapes.
 
 
 ---
@@ -949,10 +978,22 @@ Bottom-up so retrieval is testable before the full stack is wired:
 ```
 Step 0  confirm embed stack  — TEI reachable at localhost:8081 with nomic-embed-text-v1.5
                               (768 dims). Write [embeddings] block in vault.toml. chunks_vec
-                              FLOAT[768] is locked at schema creation.
-Step 1  store/schema.rs     — embedded SQL, migration runner, open DB
-Step 2  store/writer.rs     — upsert project, document, chunk, vec
-Step 3  store/query.rs      — FTS5 + vec queries, score merge, budget trim
+                              FLOAT[768] is locked at schema creation. See docs/runbook.md
+                              for the manual TEI launch until Step 8b lands.
+Step 1  store/schema.rs     — embedded SQL, migration runner, open DB,
+                              sqlite-vec auto-extension registration
+Step 2  store/sqlite_store::upsert_document  — replaces writer.rs from earlier drafts.
+                              Upserts document on (project_id, source_path); replaces
+                              its chunks + embeddings transactionally; manual chunks_vec
+                              cleanup since virtual tables have no FK cascade.
+                              Pair: prune_orphans for sync-time deletion reconciliation.
+Step 3  store/sqlite_store::hybrid_search    — replaces query.rs from earlier drafts.
+                              FTS5 MATCH (escaped, parameter-bound) + sqlite-vec
+                              vec_distance_cosine; merged by chunk_id, BM25 normalized
+                              against the result-set max, blended at alpha=0.6.
+                              Budget trim moved to Step 12 (retrieve/budget.rs) so the
+                              store stays scoring-pure and the budget layer can tune
+                              independently.
 Step 4  vault diagnose      — CLI command to test retrieval manually with real data
                               validates schema and scoring before parsers exist
 Step 5  parse/proto.rs      — first parser, cleanest boundary detection
@@ -973,7 +1014,10 @@ Step 9  index/classify/{mod,gemma,haiku}.rs   — Classifier trait + Gemma + Hai
                                                 cost-estimate prompt on first Haiku use
 Step 10 retrieve/router/{mod,gemma,haiku}.rs  — Router trait + Gemma + Haiku impls
                                                 auto-mode startup probe, prompt caching
-Step 11 retrieve/hybrid.rs  — score merge
+Step 11 retrieve/hybrid.rs  — ABSORBED into Step 3 (sqlite_store::hybrid_search).
+                              Originally planned as a separate score-merge file; the
+                              trait-abstraction decision means each backend owns its
+                              own merge logic. Skip this step.
 Step 12 retrieve/budget.rs  — token budget selection
 Step 13 hook/mod.rs         — stdin/stdout protocol, full pipeline wired
 Step 14 first-run UX        — new project prompts during vault index sync (domain, classification cache)
