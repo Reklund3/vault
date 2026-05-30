@@ -7,6 +7,9 @@ use crate::store::Hit;
 #[derive(Debug, Clone)]
 pub struct BudgetedSelection {
     pub chunks: Vec<Hit>,
+    // Surfaced for `RetrievalLogEntry.tokens_injected` once the hook starts
+    // writing retrieval-log rows. Until then it has no production reader.
+    #[allow(dead_code)]
     pub tokens_used: u32,
 }
 

@@ -1,9 +1,12 @@
 pub mod budget;
 mod router;
 
-pub use router::{ResolvedBackend, Router, RouterError, resolve_backend};
+pub use router::{Router, build_router};
+// Only the hook's test-only Router stub needs to name RouterError directly.
+// Production code only sees it inside the `Result<..., _>` from `Router::plan`,
+// which the hook chains through `.ok()?` without referring to the variant.
 #[cfg(test)]
-pub(crate) use router::StubRouter;
+pub(crate) use router::{RouterError, StubRouter};
 
 use crate::types::{DocType, Language};
 use serde::{Deserialize, Serialize};

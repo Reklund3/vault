@@ -139,6 +139,16 @@ pub fn resolve_backend(config: &Config) -> ResolvedBackend {
     resolve(config.router_mode(), config.mlx_endpoint())
 }
 
+/// Construct the configured router as a trait object. Mirrors the
+/// classifier-side factory pattern so the hook can hold a `Box<dyn Router>`
+/// without caring which backend is live.
+pub fn build_router(config: &Config) -> Result<Box<dyn Router>, RouterError> {
+    match resolve_backend(config) {
+        ResolvedBackend::Gemma => Ok(Box::new(GemmaRouter::from_config(config)?)),
+        ResolvedBackend::Haiku => Ok(Box::new(HaikuRouter::from_config(config)?)),
+    }
+}
+
 fn resolve(mode: &str, mlx_endpoint: &str) -> ResolvedBackend {
     match mode {
         "gemma" => ResolvedBackend::Gemma,
@@ -312,6 +322,68 @@ mod tests {
     #[test]
     fn build_user_prompt_is_pass_through() {
         assert_eq!(build_user_prompt("what does BuildRequest need?"), "what does BuildRequest need?");
+    }
+
+    fn config_with_mode(mode: &str) -> Config {
+        // Parse a minimal vault.toml so we can exercise build_router without
+        // poking Config's private fields.
+        let toml = format!(
+            r#"
+[defaults]
+context_tag = "vault-context"
+token_budget = 10000
+alpha = 0.6
+min_score = 0.15
+timeout = 3
+
+[router]
+mode = "{mode}"
+model = "haiku"
+timeout_secs = 3
+
+[mlx]
+endpoint = "http://127.0.0.1:1"
+router_model = "test-model"
+
+[embeddings]
+endpoint = "http://localhost:8081"
+model = "nomic-ai/nomic-embed-text-v1.5"
+dims = 768
+"#
+        );
+        toml::from_str(&toml).expect("test config parses")
+    }
+
+    #[test]
+    fn build_router_constructs_gemma_in_gemma_mode() {
+        // Forcing `gemma` mode skips the probe and goes straight to
+        // GemmaRouter::from_config, which only needs a parseable endpoint and a
+        // model name — neither makes a network call at construction time.
+        let cfg = config_with_mode("gemma");
+        let router = build_router(&cfg).expect("build");
+        // The trait object has no public type identity; the assertion is that
+        // construction succeeded without panicking or returning MissingApiKey.
+        let _ = router;
+    }
+
+    #[test]
+    fn build_router_haiku_mode_without_key_fails() {
+        // Forcing `haiku` mode requires ANTHROPIC_API_KEY; ensure the absence
+        // surfaces as MissingApiKey rather than panicking.
+        let prior = std::env::var("ANTHROPIC_API_KEY").ok();
+        // SAFETY: tests run single-threaded under cargo test by default for
+        // these env-var manipulations; this is the same convention used in the
+        // classifier tests.
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+        let cfg = config_with_mode("haiku");
+        let err = match build_router(&cfg) {
+            Ok(_) => panic!("expected MissingApiKey, got Ok(router)"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, RouterError::MissingApiKey));
+        if let Some(v) = prior {
+            unsafe { std::env::set_var("ANTHROPIC_API_KEY", v) };
+        }
     }
 
     #[test]

@@ -156,12 +156,12 @@ Tune via `vault diagnose "<prompt>" --alpha X --budget Y` after seeding real dat
 // ~/.claude/settings.json
 {
   "hooks": {
-    "PreToolUse": [{ "command": "vault hook" }]
+    "UserPromptSubmit": [{ "command": "/absolute/path/to/vault hook" }]
   }
 }
 ```
 
-Confirm exact hook key against Claude Code docs — wrong key = silent failure with no context injection.
+`UserPromptSubmit` is the event Claude Code fires before sending the user's prompt to the model. Stdout from the hook is **appended** to the prompt context (not a replacement) — that's why `vault hook` emits only the `<vault-context>...</vault-context>` block and never the user's prompt. Exit 0 with empty stdout = silent passthrough. The per-call timeout for this event is 30s.
 
 ## Context Tags
 
