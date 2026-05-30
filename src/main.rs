@@ -1,10 +1,12 @@
 mod config;
 mod diagnose;
 mod embed;
+mod index;
 mod retrieve;
 mod store;
 mod types;
 mod parse;
+mod util;
 
 use clap::{Parser, Subcommand};
 

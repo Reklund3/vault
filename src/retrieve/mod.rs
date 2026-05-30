@@ -1,8 +1,13 @@
 mod router;
 
+pub use router::{ResolvedBackend, Router, RouterError, resolve_backend};
+#[cfg(test)]
+pub(crate) use router::StubRouter;
+
 use crate::types::{DocType, Language};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug)]
 pub enum RouterOutput {
     Skip,
     Plan(QueryPlan),

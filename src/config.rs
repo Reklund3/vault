@@ -1,5 +1,7 @@
-use thiserror::Error;
 use std::path::PathBuf;
+use std::time::Duration;
+
+use thiserror::Error;
 
 const CONFIG_FILE: &str = "vault.toml";
 const CONFIG_DIR: &str = ".vault";
@@ -30,6 +32,30 @@ struct Defaults {
 struct Router {
     mode: String,
     model: String,
+    /// HTTP timeout for one router call. Defaults to 3s per CLAUDE.md's
+    /// hot-path budget; raise it in `vault.toml` when running a slow local
+    /// model that can't meet the default.
+    #[serde(default = "default_router_timeout_secs")]
+    timeout_secs: u32,
+}
+
+fn default_router_timeout_secs() -> u32 {
+    3
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct Classifier {
+    mode: String,
+    model: String,
+}
+
+impl Default for Classifier {
+    fn default() -> Self {
+        Self {
+            mode: "auto".to_string(),
+            model: "haiku".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -49,6 +75,10 @@ struct Embeddings {
 pub struct Config {
     defaults: Defaults,
     router: Router,
+    // Optional so existing vault.toml files without a [classifier] section keep
+    // loading; falls back to auto-mode / haiku alias.
+    #[serde(default)]
+    classifier: Classifier,
     mlx: Mlx,
     embeddings: Embeddings,
 }
@@ -81,6 +111,37 @@ impl Config {
 
     pub fn embedding_endpoint(&self) -> &str {
         &self.embeddings.endpoint
+    }
+
+    pub fn classifier_mode(&self) -> &str {
+        &self.classifier.mode
+    }
+
+    pub fn classifier_model(&self) -> &str {
+        &self.classifier.model
+    }
+
+    pub fn router_mode(&self) -> &str {
+        &self.router.mode
+    }
+
+    pub fn router_model(&self) -> &str {
+        &self.router.model
+    }
+
+    pub fn router_timeout(&self) -> Duration {
+        Duration::from_secs(self.router.timeout_secs as u64)
+    }
+
+    pub fn mlx_endpoint(&self) -> &str {
+        &self.mlx.endpoint
+    }
+
+    /// mlx_lm.server serves a single loaded model; the router and classifier
+    /// both target it, so the configured `router_model` is the model name for
+    /// both.
+    pub fn mlx_model(&self) -> &str {
+        &self.mlx.router_model
     }
 
     pub fn alpha(&self) -> f32 {
@@ -116,7 +177,9 @@ impl Default for Config {
             router: Router {
                 mode: "auto".to_string(),
                 model: "haiku".to_string(),
+                timeout_secs: default_router_timeout_secs(),
             },
+            classifier: Classifier::default(),
             mlx: Mlx {
                 endpoint: "http://localhost:8080".to_string(),
                 router_model: "gemma-4-31b-bf16".to_string(),
