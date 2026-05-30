@@ -1,3 +1,4 @@
+pub mod budget;
 mod router;
 
 pub use router::{ResolvedBackend, Router, RouterError, resolve_backend};
