@@ -145,6 +145,19 @@ pub fn resolve_backend(config: &Config) -> ResolvedBackend {
     resolve(config.classifier_mode(), config.mlx_endpoint())
 }
 
+/// Construct the configured classifier as a trait object. Mirrors
+/// `retrieve::router::build_router`. **Skips the Haiku cost-confirmation
+/// prompt** that `vault index sync` shows on auto→Haiku — that flow has to
+/// resolve, prompt, and construct by hand so the prompt sits between the two
+/// steps. This factory is for non-interactive entry points (tests, future
+/// scripted callers).
+pub fn build_classifier(config: &Config) -> Result<Box<dyn Classifier>, ClassifyError> {
+    match resolve_backend(config) {
+        ResolvedBackend::Gemma => Ok(Box::new(GemmaClassifier::from_config(config)?)),
+        ResolvedBackend::Haiku => Ok(Box::new(HaikuClassifier::from_config(config)?)),
+    }
+}
+
 fn resolve(mode: &str, mlx_endpoint: &str) -> ResolvedBackend {
     match mode {
         "gemma" => ResolvedBackend::Gemma,
@@ -202,6 +215,67 @@ mod tests {
         assert_eq!(resolve("auto", "http://127.0.0.1:1"), ResolvedBackend::Haiku);
         // Unrecognized modes are treated as auto.
         assert_eq!(resolve("nonsense", "http://127.0.0.1:1"), ResolvedBackend::Haiku);
+    }
+
+    fn config_with_classifier_mode(mode: &str) -> Config {
+        // Minimal vault.toml so we can exercise build_classifier without
+        // poking Config's private fields. Same pattern as the build_router
+        // tests in src/retrieve/router/mod.rs.
+        let toml = format!(
+            r#"
+[defaults]
+context_tag = "vault-context"
+token_budget = 10000
+alpha = 0.6
+min_score = 0.15
+timeout = 3
+
+[router]
+mode = "auto"
+model = "haiku"
+timeout_secs = 3
+
+[classifier]
+mode = "{mode}"
+model = "haiku"
+
+[mlx]
+endpoint = "http://127.0.0.1:1"
+router_model = "test-model"
+
+[embeddings]
+endpoint = "http://localhost:8081"
+model = "nomic-ai/nomic-embed-text-v1.5"
+dims = 768
+"#
+        );
+        toml::from_str(&toml).expect("test config parses")
+    }
+
+    #[test]
+    fn build_classifier_constructs_gemma_in_gemma_mode() {
+        let cfg = config_with_classifier_mode("gemma");
+        let classifier = build_classifier(&cfg).expect("build");
+        // Trait object has no public type identity; assertion is just that
+        // construction succeeded without panic or MissingApiKey.
+        let _ = classifier;
+    }
+
+    #[test]
+    fn build_classifier_haiku_mode_without_key_fails() {
+        let prior = std::env::var("ANTHROPIC_API_KEY").ok();
+        // SAFETY: tests touching process env run single-threaded under
+        // cargo test by default for these env-var manipulations.
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+        let cfg = config_with_classifier_mode("haiku");
+        let err = match build_classifier(&cfg) {
+            Ok(_) => panic!("expected MissingApiKey, got Ok(classifier)"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, ClassifyError::MissingApiKey));
+        if let Some(v) = prior {
+            unsafe { std::env::set_var("ANTHROPIC_API_KEY", v) };
+        }
     }
 
     #[test]
