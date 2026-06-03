@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, ToSql, params};
+use rusqlite::{Connection, OptionalExtension, ToSql, params};
 
 use crate::config::Config;
 use crate::retrieve::QueryPlan;
@@ -54,6 +54,48 @@ impl SqliteStore {
 impl Store for SqliteStore {
     fn migrate(&mut self) -> Result<(), StoreError> {
         schema::migrate(&self.conn)
+    }
+
+    fn get_or_create_project(
+        &mut self,
+        name: &str,
+        repo_path: &str,
+    ) -> Result<i64, StoreError> {
+        let tx = self.conn.transaction().map_err(backend_err)?;
+
+        let existing: Option<(i64, Option<String>)> = tx
+            .query_row(
+                "SELECT id, repo_path FROM projects WHERE name = ?1",
+                params![name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(backend_err)?;
+
+        let id = match existing {
+            None => {
+                let new_id: i64 = tx
+                    .query_row(
+                        "INSERT INTO projects (name, repo_path, created_at)
+                         VALUES (?1, ?2, ?3) RETURNING id",
+                        params![name, repo_path, now_secs()],
+                        |r| r.get(0),
+                    )
+                    .map_err(backend_err)?;
+                new_id
+            }
+            Some((id, None)) => id, // NULL on existing row matches anything
+            Some((id, Some(existing_path))) if existing_path == repo_path => id,
+            Some((_, Some(existing_path))) => {
+                return Err(StoreError::Conflict(format!(
+                    "project name {name:?} already registered at {existing_path:?}; \
+                     this sync targets {repo_path:?}. Pass `--name <unique>` to register a separate project."
+                )));
+            }
+        };
+
+        tx.commit().map_err(backend_err)?;
+        Ok(id)
     }
 
     fn upsert_document(
@@ -717,6 +759,85 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM chunks_vec", [], |r| r.get(0))
             .unwrap();
         assert_eq!(vec_count, 0);
+    }
+
+    #[test]
+    fn get_or_create_inserts_new_project() {
+        let mut store = SqliteStore::open_in_memory(&Config::default()).unwrap();
+        let id = store
+            .get_or_create_project("vault", "/a/b/vault")
+            .expect("insert");
+        assert!(id > 0);
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM projects WHERE name = 'vault'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn get_or_create_fetches_existing_with_matching_path() {
+        let mut store = SqliteStore::open_in_memory(&Config::default()).unwrap();
+        let first = store.get_or_create_project("vault", "/a/b/vault").unwrap();
+        let second = store.get_or_create_project("vault", "/a/b/vault").unwrap();
+        assert_eq!(first, second);
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "second call must not insert a duplicate row");
+    }
+
+    #[test]
+    fn get_or_create_conflicts_on_different_repo_path() {
+        let mut store = SqliteStore::open_in_memory(&Config::default()).unwrap();
+        store.get_or_create_project("vault", "/a/b/vault").unwrap();
+        let err = store
+            .get_or_create_project("vault", "/c/d/vault")
+            .unwrap_err();
+        match err {
+            StoreError::Conflict(msg) => {
+                assert!(msg.contains("/a/b/vault"), "msg missing existing path: {msg}");
+                assert!(msg.contains("/c/d/vault"), "msg missing incoming path: {msg}");
+                assert!(msg.contains("--name"), "msg missing the --name hint: {msg}");
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_or_create_treats_null_repo_path_as_match() {
+        // Existing legacy rows (and the test helper at create_project) insert
+        // projects with a NULL repo_path. New get_or_create calls should fetch
+        // those rows without conflict and without overwriting the NULL.
+        let mut store = SqliteStore::open_in_memory(&Config::default()).unwrap();
+        let legacy_id = create_project(&store, "legacy");
+        let id = store
+            .get_or_create_project("legacy", "/x/y/z")
+            .expect("must match NULL row");
+        assert_eq!(id, legacy_id);
+        let stored_path: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT repo_path FROM projects WHERE id = ?1",
+                params![legacy_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(stored_path.is_none(), "NULL must be preserved on existing legacy rows");
+    }
+
+    #[test]
+    fn get_or_create_multiple_distinct_projects_coexist() {
+        let mut store = SqliteStore::open_in_memory(&Config::default()).unwrap();
+        let vault = store.get_or_create_project("vault", "/a/b/vault").unwrap();
+        let other = store.get_or_create_project("other", "/a/b/other").unwrap();
+        assert_ne!(vault, other);
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[test]

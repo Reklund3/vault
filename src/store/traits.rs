@@ -29,6 +29,21 @@ pub enum StoreError {
 pub trait Store {
     fn migrate(&mut self) -> Result<(), StoreError>;
 
+    /// Insert-or-fetch a project row by name. Returns the project id.
+    ///
+    /// Behavior:
+    /// - Name absent → insert `(name, repo_path)` and return the new id.
+    /// - Name present with matching `repo_path` (or NULL on the existing row) →
+    ///   return the existing id. NULL on the existing row is treated as
+    ///   "matches anything" so legacy/test rows without a path keep working.
+    /// - Name present with a different non-null `repo_path` → `StoreError::Conflict`.
+    ///   The caller (the indexer) maps this to a user-facing "pass --name" hint.
+    fn get_or_create_project(
+        &mut self,
+        name: &str,
+        repo_path: &str,
+    ) -> Result<i64, StoreError>;
+
     fn upsert_document(
         &mut self,
         doc: &Document,

@@ -117,6 +117,13 @@ mod tests {
         fn migrate(&mut self) -> Result<(), StoreError> {
             Ok(())
         }
+        fn get_or_create_project(
+            &mut self,
+            _name: &str,
+            _repo_path: &str,
+        ) -> Result<i64, StoreError> {
+            Ok(1)
+        }
         fn upsert_document(
             &mut self,
             _doc: &Document,
