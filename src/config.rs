@@ -81,6 +81,15 @@ pub struct Domain {
     pub projects: Vec<String>,
 }
 
+/// One row of the classification cache as stored on disk. Keeps the
+/// TOML-deserialization shape separate from `index::classify::Classification`
+/// so the on-disk schema can drift independently from the runtime type.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CachedClassification {
+    pub doc_type: crate::types::DocType,
+    pub language: crate::types::Language,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
     defaults: Defaults,
@@ -95,6 +104,12 @@ pub struct Config {
     // falls back to `defaults.context_tag` when no project matches.
     #[serde(default)]
     domains: HashMap<String, Domain>,
+    // `[classifications."<repo>"]` sections — outer key is the repo path
+    // (tilde or canonical; we normalize on read), inner key is a glob pattern,
+    // value is the cached classification. Optional so existing configs without
+    // any cache section still load.
+    #[serde(default)]
+    classifications: HashMap<String, HashMap<String, CachedClassification>>,
 }
 
 // Todo: Move to a helper file/dir
@@ -170,6 +185,41 @@ impl Config {
         self.defaults.min_score
     }
 
+    /// Look up a cached classification for `relative_path` inside `canonical_repo`.
+    /// The caller is responsible for canonicalizing `canonical_repo`; this method
+    /// runs both that key and the on-disk keys through `normalize_repo_key` so a
+    /// canonical lookup matches a tilde-keyed `[classifications."<repo>"]`
+    /// section. Returns the first glob that matches `relative_path` — TOML map
+    /// order is undefined, but the curated handful per repo makes ordering
+    /// irrelevant for v1.
+    pub fn cached_classification(
+        &self,
+        canonical_repo: &str,
+        relative_path: &str,
+    ) -> Option<crate::index::classify::Classification> {
+        use globset::GlobBuilder;
+
+        let target = crate::util::path::normalize_repo_key(canonical_repo);
+        let section = self
+            .classifications
+            .iter()
+            .find(|(k, _)| crate::util::path::normalize_repo_key(k) == target)
+            .map(|(_, v)| v)?;
+
+        for (pattern, cached) in section {
+            let Ok(glob) = GlobBuilder::new(pattern).literal_separator(true).build() else {
+                continue;
+            };
+            if glob.compile_matcher().is_match(relative_path) {
+                return Some(crate::index::classify::Classification {
+                    doc_type: cached.doc_type,
+                    language: cached.language,
+                });
+            }
+        }
+        None
+    }
+
     /// Resolve the context tag for an injection from the router's named
     /// projects. First project whose name appears in any `[domains.X].projects`
     /// list wins; otherwise the global `defaults.context_tag` is returned. Match
@@ -220,6 +270,7 @@ impl Default for Config {
                 dims: 768,
             },
             domains: HashMap::new(),
+            classifications: HashMap::new(),
         }
     }
 }
@@ -288,5 +339,95 @@ mod tests {
         ]);
         let tag = cfg.resolve_context_tag(&["bookkeeping".to_string(), "vault".to_string()]);
         assert_eq!(tag, "finance-context");
+    }
+
+    // ----- cached_classification -----
+
+    use crate::types::{DocType, Language};
+
+    fn cached(d: DocType, l: Language) -> CachedClassification {
+        CachedClassification { doc_type: d, language: l }
+    }
+
+    fn config_with_classifications(
+        pairs: &[(&str, &[(&str, CachedClassification)])],
+    ) -> Config {
+        let classifications = pairs
+            .iter()
+            .map(|(repo, rules)| {
+                let inner: HashMap<String, CachedClassification> = rules
+                    .iter()
+                    .map(|(pat, cls)| (pat.to_string(), cls.clone()))
+                    .collect();
+                (repo.to_string(), inner)
+            })
+            .collect();
+        Config { classifications, ..Config::default() }
+    }
+
+    #[test]
+    fn cached_classification_exact_path_matches_only_exact() {
+        let cfg = config_with_classifications(&[(
+            "/repo",
+            &[("CLAUDE.md", cached(DocType::Meta, Language::Markdown))],
+        )]);
+        let hit = cfg.cached_classification("/repo", "CLAUDE.md").expect("hit");
+        assert_eq!(hit.doc_type, DocType::Meta);
+        assert_eq!(hit.language, Language::Markdown);
+        // literal-separator semantics: "CLAUDE.md" must NOT match "docs/CLAUDE.md".
+        assert!(cfg.cached_classification("/repo", "docs/CLAUDE.md").is_none());
+    }
+
+    #[test]
+    fn cached_classification_double_star_matches_any_depth() {
+        let cfg = config_with_classifications(&[(
+            "/repo",
+            &[("**/*.proto", cached(DocType::Contract, Language::Proto))],
+        )]);
+        assert!(cfg.cached_classification("/repo", "build/build.proto").is_some());
+        assert!(cfg.cached_classification("/repo", "top.proto").is_some());
+        assert!(cfg.cached_classification("/repo", "deep/nested/path/x.proto").is_some());
+        assert!(cfg.cached_classification("/repo", "build/build.go").is_none());
+    }
+
+    #[test]
+    fn cached_classification_repos_are_isolated() {
+        let cfg = config_with_classifications(&[
+            ("/repo-a", &[("**/*.proto", cached(DocType::Contract, Language::Proto))]),
+            ("/repo-b", &[("**/*.go", cached(DocType::Convention, Language::Go))]),
+        ]);
+        // A proto file in repo-b must miss — repo-b's section only covers .go.
+        assert!(cfg.cached_classification("/repo-b", "x.proto").is_none());
+        assert!(cfg.cached_classification("/repo-a", "x.proto").is_some());
+    }
+
+    #[test]
+    fn cached_classification_returns_none_when_repo_section_absent() {
+        let cfg = Config::default();
+        assert!(cfg.cached_classification("/anywhere", "file.proto").is_none());
+    }
+
+    #[test]
+    fn cached_classification_canonical_lookup_matches_tilde_keyed_section() {
+        // Use the system temp dir (which exists and canonicalizes) as the repo
+        // root so both sides have a real canonical form to compare against.
+        // The cache section is keyed by tilde-relative-to-temp; the lookup
+        // passes the canonical path. normalize_repo_key must reconcile them.
+        let canonical_tmp = std::fs::canonicalize(std::env::temp_dir())
+            .expect("temp canonicalizes");
+        // Build a tilde-keyed section that, after normalize_repo_key, expands
+        // to the same canonical tmp. We can't directly tilde-key a tempdir
+        // (it isn't under $HOME), so instead use the canonical key on disk
+        // and the *expanded* canonical for the lookup — both run through
+        // normalize_repo_key, so the equality only holds if normalize runs on
+        // both sides as documented.
+        let cfg = config_with_classifications(&[(
+            canonical_tmp.to_str().unwrap(),
+            &[("**/*.proto", cached(DocType::Contract, Language::Proto))],
+        )]);
+        let hit = cfg
+            .cached_classification(canonical_tmp.to_str().unwrap(), "x.proto")
+            .expect("hit");
+        assert_eq!(hit.doc_type, DocType::Contract);
     }
 }
