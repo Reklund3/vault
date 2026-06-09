@@ -66,12 +66,41 @@ pub trait Store {
         kept_paths: &[String],
     ) -> Result<usize, StoreError>;
 
+    /// Raw BM25 keyword search. Returns up to `top_k` hits with `bm25_score`
+    /// populated (other score fields left 0); an empty result is valid (e.g. the
+    /// plan carried no keyword tokens). Filtering by `plan.projects` /
+    /// `doc_types` / `languages` is applied here.
+    fn bm25_search(&self, plan: &QueryPlan, top_k: usize) -> Result<Vec<Hit>, StoreError>;
+
+    /// Raw cosine-similarity search over stored embeddings. Returns up to `top_k`
+    /// hits with `cosine_score` populated. Validates `embedding` length against
+    /// the backend's configured dim and applies the same plan filters as
+    /// `bm25_search`.
+    fn cosine_search(
+        &self,
+        plan: &QueryPlan,
+        embedding: &[f32],
+        top_k: usize,
+    ) -> Result<Vec<Hit>, StoreError>;
+
+    /// Hybrid retrieval: run both primitive queries and blend them with the
+    /// shared ranking math in [`crate::retrieve::hybrid`].
+    ///
+    /// **Provided, not implemented per-backend.** Real backends (SQLite,
+    /// Postgres, …) implement only `bm25_search` and `cosine_search`, so the
+    /// scoring is byte-identical across all of them and tunes in one place. Test
+    /// doubles may override this to return canned hits without running the merge.
     fn hybrid_search(
         &self,
         plan: &QueryPlan,
         embedding: &[f32],
         alpha: f32,
-    ) -> Result<Vec<Hit>, StoreError>;
+    ) -> Result<Vec<Hit>, StoreError> {
+        use crate::retrieve::hybrid::{TOP_K, merge};
+        let bm25 = self.bm25_search(plan, TOP_K)?;
+        let cosine = self.cosine_search(plan, embedding, TOP_K)?;
+        Ok(merge(bm25, cosine, alpha, TOP_K))
+    }
 
     fn log_retrieval(&mut self, entry: &RetrievalLogEntry) -> Result<(), StoreError>;
 }

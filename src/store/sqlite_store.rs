@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,8 +9,6 @@ use crate::store::schema;
 use crate::store::traits::{Store, StoreError};
 use crate::store::types::{ChunkWithEmbedding, Document, Hit, RetrievalLogEntry};
 use crate::types::DocType;
-
-const TOP_K: usize = 50;
 
 pub struct SqliteStore {
     conn: Connection,
@@ -243,11 +240,46 @@ impl Store for SqliteStore {
         Ok(removed)
     }
 
-    fn hybrid_search(
+    fn bm25_search(&self, plan: &QueryPlan, top_k: usize) -> Result<Vec<Hit>, StoreError> {
+        // No keyword tokens → no BM25 arm. Cosine still runs in the merge.
+        let Some(match_q) = build_match_query(plan) else {
+            return Ok(Vec::new());
+        };
+
+        let doc_type_strs: Vec<&'static str> = plan.doc_types.iter().map(|d| d.as_str()).collect();
+        let language_strs: Vec<&'static str> = plan.languages.iter().map(|l| l.as_str()).collect();
+        let filter_sql = build_filter_clause(plan);
+        let filter = filter_bind_params(plan, &doc_type_strs, &language_strs);
+
+        let sql = format!(
+            "SELECT c.id, c.label, c.content, c.token_est, c.project_id, c.doc_type,
+                    -rank AS bm25_score
+             FROM chunks_fts
+             JOIN chunks c ON c.id = chunks_fts.rowid
+             WHERE chunks_fts MATCH ?1{filter_sql}
+             ORDER BY rank LIMIT {top_k}"
+        );
+        let mut params: Vec<&dyn ToSql> = vec![&match_q];
+        params.extend(filter.iter().copied());
+
+        let mut stmt = self.conn.prepare(&sql).map_err(backend_err)?;
+        let rows = stmt
+            .query_map(params.as_slice(), map_hit_row)
+            .map_err(backend_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (mut hit, score) = row.map_err(backend_err)?;
+            hit.bm25_score = score;
+            out.push(hit);
+        }
+        Ok(out)
+    }
+
+    fn cosine_search(
         &self,
         plan: &QueryPlan,
         embedding: &[f32],
-        alpha: f32,
+        top_k: usize,
     ) -> Result<Vec<Hit>, StoreError> {
         if embedding.len() != self.embedding_dim {
             return Err(StoreError::InvalidInput(format!(
@@ -257,98 +289,34 @@ impl Store for SqliteStore {
             )));
         }
 
-        let doc_type_strs: Vec<&'static str> =
-            plan.doc_types.iter().map(|d| d.as_str()).collect();
-        let language_strs: Vec<&'static str> =
-            plan.languages.iter().map(|l| l.as_str()).collect();
-
+        let doc_type_strs: Vec<&'static str> = plan.doc_types.iter().map(|d| d.as_str()).collect();
+        let language_strs: Vec<&'static str> = plan.languages.iter().map(|l| l.as_str()).collect();
         let filter_sql = build_filter_clause(plan);
-        let filter_params: Vec<&dyn ToSql> = {
-            let mut p: Vec<&dyn ToSql> = Vec::new();
-            for s in &plan.projects {
-                p.push(s);
-            }
-            for s in &doc_type_strs {
-                p.push(s);
-            }
-            for s in &language_strs {
-                p.push(s);
-            }
-            p
-        };
-
+        let filter = filter_bind_params(plan, &doc_type_strs, &language_strs);
         let emb_json = embedding_to_json(embedding);
-        let mut hits: HashMap<i64, Hit> = HashMap::new();
 
-        // ---- FTS5 BM25 ----
-        if let Some(match_q) = build_match_query(plan) {
-            let sql = format!(
-                "SELECT c.id, c.label, c.content, c.token_est, c.project_id, c.doc_type,
-                        -rank AS bm25_score
-                 FROM chunks_fts
-                 JOIN chunks c ON c.id = chunks_fts.rowid
-                 WHERE chunks_fts MATCH ?1{filter_sql}
-                 ORDER BY rank LIMIT {TOP_K}"
-            );
-            let mut bm25_params: Vec<&dyn ToSql> = vec![&match_q];
-            bm25_params.extend(filter_params.iter().copied());
-
-            let mut stmt = self.conn.prepare(&sql).map_err(backend_err)?;
-            let rows = stmt
-                .query_map(bm25_params.as_slice(), map_hit_row)
-                .map_err(backend_err)?;
-            for row in rows {
-                let (hit, score) = row.map_err(backend_err)?;
-                let mut h = hit;
-                h.bm25_score = score;
-                hits.insert(h.chunk_id, h);
-            }
-        }
-
-        // ---- Vec cosine ----
-        let cos_sql = format!(
+        let sql = format!(
             "SELECT c.id, c.label, c.content, c.token_est, c.project_id, c.doc_type,
                     1.0 - vec_distance_cosine(v.embedding, ?1) AS cos
              FROM chunks_vec v
              JOIN chunks c ON c.id = v.chunk_id
              WHERE 1=1{filter_sql}
-             ORDER BY vec_distance_cosine(v.embedding, ?1) LIMIT {TOP_K}"
+             ORDER BY vec_distance_cosine(v.embedding, ?1) LIMIT {top_k}"
         );
-        let mut cos_params: Vec<&dyn ToSql> = vec![&emb_json];
-        cos_params.extend(filter_params.iter().copied());
+        let mut params: Vec<&dyn ToSql> = vec![&emb_json];
+        params.extend(filter.iter().copied());
 
-        let mut stmt = self.conn.prepare(&cos_sql).map_err(backend_err)?;
+        let mut stmt = self.conn.prepare(&sql).map_err(backend_err)?;
         let rows = stmt
-            .query_map(cos_params.as_slice(), map_hit_row)
+            .query_map(params.as_slice(), map_hit_row)
             .map_err(backend_err)?;
+        let mut out = Vec::new();
         for row in rows {
-            let (hit, cos) = row.map_err(backend_err)?;
-            hits.entry(hit.chunk_id)
-                .and_modify(|h| h.cosine_score = cos)
-                .or_insert(Hit {
-                    cosine_score: cos,
-                    ..hit
-                });
+            let (mut hit, cos) = row.map_err(backend_err)?;
+            hit.cosine_score = cos;
+            out.push(hit);
         }
-
-        // Merge: normalize BM25 across the result set, blend with cosine.
-        let mut hits: Vec<Hit> = hits.into_values().collect();
-        let max_bm25 = hits.iter().map(|h| h.bm25_score).fold(0.0_f32, f32::max);
-        for h in &mut hits {
-            let bm25_norm = if max_bm25 > 0.0 {
-                h.bm25_score / max_bm25
-            } else {
-                0.0
-            };
-            h.final_score = alpha * bm25_norm + (1.0 - alpha) * h.cosine_score;
-        }
-        hits.sort_by(|a, b| {
-            b.final_score
-                .partial_cmp(&a.final_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        hits.truncate(TOP_K);
-        Ok(hits)
+        Ok(out)
     }
 
     fn log_retrieval(&mut self, entry: &RetrievalLogEntry) -> Result<(), StoreError> {
@@ -408,6 +376,29 @@ fn build_match_query(plan: &QueryPlan) -> Option<String> {
     } else {
         Some(tokens.join(" OR "))
     }
+}
+
+/// Build the positional bind params matching `build_filter_clause`'s `?`
+/// placeholders, in the same order: projects, then doc_types, then languages.
+/// Borrows the plan and the caller's interned label slices, so all three must
+/// outlive the query. Shared by `bm25_search` and `cosine_search` so the clause
+/// and its params can never drift out of sync.
+fn filter_bind_params<'a>(
+    plan: &'a QueryPlan,
+    doc_type_strs: &'a [&'static str],
+    language_strs: &'a [&'static str],
+) -> Vec<&'a dyn ToSql> {
+    let mut p: Vec<&dyn ToSql> = Vec::new();
+    for s in &plan.projects {
+        p.push(s);
+    }
+    for s in doc_type_strs {
+        p.push(s);
+    }
+    for s in language_strs {
+        p.push(s);
+    }
+    p
 }
 
 fn build_filter_clause(plan: &QueryPlan) -> String {

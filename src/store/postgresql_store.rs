@@ -43,11 +43,18 @@ impl Store for PostgresStore {
         todo!()
     }
 
-    fn hybrid_search(
+    // Implement only the two primitives; `hybrid_search` is the trait's provided
+    // method, so this backend inherits the exact same ranking math as SqliteStore
+    // (tsvector ts_rank for BM25, pgvector `<=>` cosine, mapped into Hit).
+    fn bm25_search(&self, _plan: &QueryPlan, _top_k: usize) -> Result<Vec<Hit>, StoreError> {
+        todo!()
+    }
+
+    fn cosine_search(
         &self,
         _plan: &QueryPlan,
         _embedding: &[f32],
-        _alpha: f32,
+        _top_k: usize,
     ) -> Result<Vec<Hit>, StoreError> {
         todo!()
     }

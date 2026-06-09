@@ -145,6 +145,20 @@ mod tests {
         ) -> Result<usize, StoreError> {
             Ok(0)
         }
+        // Required primitives — unused here because we override hybrid_search to
+        // return canned hits directly (keeping these tests about hook logic, not
+        // the merge, which is covered in retrieve::hybrid).
+        fn bm25_search(&self, _plan: &QueryPlan, _top_k: usize) -> Result<Vec<Hit>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn cosine_search(
+            &self,
+            _plan: &QueryPlan,
+            _embedding: &[f32],
+            _top_k: usize,
+        ) -> Result<Vec<Hit>, StoreError> {
+            Ok(Vec::new())
+        }
         fn hybrid_search(
             &self,
             _plan: &QueryPlan,

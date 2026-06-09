@@ -524,11 +524,16 @@ mod tests {
             self.prunes.borrow_mut().push(kept_paths.to_vec());
             Ok(0)
         }
-        fn hybrid_search(
+        // Indexer never retrieves; the two primitives satisfy the trait and the
+        // provided hybrid_search is never exercised here.
+        fn bm25_search(&self, _plan: &QueryPlan, _top_k: usize) -> Result<Vec<Hit>, StoreError> {
+            Ok(vec![])
+        }
+        fn cosine_search(
             &self,
             _plan: &QueryPlan,
             _embedding: &[f32],
-            _alpha: f32,
+            _top_k: usize,
         ) -> Result<Vec<Hit>, StoreError> {
             Ok(vec![])
         }

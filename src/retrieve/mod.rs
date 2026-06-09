@@ -1,4 +1,5 @@
 pub mod budget;
+pub mod hybrid;
 mod router;
 
 pub use router::{Router, build_router};
