@@ -34,7 +34,10 @@ pub fn select_within_budget(
         tokens_used += hit.token_est;
         chunks.push(hit);
     }
-    BudgetedSelection { chunks, tokens_used }
+    BudgetedSelection {
+        chunks,
+        tokens_used,
+    }
 }
 
 #[cfg(test)]
@@ -67,7 +70,10 @@ mod tests {
     fn all_hits_fit_when_budget_is_ample() {
         let hits = vec![hit(1, 0.9, 100), hit(2, 0.8, 200), hit(3, 0.7, 50)];
         let sel = select_within_budget(hits, 10_000, 0.15);
-        assert_eq!(sel.chunks.iter().map(|h| h.chunk_id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            sel.chunks.iter().map(|h| h.chunk_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
         assert_eq!(sel.tokens_used, 350);
     }
 
@@ -75,7 +81,10 @@ mod tests {
     fn min_score_gate_drops_below_threshold() {
         let hits = vec![hit(1, 0.9, 50), hit(2, 0.10, 50), hit(3, 0.5, 50)];
         let sel = select_within_budget(hits, 10_000, 0.15);
-        assert_eq!(sel.chunks.iter().map(|h| h.chunk_id).collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(
+            sel.chunks.iter().map(|h| h.chunk_id).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
         assert_eq!(sel.tokens_used, 100);
     }
 
@@ -92,7 +101,10 @@ mod tests {
         // `break`. Lower-scored but smaller hits should still fit the gap.
         let hits = vec![hit(1, 0.9, 9000), hit(2, 0.8, 100), hit(3, 0.7, 50)];
         let sel = select_within_budget(hits, 200, 0.15);
-        assert_eq!(sel.chunks.iter().map(|h| h.chunk_id).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(
+            sel.chunks.iter().map(|h| h.chunk_id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
         assert_eq!(sel.tokens_used, 150);
     }
 
@@ -109,7 +121,10 @@ mod tests {
     fn one_token_over_budget_is_excluded() {
         let hits = vec![hit(1, 0.9, 100), hit(2, 0.8, 101)];
         let sel = select_within_budget(hits, 200, 0.15);
-        assert_eq!(sel.chunks.iter().map(|h| h.chunk_id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            sel.chunks.iter().map(|h| h.chunk_id).collect::<Vec<_>>(),
+            vec![1]
+        );
         assert_eq!(sel.tokens_used, 100);
     }
 
@@ -134,7 +149,10 @@ mod tests {
         // Pass deliberately out-of-order input; output must follow input.
         let hits = vec![hit(1, 0.5, 10), hit(2, 0.9, 10), hit(3, 0.7, 10)];
         let sel = select_within_budget(hits, 100, 0.15);
-        assert_eq!(sel.chunks.iter().map(|h| h.chunk_id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            sel.chunks.iter().map(|h| h.chunk_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]
@@ -142,7 +160,10 @@ mod tests {
         // token_est of u32::MAX shouldn't crash; it just fails the budget check.
         let hits = vec![hit(1, 0.9, u32::MAX), hit(2, 0.8, 50)];
         let sel = select_within_budget(hits, 100, 0.15);
-        assert_eq!(sel.chunks.iter().map(|h| h.chunk_id).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(
+            sel.chunks.iter().map(|h| h.chunk_id).collect::<Vec<_>>(),
+            vec![2]
+        );
         assert_eq!(sel.tokens_used, 50);
     }
 }

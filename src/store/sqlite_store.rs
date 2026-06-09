@@ -53,11 +53,7 @@ impl Store for SqliteStore {
         schema::migrate(&self.conn)
     }
 
-    fn get_or_create_project(
-        &mut self,
-        name: &str,
-        repo_path: &str,
-    ) -> Result<i64, StoreError> {
+    fn get_or_create_project(&mut self, name: &str, repo_path: &str) -> Result<i64, StoreError> {
         let tx = self.conn.transaction().map_err(backend_err)?;
 
         let existing: Option<(i64, Option<String>)> = tx
@@ -210,7 +206,10 @@ impl Store for SqliteStore {
             (String::new(), Vec::new())
         } else {
             (
-                format!(" AND source_path NOT IN ({})", placeholders(kept_paths.len())),
+                format!(
+                    " AND source_path NOT IN ({})",
+                    placeholders(kept_paths.len())
+                ),
                 kept_paths.iter().map(|s| s as &dyn ToSql).collect(),
             )
         };
@@ -777,7 +776,11 @@ mod tests {
         assert!(id > 0);
         let count: i64 = store
             .conn
-            .query_row("SELECT COUNT(*) FROM projects WHERE name = 'vault'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE name = 'vault'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 1);
     }
@@ -804,8 +807,14 @@ mod tests {
             .unwrap_err();
         match err {
             StoreError::Conflict(msg) => {
-                assert!(msg.contains("/a/b/vault"), "msg missing existing path: {msg}");
-                assert!(msg.contains("/c/d/vault"), "msg missing incoming path: {msg}");
+                assert!(
+                    msg.contains("/a/b/vault"),
+                    "msg missing existing path: {msg}"
+                );
+                assert!(
+                    msg.contains("/c/d/vault"),
+                    "msg missing incoming path: {msg}"
+                );
                 assert!(msg.contains("--name"), "msg missing the --name hint: {msg}");
             }
             other => panic!("expected Conflict, got {other:?}"),
@@ -831,7 +840,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(stored_path.is_none(), "NULL must be preserved on existing legacy rows");
+        assert!(
+            stored_path.is_none(),
+            "NULL must be preserved on existing legacy rows"
+        );
     }
 
     #[test]
@@ -897,10 +909,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.get_document_content_hash(pa, "x.md").unwrap().as_deref(),
+            store
+                .get_document_content_hash(pa, "x.md")
+                .unwrap()
+                .as_deref(),
             Some("in-a")
         );
-        assert!(store.get_document_content_hash(pb, "x.md").unwrap().is_none());
+        assert!(
+            store
+                .get_document_content_hash(pb, "x.md")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

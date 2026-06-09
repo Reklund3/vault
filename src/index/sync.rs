@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 use crate::config::{Config, ConfigError};
 use crate::embed::{EmbedError, Embedder, TeiEmbedder};
 use crate::index::classify::{
-    Classification, ClassifyError, ClassifyInput, Classifier, ResolvedBackend, build_classifier,
+    Classification, Classifier, ClassifyError, ClassifyInput, ResolvedBackend, build_classifier,
     cost_estimate, resolve_backend,
 };
 use crate::index::secrets;
-use crate::index::walk::{Walked, WalkError, WalkOptions, walk_repo};
+use crate::index::walk::{WalkError, WalkOptions, Walked, walk_repo};
 use crate::parse::{self, parser_for};
 use crate::store::{Chunk, ChunkWithEmbedding, Document, SqliteStore, Store, StoreError};
 use crate::types::{DocType, Language};
@@ -24,21 +24,21 @@ pub struct SyncOptions {
 #[derive(Debug, Default)]
 pub struct SyncReport {
     pub project: String,
-    pub project_id: i64,                          // 0 in dry-run (no store touched)
+    pub project_id: i64, // 0 in dry-run (no store touched)
     pub dry_run: bool,
     pub files_walked: usize,
-    pub files_cached: usize,                      // matched a vault.toml override
-    pub files_classified: usize,                  // called the live classifier (0 in dry-run)
-    pub files_would_classify: usize,              // dry-run only — # that would have classified
-    pub files_unchanged: usize,                   // content_hash matched (0 in dry-run)
-    pub files_skipped_remote_classify: usize,     // head trip → ext fallback (0 in dry-run)
-    pub files_parsed_via_parser: usize,           // 0 in dry-run
-    pub files_parsed_as_whole: usize,             // 0 in dry-run
-    pub files_skipped: Vec<(String, String)>,     // (relative_path, reason)
-    pub chunks_indexed: usize,                    // 0 in dry-run
-    pub chunks_dropped_secret: usize,             // 0 in dry-run
-    pub orphans_pruned: usize,                    // 0 in dry-run
-    pub estimated_haiku_cost_usd: f64,            // dry-run; 0.0 if not auto→Haiku
+    pub files_cached: usize,                  // matched a vault.toml override
+    pub files_classified: usize,              // called the live classifier (0 in dry-run)
+    pub files_would_classify: usize,          // dry-run only — # that would have classified
+    pub files_unchanged: usize,               // content_hash matched (0 in dry-run)
+    pub files_skipped_remote_classify: usize, // head trip → ext fallback (0 in dry-run)
+    pub files_parsed_via_parser: usize,       // 0 in dry-run
+    pub files_parsed_as_whole: usize,         // 0 in dry-run
+    pub files_skipped: Vec<(String, String)>, // (relative_path, reason)
+    pub chunks_indexed: usize,                // 0 in dry-run
+    pub chunks_dropped_secret: usize,         // 0 in dry-run
+    pub orphans_pruned: usize,                // 0 in dry-run
+    pub estimated_haiku_cost_usd: f64,        // dry-run; 0.0 if not auto→Haiku
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -282,10 +282,9 @@ fn process_file(
                         c
                     }
                     Err(e) => {
-                        report.files_skipped.push((
-                            w.relative_path.clone(),
-                            format!("classify error: {e}"),
-                        ));
+                        report
+                            .files_skipped
+                            .push((w.relative_path.clone(), format!("classify error: {e}")));
                         return Ok(());
                     }
                 }
@@ -336,7 +335,10 @@ fn process_file(
     let mut chunks_with_emb: Vec<ChunkWithEmbedding> = Vec::with_capacity(chunks.len());
     for c in chunks {
         match embedder.embed_document(&c.content) {
-            Ok(embedding) => chunks_with_emb.push(ChunkWithEmbedding { chunk: c, embedding }),
+            Ok(embedding) => chunks_with_emb.push(ChunkWithEmbedding {
+                chunk: c,
+                embedding,
+            }),
             Err(e) => {
                 report
                     .files_skipped
@@ -352,9 +354,10 @@ fn process_file(
     // a chunkless document row is harmless (never retrievable) but noise. Record
     // the skip so the report still reflects what happened.
     if chunks_with_emb.is_empty() {
-        report
-            .files_skipped
-            .push((w.relative_path.clone(), "all chunks dropped as secrets".to_string()));
+        report.files_skipped.push((
+            w.relative_path.clone(),
+            "all chunks dropped as secrets".to_string(),
+        ));
         return Ok(());
     }
 
@@ -506,7 +509,10 @@ mod tests {
             project_id: i64,
             source_path: &str,
         ) -> Result<Option<String>, StoreError> {
-            Ok(self.hashes.get(&(project_id, source_path.to_string())).cloned())
+            Ok(self
+                .hashes
+                .get(&(project_id, source_path.to_string()))
+                .cloned())
         }
         fn upsert_document(
             &mut self,
@@ -693,9 +699,7 @@ dims = 768
         let real_hash = parse::sha256_hex(body);
 
         let mut store = StubStore::new();
-        store
-            .hashes
-            .insert((1, "a.go".to_string()), real_hash);
+        store.hashes.insert((1, "a.go".to_string()), real_hash);
 
         let config = Config::default();
         let embedder = StubEmbedder::from_config(&config);

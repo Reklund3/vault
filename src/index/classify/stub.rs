@@ -1,4 +1,4 @@
-use crate::index::classify::{ClassifyError, ClassifyInput, Classification, Classifier};
+use crate::index::classify::{Classification, Classifier, ClassifyError, ClassifyInput};
 use crate::types::{DocType, Language};
 
 /// Test-only classifier that maps a file extension to a plausible

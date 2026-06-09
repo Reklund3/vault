@@ -54,10 +54,7 @@ impl Parser for ProtoParser {
             let inside_block_comment_at_start = scanner.in_block_comment;
             let net = scanner.scan_line(raw_line, i)?;
 
-            if !inside_block_comment_at_start
-                && open.is_none()
-                && scanner.brace_depth == 0
-            {
+            if !inside_block_comment_at_start && open.is_none() && scanner.brace_depth == 0 {
                 if let Some(header) = parse_def_header(raw_line, i)? {
                     open = Some(OpenDef {
                         kind: header.kind,
@@ -291,7 +288,11 @@ message BuildRequest {
         let chunks = parse(src);
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].content.starts_with("// BuildRequest carries"));
-        assert!(chunks[0].content.contains("// Sent on every protobuf call."));
+        assert!(
+            chunks[0]
+                .content
+                .contains("// Sent on every protobuf call.")
+        );
     }
 
     #[test]

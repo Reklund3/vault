@@ -58,8 +58,14 @@ mod tests {
 
     #[test]
     fn expand_tilde_returns_input_unchanged_when_no_tilde() {
-        assert_eq!(expand_tilde("/absolute/path"), PathBuf::from("/absolute/path"));
-        assert_eq!(expand_tilde("relative/path"), PathBuf::from("relative/path"));
+        assert_eq!(
+            expand_tilde("/absolute/path"),
+            PathBuf::from("/absolute/path")
+        );
+        assert_eq!(
+            expand_tilde("relative/path"),
+            PathBuf::from("relative/path")
+        );
     }
 
     #[test]

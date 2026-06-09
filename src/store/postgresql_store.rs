@@ -11,11 +11,7 @@ impl Store for PostgresStore {
         todo!()
     }
 
-    fn get_or_create_project(
-        &mut self,
-        _name: &str,
-        _repo_path: &str,
-    ) -> Result<i64, StoreError> {
+    fn get_or_create_project(&mut self, _name: &str, _repo_path: &str) -> Result<i64, StoreError> {
         todo!()
     }
 

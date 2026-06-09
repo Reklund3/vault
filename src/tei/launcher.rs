@@ -39,10 +39,7 @@ pub enum LauncherError {
     BadLauncherCmd(String),
 
     #[error("could not run {program:?} (from launcher_cmd): {source}")]
-    Spawn {
-        program: String,
-        source: io::Error,
-    },
+    Spawn { program: String, source: io::Error },
 
     #[error("invalid pidfile {path}: {detail}")]
     BadPidFile { path: String, detail: String },
@@ -101,7 +98,10 @@ pub(crate) fn start(config: &Config) -> Result<(), LauncherError> {
     fs::write(&pid_path, pid.to_string())?;
     harden_file(&pid_path);
 
-    println!("Started TEI (pid {pid}). Logging to {}.", log_path.display());
+    println!(
+        "Started TEI (pid {pid}). Logging to {}.",
+        log_path.display()
+    );
 
     let deadline = Instant::now() + READY_TIMEOUT;
     while Instant::now() < deadline {
@@ -261,7 +261,9 @@ fn split_command(input: &str) -> Result<Vec<String>, LauncherError> {
     }
 
     if in_quotes {
-        return Err(LauncherError::BadLauncherCmd("unbalanced quotes".to_string()));
+        return Err(LauncherError::BadLauncherCmd(
+            "unbalanced quotes".to_string(),
+        ));
     }
     if has_token {
         tokens.push(cur);

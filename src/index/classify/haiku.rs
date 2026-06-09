@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::index::classify::{
-    CLASSIFY_SYSTEM, ClassifyError, ClassifyInput, Classification, Classifier, build_user_prompt,
+    CLASSIFY_SYSTEM, Classification, Classifier, ClassifyError, ClassifyInput, build_user_prompt,
     parse_response,
 };
 
@@ -171,7 +171,10 @@ mod tests {
 
     #[test]
     fn require_api_key_rejects_missing_and_blank() {
-        assert!(matches!(require_api_key(None), Err(ClassifyError::MissingApiKey)));
+        assert!(matches!(
+            require_api_key(None),
+            Err(ClassifyError::MissingApiKey)
+        ));
         assert!(matches!(
             require_api_key(Some(String::new())),
             Err(ClassifyError::MissingApiKey)
@@ -180,7 +183,10 @@ mod tests {
             require_api_key(Some("   ".to_string())),
             Err(ClassifyError::MissingApiKey)
         ));
-        assert_eq!(require_api_key(Some("sk-test".to_string())).unwrap(), "sk-test");
+        assert_eq!(
+            require_api_key(Some("sk-test".to_string())).unwrap(),
+            "sk-test"
+        );
     }
 
     #[test]
@@ -219,7 +225,10 @@ mod tests {
         let raw = r#"{"content":[{"type":"tool_use","id":"t1","name":"x","input":{}}]}"#;
         let body: MessagesResponse = serde_json::from_str(raw).unwrap();
         let text = body.content.into_iter().next().unwrap().text;
-        assert!(matches!(parse_response(&text), Err(ClassifyError::BadResponse(_))));
+        assert!(matches!(
+            parse_response(&text),
+            Err(ClassifyError::BadResponse(_))
+        ));
     }
 
     #[test]

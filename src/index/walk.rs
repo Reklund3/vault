@@ -61,7 +61,10 @@ pub enum WalkError {
     #[error("repo path is not a directory: {0}")]
     NotADirectory(PathBuf),
     #[error("could not canonicalize repo path {path:?}: {source}")]
-    Canonicalize { path: PathBuf, source: std::io::Error },
+    Canonicalize {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("invalid exclusion glob {pattern:?}: {detail}")]
     BadGlob { pattern: String, detail: String },
 }
@@ -221,7 +224,10 @@ mod tests {
         tmp.write("a.proto", b"x");
         tmp.write("nested/b.go", b"y");
         let out = walk_repo(&tmp.root, &WalkOptions::default()).unwrap();
-        assert_eq!(rels(&out), vec!["a.proto".to_string(), "nested/b.go".to_string()]);
+        assert_eq!(
+            rels(&out),
+            vec!["a.proto".to_string(), "nested/b.go".to_string()]
+        );
     }
 
     #[test]
@@ -288,7 +294,10 @@ mod tests {
         // run it to keep the code path exercised.
         let out = walk_repo(&repo.root, &WalkOptions::default()).unwrap();
         let rels = rels(&out);
-        assert!(!rels.contains(&"link.txt".to_string()), "symlink leaked: {rels:?}");
+        assert!(
+            !rels.contains(&"link.txt".to_string()),
+            "symlink leaked: {rels:?}"
+        );
         assert!(rels.contains(&"README.md".to_string()));
     }
 

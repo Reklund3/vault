@@ -97,7 +97,9 @@ impl QueryPlan {
         let languages: Vec<Language> = raw
             .languages
             .into_iter()
-            .map(|s| Language::from_str(&s.trim().to_ascii_lowercase()).unwrap_or(Language::Unknown))
+            .map(|s| {
+                Language::from_str(&s.trim().to_ascii_lowercase()).unwrap_or(Language::Unknown)
+            })
             .collect();
         Ok(Self {
             projects: raw.projects,
@@ -309,19 +311,34 @@ mod tests {
 
     #[test]
     fn resolve_forces_explicit_modes_without_probing() {
-        assert_eq!(resolve("gemma", "http://127.0.0.1:1"), ResolvedBackend::Gemma);
-        assert_eq!(resolve("haiku", "http://localhost:8080"), ResolvedBackend::Haiku);
+        assert_eq!(
+            resolve("gemma", "http://127.0.0.1:1"),
+            ResolvedBackend::Gemma
+        );
+        assert_eq!(
+            resolve("haiku", "http://localhost:8080"),
+            ResolvedBackend::Haiku
+        );
     }
 
     #[test]
     fn resolve_auto_falls_back_to_haiku_when_unreachable() {
-        assert_eq!(resolve("auto", "http://127.0.0.1:1"), ResolvedBackend::Haiku);
-        assert_eq!(resolve("nonsense", "http://127.0.0.1:1"), ResolvedBackend::Haiku);
+        assert_eq!(
+            resolve("auto", "http://127.0.0.1:1"),
+            ResolvedBackend::Haiku
+        );
+        assert_eq!(
+            resolve("nonsense", "http://127.0.0.1:1"),
+            ResolvedBackend::Haiku
+        );
     }
 
     #[test]
     fn build_user_prompt_is_pass_through() {
-        assert_eq!(build_user_prompt("what does BuildRequest need?"), "what does BuildRequest need?");
+        assert_eq!(
+            build_user_prompt("what does BuildRequest need?"),
+            "what does BuildRequest need?"
+        );
     }
 
     fn config_with_mode(mode: &str) -> Config {

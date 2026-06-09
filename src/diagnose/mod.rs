@@ -64,8 +64,10 @@ pub fn run(args: Args) -> CliResult {
     let db_path = config.db_path()?;
     let store = SqliteStore::open(&db_path, &config)?;
 
-    let doc_types = parse_list::<DocType>(&args.doc_types).map_err(|e| format!("--doc-types: {e}"))?;
-    let languages = parse_list::<Language>(&args.languages).map_err(|e| format!("--languages: {e}"))?;
+    let doc_types =
+        parse_list::<DocType>(&args.doc_types).map_err(|e| format!("--doc-types: {e}"))?;
+    let languages =
+        parse_list::<Language>(&args.languages).map_err(|e| format!("--languages: {e}"))?;
 
     let plan = QueryPlan {
         projects: args.projects,

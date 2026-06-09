@@ -166,7 +166,10 @@ mod tests {
 
     #[test]
     fn require_api_key_rejects_missing_and_blank() {
-        assert!(matches!(require_api_key(None), Err(RouterError::MissingApiKey)));
+        assert!(matches!(
+            require_api_key(None),
+            Err(RouterError::MissingApiKey)
+        ));
         assert!(matches!(
             require_api_key(Some(String::new())),
             Err(RouterError::MissingApiKey)
@@ -175,7 +178,10 @@ mod tests {
             require_api_key(Some("   ".to_string())),
             Err(RouterError::MissingApiKey)
         ));
-        assert_eq!(require_api_key(Some("sk-test".to_string())).unwrap(), "sk-test");
+        assert_eq!(
+            require_api_key(Some("sk-test".to_string())).unwrap(),
+            "sk-test"
+        );
     }
 
     #[test]
@@ -235,7 +241,10 @@ mod tests {
         let raw = r#"{"content":[{"type":"tool_use","id":"t1","name":"x","input":{}}]}"#;
         let body: MessagesResponse = serde_json::from_str(raw).unwrap();
         let text = body.content.into_iter().next().unwrap().text;
-        assert!(matches!(parse_response(&text), Err(RouterError::BadResponse(_))));
+        assert!(matches!(
+            parse_response(&text),
+            Err(RouterError::BadResponse(_))
+        ));
     }
 
     /// 30s for live tests: production sets the budget via
@@ -248,7 +257,9 @@ mod tests {
     fn live_haiku_route_plan() {
         let config = Config::default();
         let router = HaikuRouter::from_config_with_timeout(&config, LIVE_TIMEOUT).expect("client");
-        let out = router.plan("How does the BuildRequest proto handle retries?").expect("plan");
+        let out = router
+            .plan("How does the BuildRequest proto handle retries?")
+            .expect("plan");
         let _ = out;
     }
 
@@ -262,6 +273,10 @@ mod tests {
         let config = Config::default();
         let router = HaikuRouter::from_config_with_timeout(&config, LIVE_TIMEOUT).expect("client");
         let out = router.plan("hi").expect("plan");
-        assert!(matches!(out, RouterOutput::Skip), "expected Skip for trivial prompt, got {:?}", out);
+        assert!(
+            matches!(out, RouterOutput::Skip),
+            "expected Skip for trivial prompt, got {:?}",
+            out
+        );
     }
 }

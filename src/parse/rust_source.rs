@@ -171,7 +171,8 @@ impl Parser for RustParser {
                 }
             }
 
-            let exit_impl = matches!(&mode, Mode::Impl { body_depth, .. } if scanner.group_depth < *body_depth);
+            let exit_impl =
+                matches!(&mode, Mode::Impl { body_depth, .. } if scanner.group_depth < *body_depth);
             if exit_impl {
                 mode = Mode::Module;
             }
@@ -405,8 +406,7 @@ impl LineScanner {
                     // A lifetime (`'a`) or label — consume the tick and the name;
                     // neither contains delimiters we count.
                     i += 1;
-                    while i < bytes.len()
-                        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
                     {
                         i += 1;
                     }
@@ -754,7 +754,13 @@ pub const MAX: usize = 100;
         let chunks = parse(src);
         assert_eq!(
             labels(&chunks),
-            ["struct Point", "enum Color", "trait Draw", "type Id", "const MAX"]
+            [
+                "struct Point",
+                "enum Color",
+                "trait Draw",
+                "type Id",
+                "const MAX"
+            ]
         );
     }
 

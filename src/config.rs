@@ -282,7 +282,9 @@ impl Config {
     /// write into it (e.g. the TEI launcher) are responsible for `create_dir_all`
     /// and permission hardening.
     pub fn vault_dir(&self) -> Result<PathBuf, ConfigError> {
-        Ok(home_dir().ok_or(ConfigError::HomeNotFound)?.join(CONFIG_DIR))
+        Ok(home_dir()
+            .ok_or(ConfigError::HomeNotFound)?
+            .join(CONFIG_DIR))
     }
 
     pub fn db_path(&self) -> Result<PathBuf, ConfigError> {
@@ -336,14 +338,20 @@ mod tests {
 
     fn config_with_domains(pairs: &[(&str, Domain)]) -> Config {
         Config {
-            domains: pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+            domains: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
             ..Config::default()
         }
     }
 
     #[test]
     fn resolve_context_tag_matches_first_named_project() {
-        let cfg = config_with_domains(&[("software", domain("software-context", &["olympus", "vault"]))]);
+        let cfg = config_with_domains(&[(
+            "software",
+            domain("software-context", &["olympus", "vault"]),
+        )]);
         let tag = cfg.resolve_context_tag(&["vault".to_string()]);
         assert_eq!(tag, "software-context");
     }
@@ -394,12 +402,13 @@ mod tests {
     use crate::types::{DocType, Language};
 
     fn cached(d: DocType, l: Language) -> CachedClassification {
-        CachedClassification { doc_type: d, language: l }
+        CachedClassification {
+            doc_type: d,
+            language: l,
+        }
     }
 
-    fn config_with_classifications(
-        pairs: &[(&str, &[(&str, CachedClassification)])],
-    ) -> Config {
+    fn config_with_classifications(pairs: &[(&str, &[(&str, CachedClassification)])]) -> Config {
         let classifications = pairs
             .iter()
             .map(|(repo, rules)| {
@@ -410,7 +419,10 @@ mod tests {
                 (repo.to_string(), inner)
             })
             .collect();
-        Config { classifications, ..Config::default() }
+        Config {
+            classifications,
+            ..Config::default()
+        }
     }
 
     #[test]
@@ -419,11 +431,16 @@ mod tests {
             "/repo",
             &[("CLAUDE.md", cached(DocType::Meta, Language::Markdown))],
         )]);
-        let hit = cfg.cached_classification("/repo", "CLAUDE.md").expect("hit");
+        let hit = cfg
+            .cached_classification("/repo", "CLAUDE.md")
+            .expect("hit");
         assert_eq!(hit.doc_type, DocType::Meta);
         assert_eq!(hit.language, Language::Markdown);
         // literal-separator semantics: "CLAUDE.md" must NOT match "docs/CLAUDE.md".
-        assert!(cfg.cached_classification("/repo", "docs/CLAUDE.md").is_none());
+        assert!(
+            cfg.cached_classification("/repo", "docs/CLAUDE.md")
+                .is_none()
+        );
     }
 
     #[test]
@@ -432,17 +449,32 @@ mod tests {
             "/repo",
             &[("**/*.proto", cached(DocType::Contract, Language::Proto))],
         )]);
-        assert!(cfg.cached_classification("/repo", "build/build.proto").is_some());
+        assert!(
+            cfg.cached_classification("/repo", "build/build.proto")
+                .is_some()
+        );
         assert!(cfg.cached_classification("/repo", "top.proto").is_some());
-        assert!(cfg.cached_classification("/repo", "deep/nested/path/x.proto").is_some());
-        assert!(cfg.cached_classification("/repo", "build/build.go").is_none());
+        assert!(
+            cfg.cached_classification("/repo", "deep/nested/path/x.proto")
+                .is_some()
+        );
+        assert!(
+            cfg.cached_classification("/repo", "build/build.go")
+                .is_none()
+        );
     }
 
     #[test]
     fn cached_classification_repos_are_isolated() {
         let cfg = config_with_classifications(&[
-            ("/repo-a", &[("**/*.proto", cached(DocType::Contract, Language::Proto))]),
-            ("/repo-b", &[("**/*.go", cached(DocType::Convention, Language::Go))]),
+            (
+                "/repo-a",
+                &[("**/*.proto", cached(DocType::Contract, Language::Proto))],
+            ),
+            (
+                "/repo-b",
+                &[("**/*.go", cached(DocType::Convention, Language::Go))],
+            ),
         ]);
         // A proto file in repo-b must miss — repo-b's section only covers .go.
         assert!(cfg.cached_classification("/repo-b", "x.proto").is_none());
@@ -452,7 +484,10 @@ mod tests {
     #[test]
     fn cached_classification_returns_none_when_repo_section_absent() {
         let cfg = Config::default();
-        assert!(cfg.cached_classification("/anywhere", "file.proto").is_none());
+        assert!(
+            cfg.cached_classification("/anywhere", "file.proto")
+                .is_none()
+        );
     }
 
     // ----- indexer_exclude_patterns -----
@@ -530,8 +565,8 @@ dims = 768
         // root so both sides have a real canonical form to compare against.
         // The cache section is keyed by tilde-relative-to-temp; the lookup
         // passes the canonical path. normalize_repo_key must reconcile them.
-        let canonical_tmp = std::fs::canonicalize(std::env::temp_dir())
-            .expect("temp canonicalizes");
+        let canonical_tmp =
+            std::fs::canonicalize(std::env::temp_dir()).expect("temp canonicalizes");
         // Build a tilde-keyed section that, after normalize_repo_key, expands
         // to the same canonical tmp. We can't directly tilde-key a tempdir
         // (it isn't under $HOME), so instead use the canonical key on disk

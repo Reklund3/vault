@@ -103,7 +103,9 @@ impl Router for GemmaRouter {
             .content
             .filter(|s| !s.is_empty())
             .or(message.reasoning)
-            .ok_or_else(|| RouterError::BadResponse("no content or reasoning in reply".to_string()))?;
+            .ok_or_else(|| {
+                RouterError::BadResponse("no content or reasoning in reply".to_string())
+            })?;
 
         parse_response(&text)
     }
@@ -158,7 +160,14 @@ mod tests {
             ]
         }"#;
         let body: ChatResponse = serde_json::from_str(raw).expect("deserialize");
-        let content = body.choices.into_iter().next().unwrap().message.content.expect("content");
+        let content = body
+            .choices
+            .into_iter()
+            .next()
+            .unwrap()
+            .message
+            .content
+            .expect("content");
         let out = parse_response(&content).expect("parse");
         match out {
             RouterOutput::Plan(plan) => {
@@ -178,7 +187,14 @@ mod tests {
             ]
         }"#;
         let body: ChatResponse = serde_json::from_str(raw).expect("deserialize");
-        let content = body.choices.into_iter().next().unwrap().message.content.expect("content");
+        let content = body
+            .choices
+            .into_iter()
+            .next()
+            .unwrap()
+            .message
+            .content
+            .expect("content");
         let out = parse_response(&content).expect("parse");
         assert!(matches!(out, RouterOutput::Skip));
     }
@@ -196,7 +212,11 @@ mod tests {
         }"#;
         let body: ChatResponse = serde_json::from_str(raw).expect("deserialize");
         let msg = body.choices.into_iter().next().unwrap().message;
-        let text = msg.content.filter(|s| !s.is_empty()).or(msg.reasoning).unwrap();
+        let text = msg
+            .content
+            .filter(|s| !s.is_empty())
+            .or(msg.reasoning)
+            .unwrap();
         let out = parse_response(&text).expect("parse");
         assert!(matches!(out, RouterOutput::Skip));
     }
@@ -211,7 +231,9 @@ mod tests {
     fn live_gemma_route_plan() {
         let config = Config::default();
         let router = GemmaRouter::from_config_with_timeout(&config, LIVE_TIMEOUT).expect("client");
-        let out = router.plan("How does the BuildRequest proto handle retries?").expect("plan");
+        let out = router
+            .plan("How does the BuildRequest proto handle retries?")
+            .expect("plan");
         // Don't assert exact shape — model output drifts. Just confirm it parses.
         let _ = out;
     }
@@ -226,6 +248,10 @@ mod tests {
         let config = Config::default();
         let router = GemmaRouter::from_config_with_timeout(&config, LIVE_TIMEOUT).expect("client");
         let out = router.plan("hi").expect("plan");
-        assert!(matches!(out, RouterOutput::Skip), "expected Skip for trivial prompt, got {:?}", out);
+        assert!(
+            matches!(out, RouterOutput::Skip),
+            "expected Skip for trivial prompt, got {:?}",
+            out
+        );
     }
 }

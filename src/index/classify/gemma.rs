@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::index::classify::{
-    CLASSIFY_SYSTEM, ClassifyError, ClassifyInput, Classification, Classifier, build_user_prompt,
+    CLASSIFY_SYSTEM, Classification, Classifier, ClassifyError, ClassifyInput, build_user_prompt,
     parse_response,
 };
 
@@ -102,7 +102,9 @@ impl Classifier for GemmaClassifier {
             .content
             .filter(|s| !s.is_empty())
             .or(message.reasoning)
-            .ok_or_else(|| ClassifyError::BadResponse("no content or reasoning in reply".to_string()))?;
+            .ok_or_else(|| {
+                ClassifyError::BadResponse("no content or reasoning in reply".to_string())
+            })?;
 
         parse_response(&text)
     }
@@ -159,7 +161,14 @@ mod tests {
             ]
         }"#;
         let body: ChatResponse = serde_json::from_str(raw).expect("deserialize");
-        let content = body.choices.into_iter().next().unwrap().message.content.expect("content");
+        let content = body
+            .choices
+            .into_iter()
+            .next()
+            .unwrap()
+            .message
+            .content
+            .expect("content");
         let c = parse_response(&content).expect("parse");
         assert_eq!(c.doc_type, DocType::Contract);
         assert_eq!(c.language, Language::Proto);
@@ -178,7 +187,11 @@ mod tests {
         }"#;
         let body: ChatResponse = serde_json::from_str(raw).expect("deserialize");
         let msg = body.choices.into_iter().next().unwrap().message;
-        let text = msg.content.filter(|s| !s.is_empty()).or(msg.reasoning).unwrap();
+        let text = msg
+            .content
+            .filter(|s| !s.is_empty())
+            .or(msg.reasoning)
+            .unwrap();
         let c = parse_response(&text).expect("parse");
         assert_eq!(c.doc_type, DocType::Contract);
     }

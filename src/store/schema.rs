@@ -254,11 +254,7 @@ mod tests {
         let conn = open_in_memory().expect("open");
         migrate(&conn).expect("migrate");
         let dim: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM chunks_vec",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT count(*) FROM chunks_vec", [], |r| r.get(0))
             .expect("query vec table");
         assert_eq!(dim, 0);
     }

@@ -47,10 +47,7 @@ impl Parser for GoParser {
             // closed *and* we are not suspended inside a multi-line raw string
             // or block comment (both of which leave `group_depth` untouched).
             if let Some(def) = &open {
-                if scanner.group_depth == 0
-                    && !scanner.in_raw_string
-                    && !scanner.in_block_comment
-                {
+                if scanner.group_depth == 0 && !scanner.in_raw_string && !scanner.in_block_comment {
                     let (label, emit) = match &def.name {
                         DeclName::Named { label, exported } => (label.clone(), *exported),
                         DeclName::Method { label, exported } => (label.clone(), *exported),

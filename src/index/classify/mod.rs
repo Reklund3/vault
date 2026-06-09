@@ -205,16 +205,28 @@ mod tests {
 
     #[test]
     fn resolve_forces_explicit_modes_without_probing() {
-        assert_eq!(resolve("gemma", "http://127.0.0.1:1"), ResolvedBackend::Gemma);
-        assert_eq!(resolve("haiku", "http://localhost:8080"), ResolvedBackend::Haiku);
+        assert_eq!(
+            resolve("gemma", "http://127.0.0.1:1"),
+            ResolvedBackend::Gemma
+        );
+        assert_eq!(
+            resolve("haiku", "http://localhost:8080"),
+            ResolvedBackend::Haiku
+        );
     }
 
     #[test]
     fn resolve_auto_falls_back_to_haiku_when_unreachable() {
         // Port 1 is privileged and not served — the probe fails fast.
-        assert_eq!(resolve("auto", "http://127.0.0.1:1"), ResolvedBackend::Haiku);
+        assert_eq!(
+            resolve("auto", "http://127.0.0.1:1"),
+            ResolvedBackend::Haiku
+        );
         // Unrecognized modes are treated as auto.
-        assert_eq!(resolve("nonsense", "http://127.0.0.1:1"), ResolvedBackend::Haiku);
+        assert_eq!(
+            resolve("nonsense", "http://127.0.0.1:1"),
+            ResolvedBackend::Haiku
+        );
     }
 
     fn config_with_classifier_mode(mode: &str) -> Config {
@@ -295,7 +307,8 @@ dims = 768
 
     #[test]
     fn parse_response_leading_prose() {
-        let text = "Sure, here is the classification:\n{\"doc_type\":\"convention\",\"language\":\"go\"}";
+        let text =
+            "Sure, here is the classification:\n{\"doc_type\":\"convention\",\"language\":\"go\"}";
         let c = parse_response(text).unwrap();
         assert_eq!(c.doc_type, DocType::Convention);
         assert_eq!(c.language, Language::Go);
@@ -303,7 +316,8 @@ dims = 768
 
     #[test]
     fn parse_response_trailing_prose() {
-        let text = "{\"doc_type\":\"meta\",\"language\":\"markdown\"}\nLet me know if you need more.";
+        let text =
+            "{\"doc_type\":\"meta\",\"language\":\"markdown\"}\nLet me know if you need more.";
         let c = parse_response(text).unwrap();
         assert_eq!(c.doc_type, DocType::Meta);
     }

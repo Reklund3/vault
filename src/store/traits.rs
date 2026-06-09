@@ -38,11 +38,7 @@ pub trait Store {
     ///   "matches anything" so legacy/test rows without a path keep working.
     /// - Name present with a different non-null `repo_path` → `StoreError::Conflict`.
     ///   The caller (the indexer) maps this to a user-facing "pass --name" hint.
-    fn get_or_create_project(
-        &mut self,
-        name: &str,
-        repo_path: &str,
-    ) -> Result<i64, StoreError>;
+    fn get_or_create_project(&mut self, name: &str, repo_path: &str) -> Result<i64, StoreError>;
 
     fn upsert_document(
         &mut self,

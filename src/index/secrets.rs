@@ -51,7 +51,9 @@ mod tests {
     fn aws_access_key_trips() {
         assert!(looks_like_secret("AKIA0123456789ABCDEF"));
         // Embedded in normal text still hits — these scan content, not whole lines.
-        assert!(looks_like_secret("const key = \"AKIA0123456789ABCDEF\"; // ugh"));
+        assert!(looks_like_secret(
+            "const key = \"AKIA0123456789ABCDEF\"; // ugh"
+        ));
     }
 
     #[test]
@@ -59,7 +61,9 @@ mod tests {
         let body = "GITHUB_TOKEN=ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         assert!(looks_like_secret(body));
         // gho_ / ghu_ / ghs_ / ghr_ all hit the same character class.
-        assert!(looks_like_secret("ghs_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        assert!(looks_like_secret(
+            "ghs_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ));
     }
 
     #[test]

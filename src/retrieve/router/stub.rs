@@ -1,5 +1,5 @@
-use crate::retrieve::{QueryPlan, RouterOutput};
 use crate::retrieve::router::{Router, RouterError};
+use crate::retrieve::{QueryPlan, RouterOutput};
 
 /// Test-only router that returns an empty `QueryPlan` for any input. NOT a
 /// production fallback — `auto` mode picks Gemma or Haiku, never this. The

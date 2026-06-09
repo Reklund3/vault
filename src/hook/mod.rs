@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::config::Config;
 use crate::embed::{Embedder, TeiEmbedder};
-use crate::retrieve::{self, RouterOutput, Router, budget};
+use crate::retrieve::{self, Router, RouterOutput, budget};
 use crate::store::{Hit, SqliteStore, Store};
 
 /// Entry for `vault hook`. Reads a UserPromptSubmit envelope on stdin, runs
@@ -60,11 +60,7 @@ fn pipeline_with(
     };
     let emb = embedder.embed_query(prompt).ok()?;
     let hits = store.hybrid_search(&plan, &emb, config.alpha()).ok()?;
-    let sel = budget::select_within_budget(
-        hits,
-        config.token_budget() as u32,
-        config.min_score(),
-    );
+    let sel = budget::select_within_budget(hits, config.token_budget() as u32, config.min_score());
     if sel.chunks.is_empty() {
         return None;
     }
@@ -200,8 +196,14 @@ mod tests {
             hits: vec![sample_hit("BuildRequest", "message BuildRequest {}", 0.9)],
         };
         let embedder = StubEmbedder::from_config(&config);
-        let out = pipeline_with("what is BuildRequest?", &config, &StubRouter, &embedder, &store)
-            .expect("expected block");
+        let out = pipeline_with(
+            "what is BuildRequest?",
+            &config,
+            &StubRouter,
+            &embedder,
+            &store,
+        )
+        .expect("expected block");
         assert!(out.starts_with("<vault-context>\n"));
         assert!(out.contains("## BuildRequest [contract]"));
         assert!(out.contains("message BuildRequest {}"));
@@ -265,10 +267,7 @@ mod tests {
 
     #[test]
     fn render_block_multiple_chunks_separated_by_blank_line() {
-        let chunks = vec![
-            sample_hit("A", "alpha", 0.9),
-            sample_hit("B", "beta", 0.8),
-        ];
+        let chunks = vec![sample_hit("A", "alpha", 0.9), sample_hit("B", "beta", 0.8)];
         let out = render_block("ctx", &chunks);
         // Blank line between chunks; no leading blank before the first.
         let expected = "<ctx>\n## A [contract]\nalpha\n\n## B [contract]\nbeta\n</ctx>\n";
@@ -290,5 +289,4 @@ mod tests {
         assert!(first_pos < second_pos);
         assert!(second_pos < third_pos);
     }
-
 }

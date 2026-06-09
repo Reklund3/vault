@@ -29,7 +29,9 @@ fn port_reachable(endpoint: &str) -> bool {
     let Ok(addrs) = authority.to_socket_addrs() else {
         return false;
     };
-    addrs.into_iter().any(|addr| TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok())
+    addrs
+        .into_iter()
+        .any(|addr| TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok())
 }
 
 /// Extract `host:port` from an `http://host:port/...` endpoint, defaulting the
@@ -55,8 +57,14 @@ mod tests {
 
     #[test]
     fn socket_authority_parses_forms() {
-        assert_eq!(socket_authority("http://localhost:8080").as_deref(), Some("localhost:8080"));
-        assert_eq!(socket_authority("http://localhost").as_deref(), Some("localhost:8080"));
+        assert_eq!(
+            socket_authority("http://localhost:8080").as_deref(),
+            Some("localhost:8080")
+        );
+        assert_eq!(
+            socket_authority("http://localhost").as_deref(),
+            Some("localhost:8080")
+        );
         assert_eq!(
             socket_authority("http://127.0.0.1:9000/v1/models").as_deref(),
             Some("127.0.0.1:9000")

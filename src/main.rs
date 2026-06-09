@@ -3,11 +3,11 @@ mod diagnose;
 mod embed;
 mod hook;
 mod index;
+mod parse;
 mod retrieve;
 mod store;
 mod tei;
 mod types;
-mod parse;
 mod util;
 
 use std::path::PathBuf;
