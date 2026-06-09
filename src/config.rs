@@ -72,6 +72,20 @@ struct Embeddings {
     dims: u16,
 }
 
+/// Optional `[indexer]` block. Today it carries only `[indexer.exclude]`; if/when
+/// the indexer grows more knobs they land here.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct Indexer {
+    #[serde(default)]
+    exclude: IndexerExclude,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct IndexerExclude {
+    #[serde(default)]
+    patterns: Vec<String>,
+}
+
 /// A logical group of projects that share one context tag. Configured under
 /// `[domains.<name>]` in `vault.toml`. The hook uses `projects` to match the
 /// router's named projects back to a `context_tag` for the injected block.
@@ -100,6 +114,10 @@ pub struct Config {
     classifier: Classifier,
     mlx: Mlx,
     embeddings: Embeddings,
+    // Optional so configs without an [indexer] block still load — the walker
+    // falls back to the built-in exclusion list.
+    #[serde(default)]
+    indexer: Indexer,
     // Optional so configs without any [domains.*] section still load — the hook
     // falls back to `defaults.context_tag` when no project matches.
     #[serde(default)]
@@ -183,6 +201,13 @@ impl Config {
 
     pub fn min_score(&self) -> f32 {
         self.defaults.min_score
+    }
+
+    /// User-supplied extra exclusion globs from `[indexer.exclude].patterns`.
+    /// These are added to the walker's non-removable `BUILT_IN_EXCLUDES`; an
+    /// empty vec means "use the built-ins only".
+    pub fn indexer_exclude_patterns(&self) -> &[String] {
+        &self.indexer.exclude.patterns
     }
 
     /// Look up a cached classification for `relative_path` inside `canonical_repo`.
@@ -269,6 +294,7 @@ impl Default for Config {
                 model: "nomic-ai/nomic-embed-text-v1.5".to_string(),
                 dims: 768,
             },
+            indexer: Indexer::default(),
             domains: HashMap::new(),
             classifications: HashMap::new(),
         }
@@ -405,6 +431,75 @@ mod tests {
     fn cached_classification_returns_none_when_repo_section_absent() {
         let cfg = Config::default();
         assert!(cfg.cached_classification("/anywhere", "file.proto").is_none());
+    }
+
+    // ----- indexer_exclude_patterns -----
+
+    #[test]
+    fn indexer_exclude_patterns_default_is_empty() {
+        let cfg = Config::default();
+        assert!(cfg.indexer_exclude_patterns().is_empty());
+    }
+
+    #[test]
+    fn indexer_exclude_patterns_parses_from_toml() {
+        let toml_text = r#"
+[defaults]
+context_tag = "vault-context"
+token_budget = 10000
+alpha = 0.6
+min_score = 0.15
+timeout = 3
+
+[router]
+mode = "auto"
+model = "haiku"
+
+[mlx]
+endpoint = "http://localhost:8080"
+router_model = "test"
+
+[embeddings]
+endpoint = "http://localhost:8081"
+model = "nomic-ai/nomic-embed-text-v1.5"
+dims = 768
+
+[indexer.exclude]
+patterns = ["*.log", "tmp/**"]
+"#;
+        let cfg: Config = toml::from_str(toml_text).expect("parse");
+        assert_eq!(
+            cfg.indexer_exclude_patterns(),
+            &["*.log".to_string(), "tmp/**".to_string()]
+        );
+    }
+
+    #[test]
+    fn indexer_section_optional_for_back_compat() {
+        // Existing vault.toml files with no [indexer] block must still load.
+        let toml_text = r#"
+[defaults]
+context_tag = "vault-context"
+token_budget = 10000
+alpha = 0.6
+min_score = 0.15
+timeout = 3
+
+[router]
+mode = "auto"
+model = "haiku"
+
+[mlx]
+endpoint = "http://localhost:8080"
+router_model = "test"
+
+[embeddings]
+endpoint = "http://localhost:8081"
+model = "nomic-ai/nomic-embed-text-v1.5"
+dims = 768
+"#;
+        let cfg: Config = toml::from_str(toml_text).expect("parse");
+        assert!(cfg.indexer_exclude_patterns().is_empty());
     }
 
     #[test]

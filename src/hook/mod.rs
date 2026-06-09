@@ -124,6 +124,13 @@ mod tests {
         ) -> Result<i64, StoreError> {
             Ok(1)
         }
+        fn get_document_content_hash(
+            &self,
+            _project_id: i64,
+            _source_path: &str,
+        ) -> Result<Option<String>, StoreError> {
+            Ok(None)
+        }
         fn upsert_document(
             &mut self,
             _doc: &Document,

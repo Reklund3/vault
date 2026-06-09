@@ -98,6 +98,22 @@ impl Store for SqliteStore {
         Ok(id)
     }
 
+    fn get_document_content_hash(
+        &self,
+        project_id: i64,
+        source_path: &str,
+    ) -> Result<Option<String>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT content_hash FROM documents
+                 WHERE project_id = ?1 AND source_path = ?2",
+                params![project_id, source_path],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(backend_err)
+    }
+
     fn upsert_document(
         &mut self,
         doc: &Document,
@@ -838,6 +854,62 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn get_document_content_hash_returns_hash_for_known_doc() {
+        let mut store = SqliteStore::open_in_memory(&Config::default()).unwrap();
+        let project_id = create_project(&store, "p");
+        store
+            .upsert_document(
+                &Document {
+                    project_id,
+                    doc_type: DocType::Plan,
+                    source_path: "design.md".into(),
+                    title: "design".into(),
+                    content_hash: "abc123".into(),
+                },
+                &[],
+            )
+            .unwrap();
+
+        let got = store
+            .get_document_content_hash(project_id, "design.md")
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn get_document_content_hash_returns_none_for_unknown_path() {
+        let store = SqliteStore::open_in_memory(&Config::default()).unwrap();
+        let got = store.get_document_content_hash(1, "missing.md").unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn get_document_content_hash_scopes_to_project() {
+        // Same source_path in a different project must NOT leak across.
+        let mut store = SqliteStore::open_in_memory(&Config::default()).unwrap();
+        let pa = create_project(&store, "a");
+        let pb = create_project(&store, "b");
+        store
+            .upsert_document(
+                &Document {
+                    project_id: pa,
+                    doc_type: DocType::Plan,
+                    source_path: "x.md".into(),
+                    title: "x".into(),
+                    content_hash: "in-a".into(),
+                },
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.get_document_content_hash(pa, "x.md").unwrap().as_deref(),
+            Some("in-a")
+        );
+        assert!(store.get_document_content_hash(pb, "x.md").unwrap().is_none());
     }
 
     #[test]

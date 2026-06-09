@@ -9,6 +9,8 @@ mod types;
 mod parse;
 mod util;
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -25,6 +27,15 @@ enum Command {
     /// Pre-prompt hook for Claude Code (UserPromptSubmit). Reads JSON on stdin,
     /// emits a context block on stdout. Always exits 0 — fails open.
     Hook,
+    /// Predict what `vault index sync` would do without touching anything.
+    /// Walks the repo, reports walk + cache hits + would-classify count + cost
+    /// estimate. The full `index sync` subcommand lands in 14.8; this is a smoke
+    /// entry so the orchestrator runs against real data before the slice is done.
+    IndexSyncDryRun {
+        repo: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 fn main() {
@@ -37,5 +48,26 @@ fn main() {
             }
         }
         Command::Hook => hook::run(),
+        Command::IndexSyncDryRun { repo, name } => {
+            if let Err(e) = run_index_sync_dry_run(repo, name) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
     }
+}
+
+fn run_index_sync_dry_run(
+    repo: PathBuf,
+    name: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = config::Config::load()?;
+    let opts = index::sync::SyncOptions {
+        repo,
+        explicit_name: name,
+        dry_run: true,
+    };
+    let report = index::sync::run_sync(opts, &config)?;
+    println!("{report:#?}");
+    Ok(())
 }

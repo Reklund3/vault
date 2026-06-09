@@ -50,6 +50,16 @@ pub trait Store {
         chunks: &[ChunkWithEmbedding],
     ) -> Result<(), StoreError>;
 
+    /// Look up the stored `content_hash` for a document by `(project_id, source_path)`.
+    /// Returns `Ok(None)` when no such document exists. Used by sync's
+    /// unchanged-file gate to skip classify + parse + embed when the on-disk
+    /// content hasn't drifted since the last sync.
+    fn get_document_content_hash(
+        &self,
+        project_id: i64,
+        source_path: &str,
+    ) -> Result<Option<String>, StoreError>;
+
     fn prune_orphans(
         &mut self,
         project_id: i64,

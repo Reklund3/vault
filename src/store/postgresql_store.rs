@@ -19,6 +19,14 @@ impl Store for PostgresStore {
         todo!()
     }
 
+    fn get_document_content_hash(
+        &self,
+        _project_id: i64,
+        _source_path: &str,
+    ) -> Result<Option<String>, StoreError> {
+        todo!()
+    }
+
     fn upsert_document(
         &mut self,
         _doc: &Document,
