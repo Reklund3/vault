@@ -70,6 +70,11 @@ struct Embeddings {
     endpoint: String,
     model: String,
     dims: u16,
+    /// Command `vault tei start` runs to spawn the TEI server. Optional so
+    /// configs that manage TEI by hand still load; when unset, `vault tei start`
+    /// errors with guidance instead of spawning.
+    #[serde(default)]
+    launcher_cmd: Option<String>,
 }
 
 /// Optional `[indexer]` block. Today it carries only `[indexer.exclude]`; if/when
@@ -158,6 +163,17 @@ impl Config {
 
     pub fn embedding_endpoint(&self) -> &str {
         &self.embeddings.endpoint
+    }
+
+    /// The `[embeddings].launcher_cmd` string, if set and non-empty. Consumed by
+    /// `vault tei start`. A whitespace-only value collapses to `None` so the
+    /// start path errors with the same guidance as an absent key.
+    pub fn embedding_launcher_cmd(&self) -> Option<&str> {
+        self.embeddings
+            .launcher_cmd
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 
     pub fn classifier_mode(&self) -> &str {
@@ -261,11 +277,16 @@ impl Config {
         &self.defaults.context_tag
     }
 
+    /// `~/.vault/` — the directory holding `vault.db`, `vault.toml`, and the TEI
+    /// `tei.pid` / `tei.log` files. Does not create the directory; callers that
+    /// write into it (e.g. the TEI launcher) are responsible for `create_dir_all`
+    /// and permission hardening.
+    pub fn vault_dir(&self) -> Result<PathBuf, ConfigError> {
+        Ok(home_dir().ok_or(ConfigError::HomeNotFound)?.join(CONFIG_DIR))
+    }
+
     pub fn db_path(&self) -> Result<PathBuf, ConfigError> {
-        Ok(home_dir()
-            .ok_or(ConfigError::HomeNotFound)?
-            .join(CONFIG_DIR)
-            .join(CONFIG_DB))
+        Ok(self.vault_dir()?.join(CONFIG_DB))
     }
 }
 
@@ -293,6 +314,7 @@ impl Default for Config {
                 endpoint: "http://localhost:8081".to_string(),
                 model: "nomic-ai/nomic-embed-text-v1.5".to_string(),
                 dims: 768,
+                launcher_cmd: None,
             },
             indexer: Indexer::default(),
             domains: HashMap::new(),

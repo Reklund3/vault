@@ -50,10 +50,10 @@ What process boundary does buy:
   `yama.ptrace_scope`, `task_for_pid` on macOS subject to SIP — often
   blocked by default but not always.)
 - **Environment separation if scrubbed on spawn.** TEI doesn't need
-  `ANTHROPIC_API_KEY`; vault's TEI launcher must call `env_clear()`
-  before exec and pass through only what TEI needs. (Caveat: on Linux,
-  `/proc/<vault_pid>/environ` is readable by the same user, so this is
-  partial mitigation, not a wall.)
+  `ANTHROPIC_API_KEY`; vault's TEI launcher calls `env_clear()` before
+  exec and re-adds only what TEI needs (see "Secrets and credentials").
+  (Caveat: on Linux, `/proc/<vault_pid>/environ` is readable by the same
+  user, so this is partial mitigation, not a wall.)
 - **Execution context separation.** A library compromise (candle linked
   into vault) *is* vault — malicious code runs in the same address
   space and can intercept any function call. A service compromise
@@ -130,13 +130,18 @@ Defenses, in order of importance:
   sees an error.
 - Vault never logs, echoes, or includes the key in `vault diagnose` output.
 - `vault.toml` may contain repo paths and domain assignments but no secrets.
-- **When vault spawns a child process** (e.g. a future `vault tei start`
-  launcher for TEI), the spawn must call `env_clear()` and explicitly
-  pass through only the variables the child needs (`PATH`, `HOME`,
-  `HF_HUB_CACHE`, locale). `ANTHROPIC_API_KEY` and any unrelated env
-  must not be inherited. This is a partial mitigation per "Process
-  boundaries are defense-in-depth" above, but free to do up front and
-  awkward to retrofit.
+- **When vault spawns a child process** (the `vault tei start` launcher for
+  TEI — implemented in `src/tei/launcher.rs`), the spawn calls `env_clear()`
+  and re-adds only a minimal allowlist: `PATH`, `HOME`, the HuggingFace cache
+  vars (`HF_HUB_CACHE`, `HF_HOME`, `HUGGINGFACE_HUB_CACHE`), and locale
+  (`LANG`/`LC_*`). On Windows it additionally passes the system vars a process
+  cannot start without (`SystemRoot`, `windir`, `TEMP`, `APPDATA`, …) — these
+  are not secrets. `ANTHROPIC_API_KEY` and any unrelated env are never
+  inherited. This is a partial mitigation per "Process boundaries are
+  defense-in-depth" above (on Linux, `/proc/<vault_pid>/environ` is still
+  readable by the same user), but free to do up front and awkward to retrofit.
+  The launcher also writes `tei.pid` / `tei.log` `0600` and the `~/.vault/`
+  dir `0700` (best-effort, Unix).
 
 ---
 

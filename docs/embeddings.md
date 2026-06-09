@@ -122,19 +122,22 @@ launcher_cmd = "text-embeddings-router --model-id nomic-ai/nomic-embed-text-v1.5
 ```
 
 `launcher_cmd` is consumed by the `vault tei start | stop | status | logs`
-subcommand group. Vault spawns TEI from this command, detaches it, and tracks
-the PID + log file in `~/.vault/`. The spawn does `env_clear()` + explicit
-pass-through (`PATH`, `HOME`, `HF_HUB_CACHE`, locale) so `ANTHROPIC_API_KEY`
-is never inherited. If `launcher_cmd` is empty, `vault tei start` errors and
-asks you to start TEI manually. The hook never auto-spawns regardless — see
+subcommand group. Vault spawns TEI from this command, detaches it
+(`process_group(0)` on Unix, `DETACHED_PROCESS` on Windows), and tracks the
+PID + log file in `~/.vault/` (`tei.pid`, `tei.log`). The spawn does
+`env_clear()` then re-adds only a minimal allowlist — `PATH`, `HOME`, the
+HuggingFace cache vars, and locale (plus the system vars Windows needs to start
+a process) — so `ANTHROPIC_API_KEY` is never inherited. `vault tei start` is a
+no-op when TEI is already reachable; if `launcher_cmd` is unset it errors and
+prints an example line to add. The hook never auto-spawns regardless — see
 "Index-time vs hook-time availability" below.
 
 ### Index-time vs hook-time availability
 
-- If TEI is unreachable at **index time**, `vault index sync` probes first and
-  prompts to start it via `vault tei start` (or pass `--start-tei` to
-  auto-start). With no `launcher_cmd` set, it errors with a clear message —
-  you can't index without embeddings.
+- If TEI is unreachable at **index time**, `vault index sync` verifies it first
+  and aborts with an error that points you at `vault tei start`. With no
+  `launcher_cmd` set, `vault tei start` in turn tells you to add one or launch
+  TEI by hand — you can't index without embeddings.
 - If TEI is unreachable at **hook time**, the hook silently passes through (no
   context block) under the 3-second timeout, same as any other backend failure.
   **The hook never auto-spawns TEI** — cold-start blows the budget.

@@ -764,7 +764,7 @@ vault hook
 
 # Indexing — always explicit, never automated
 vault index sync <repo-path>              # Classifier (Gemma or Haiku) classifies, you confirm; skips unchanged files
-                                          # Probes TEI; prompts to start it if unreachable (or pass --start-tei)
+                                          # Verifies TEI first; if unreachable, errors with a hint to run `vault tei start`
 vault index add <path> --project <name> --type <doc_type> [--language <lang>]
 vault index remove --project <name>       # drop all documents for a project
 
@@ -778,10 +778,10 @@ vault diagnose "<prompt>" --budget 5000  # test different token budgets
 vault diagnose "<prompt>" --alpha 0.75   # test different BM25/cosine weights
 
 # TEI lifecycle (embedding service — runs as a separate process by design)
-vault tei start                           # spawn TEI from [embeddings].launcher_cmd; detach; write PID file
-vault tei stop                            # graceful SIGTERM via PID file, SIGKILL after timeout
-vault tei status                          # running? port? model? dim count? last response time
-vault tei logs [--follow]                 # show / tail the spawned-instance log
+vault tei start                           # spawn TEI from [embeddings].launcher_cmd; detach; write PID file; no-op if already reachable
+vault tei stop                            # terminate the recorded PID (kill on Unix, taskkill /F on Windows); clear pidfile
+vault tei status                          # endpoint reachability, pidfile/PID, configured launcher_cmd
+vault tei logs                            # print the tail of ~/.vault/tei.log
 
 # Maintenance
 vault reindex --project <name>           # force full re-index ignoring hash
@@ -790,20 +790,27 @@ vault reindex --project <name>           # force full re-index ignoring hash
 vault serve                              # expose retrieval as MCP tool over stdio
 ```
 
-**TEI launcher behavior:**
-- Spawn does `env_clear()` then explicitly passes through `PATH`, `HOME`,
-  `HF_HUB_CACHE`, and locale — `ANTHROPIC_API_KEY` is never inherited
-  (see `docs/security.md` → "Secrets and credentials").
-- PID + log file live in `~/.vault/tei.pid` and `~/.vault/tei.log`.
-- Cross-platform detach: `setsid` on Unix, `CREATE_NEW_PROCESS_GROUP` on Windows.
-- If `[embeddings].launcher_cmd` is unset, `vault tei start` errors clearly:
-  *"no launcher_cmd configured — start TEI manually or set [embeddings].launcher_cmd"*.
+**TEI launcher behavior (implemented):**
+- Spawn does `env_clear()` then re-adds a minimal allowlist — `PATH`, `HOME`,
+  the HuggingFace cache vars (`HF_HUB_CACHE`, `HF_HOME`,
+  `HUGGINGFACE_HUB_CACHE`), and locale (`LANG`/`LC_*`). On Windows it
+  additionally passes the system vars a process needs to start at all
+  (`SystemRoot`, `windir`, `TEMP`, `APPDATA`, …). `ANTHROPIC_API_KEY` is
+  never inherited (see `docs/security.md` → "Secrets and credentials").
+- PID + log file live in `~/.vault/tei.pid` and `~/.vault/tei.log`; both are
+  written `0600` and the dir `0700` (best-effort, Unix).
+- Cross-platform detach: `process_group(0)` on Unix (stable std, no `libc`
+  dependency), `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS` on Windows.
+- `start` is a no-op when TEI is already reachable, then polls the endpoint
+  for ~20 s and reports readiness (first-run weight downloads can exceed that;
+  the process keeps running — `vault tei logs` shows progress).
+- If `[embeddings].launcher_cmd` is unset, `vault tei start` errors clearly,
+  printing an example `launcher_cmd` line to copy into `vault.toml`.
 - **The hook never auto-spawns TEI.** Cold-start blows the 3 s budget;
   silent passthrough on TEI unreachable per fail-open contract.
-- `vault index sync` probes TEI at start. If unreachable and `launcher_cmd`
-  is set, prompts: *"TEI not running. Start it? [Y/n]"*. With `--start-tei`,
-  auto-starts without prompt. With `--stop-tei-after`, stops on completion;
-  default is to leave TEI running.
+- `vault index sync` verifies TEI at start; if unreachable it errors with a
+  hint to run `vault tei start`. (An interactive prompt + `--start-tei` /
+  `--stop-tei-after` flags are deferred — not in v1.)
 
 `vault diagnose` output shows:
 - Router query plan (with the impl name — gemma or haiku — that produced it)
@@ -890,7 +897,7 @@ No session state lives in vault.db. The hook binary is read-only at runtime.
 | SQLite driver | rusqlite with bundled feature | Compiles SQLite from source, supports sqlite-vec extension loading |
 | Embedding backend | HuggingFace `text-embeddings-inference` (TEI) on `localhost:8081` | Official Rust HTTP server, single binary, no Python deps, cross-platform; avoids the ONNX/Windows/bus-factor concerns of fastembed-rs and the Python+Mac-only constraint of mlx-embeddings. Subject to change — see `docs/embeddings.md` |
 | Embedder placement | External process (TEI), not linked into vault | Process boundary as defense-in-depth: smaller Cargo audit surface in vault, execution-context separation, vault stays out of candle/ort/safetensors CVE surface. Trade-off accepted: one extra service to install + start once. NOT a hard security wall — TEI runs as the same OS user, so FS / network permissions are equivalent; see `docs/security.md` "Process boundaries are defense-in-depth" |
-| TEI launcher in v1 | `vault tei start \| stop \| status \| logs` subcommand group | Hides the operational surface so daily use is one binary even though two processes run. `[embeddings].launcher_cmd` config knob; child-process spawn does `env_clear()` then passes through `PATH`, `HOME`, `HF_HUB_CACHE`, locale only. Hook never auto-spawns; `vault index sync` may prompt to start TEI if unreachable |
+| TEI launcher in v1 | `vault tei start \| stop \| status \| logs` subcommand group | Hides the operational surface so daily use is one binary even though two processes run. `[embeddings].launcher_cmd` config knob; child-process spawn does `env_clear()` then re-adds a minimal allowlist (`PATH`, `HOME`, HuggingFace cache vars, locale; plus required system vars on Windows) — `ANTHROPIC_API_KEY` never inherited. Detach via `process_group(0)` (Unix) / `DETACHED_PROCESS` (Windows). Hook never auto-spawns; `vault index sync` errors with a hint to run `vault tei start` if unreachable |
 | Embedding model | `nomic-ai/nomic-embed-text-v1.5` | Apache 2.0, strong MTEB scores, asymmetric `search_document:` / `search_query:` prefixes; supported natively by TEI |
 | Vector dimensions | 768 | Locked at schema creation — `chunks_vec FLOAT[768]`. Changing the model means a full reindex |
 | Primary interface | Pre-send hook (vault hook) | All routing/retrieval before Claude sees prompt; zero Claude token cost |
@@ -978,8 +985,8 @@ Bottom-up so retrieval is testable before the full stack is wired:
 ```
 Step 0  confirm embed stack  — TEI reachable at localhost:8081 with nomic-embed-text-v1.5
                               (768 dims). Write [embeddings] block in vault.toml. chunks_vec
-                              FLOAT[768] is locked at schema creation. See docs/runbook.md
-                              for the manual TEI launch until Step 8b lands.
+                              FLOAT[768] is locked at schema creation. `vault tei start`
+                              (Step 8b) launches TEI from [embeddings].launcher_cmd.
 Step 1  store/schema.rs     — embedded SQL, migration runner, open DB,
                               sqlite-vec auto-extension registration
 Step 2  store/sqlite_store::upsert_document  — replaces writer.rs from earlier drafts.
@@ -1005,11 +1012,12 @@ Step 6  parse/go_source.rs  — exported symbol + doc comment extraction
 Step 7  parse/rust_source.rs
 Step 8a embed/tei.rs        — HTTP client against TEI /embeddings (search_document/search_query prefixes)
 Step 8b tei/launcher.rs     — `vault tei start|stop|status|logs` subcommands. Spawn TEI from
-                              [embeddings].launcher_cmd with env_clear() + explicit
-                              pass-through (PATH, HOME, HF_HUB_CACHE, locale). PID + log
-                              files in ~/.vault/. Cross-platform detach (setsid on Unix,
-                              CREATE_NEW_PROCESS_GROUP on Windows). Hook never auto-spawns;
-                              vault index sync may prompt to start
+                              [embeddings].launcher_cmd with env_clear() + minimal allowlist
+                              (PATH, HOME, HF cache vars, locale; +required system vars on
+                              Windows). PID + log files in ~/.vault/ (0600/0700). Cross-platform
+                              detach (process_group(0) on Unix, DETACHED_PROCESS on Windows).
+                              Hook never auto-spawns; vault index sync errors with a
+                              `vault tei start` hint when TEI is unreachable
 Step 9  index/classify/{mod,gemma,haiku}.rs   — Classifier trait + Gemma + Haiku impls
                                                 cost-estimate prompt on first Haiku use
 Step 10 retrieve/router/{mod,gemma,haiku}.rs  — Router trait + Gemma + Haiku impls

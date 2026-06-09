@@ -7,6 +7,22 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 /// on the mlx port. API-level failures surface on the first real call; a full
 /// HTTP round trip doesn't fit the 200ms budget.
 pub fn mlx_reachable(endpoint: &str) -> bool {
+    port_reachable(endpoint)
+}
+
+/// TCP reachability for the TEI embeddings server, same 200ms budget as the mlx
+/// probe. Used by `vault tei start|status` to decide whether to spawn and by
+/// `vault index sync` preflight. A successful connect means something is
+/// listening; dim/model correctness is confirmed separately by
+/// `TeiEmbedder::verify_against_server`.
+pub fn tei_reachable(endpoint: &str) -> bool {
+    port_reachable(endpoint)
+}
+
+/// Shared TCP-connect core. The endpoint's authority must carry an explicit
+/// port (both the mlx and TEI config endpoints do); a portless authority falls
+/// back to `socket_authority`'s 8080 default, which is only meaningful for mlx.
+fn port_reachable(endpoint: &str) -> bool {
     let Some(authority) = socket_authority(endpoint) else {
         return false;
     };

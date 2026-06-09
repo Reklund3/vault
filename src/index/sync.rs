@@ -47,7 +47,10 @@ pub enum SyncError {
     ProjectNameCollision { name: String, message: String },
     #[error("declined Haiku cost — sync aborted")]
     DeclinedHaikuCost,
-    #[error("TEI unreachable: {0}")]
+    #[error(
+        "TEI embeddings server unreachable ({0}).\n\
+         Start it with `vault tei start` (or check `vault tei status`), then re-run sync."
+    )]
     TeiUnreachable(EmbedError),
     #[error("classifier construction failed: {0}")]
     BuildClassifier(ClassifyError),

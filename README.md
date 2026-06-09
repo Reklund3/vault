@@ -26,6 +26,12 @@ The hook has a 3-second timeout and silently passes through on failure — it ne
 # Add to ~/.claude/settings.json:
 # { "hooks": { "PreToolUse": [{ "command": "vault hook" }] } }
 
+# Start the embeddings server (needs [embeddings].launcher_cmd in vault.toml)
+vault tei start
+vault tei status
+vault tei logs
+vault tei stop
+
 # Index a repo before starting a cross-service session
 vault index sync ~/repos/build-service
 vault index sync ~/repos/auth-lib
@@ -113,7 +119,7 @@ cargo build --release
 
 **Router**: either Gemma 4 via `mlx_lm.server` on `localhost:8080` (zero-cost, recommended) or Anthropic Haiku via API (`ANTHROPIC_API_KEY`). `auto` mode picks Gemma when reachable, Haiku otherwise.
 
-**Embeddings**: HuggingFace's `text-embeddings-inference` server on `localhost:8081`, serving `nomic-ai/nomic-embed-text-v1.5` (768 dims). Single binary, no Python deps; install via the prebuilt release, Docker image, or `cargo install --path .` from the TEI repo. Once installed, set `[embeddings].launcher_cmd` in `vault.toml` and use `vault tei start | stop | status | logs` to manage the service — `vault index sync` will probe and offer to start it for you. The hook never auto-spawns. See `docs/embeddings.md` for the full rationale; this choice is current-best and may change.
+**Embeddings**: HuggingFace's `text-embeddings-inference` server on `localhost:8081`, serving `nomic-ai/nomic-embed-text-v1.5` (768 dims). Single binary, no Python deps; install via the prebuilt release, Docker image, or `cargo install --path .` from the TEI repo. Once installed, set `[embeddings].launcher_cmd` in `vault.toml` and use `vault tei start | stop | status | logs` to manage the service — if TEI is down when you run `vault index sync`, it aborts with a hint to run `vault tei start`. The hook never auto-spawns. See `docs/embeddings.md` for the full rationale; this choice is current-best and may change.
 
 ## Security
 

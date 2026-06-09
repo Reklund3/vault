@@ -5,6 +5,7 @@ mod hook;
 mod index;
 mod retrieve;
 mod store;
+mod tei;
 mod types;
 mod parse;
 mod util;
@@ -27,6 +28,11 @@ enum Command {
     /// Pre-prompt hook for Claude Code (UserPromptSubmit). Reads JSON on stdin,
     /// emits a context block on stdout. Always exits 0 — fails open.
     Hook,
+    /// Manage the local TEI embeddings server (start | stop | status | logs).
+    Tei {
+        #[command(subcommand)]
+        command: tei::TeiCommand,
+    },
     /// Predict what `vault index sync` would do without touching anything.
     /// Walks the repo, reports walk + cache hits + would-classify count + cost
     /// estimate. The full `index sync` subcommand lands in 14.8; this is a smoke
@@ -48,6 +54,12 @@ fn main() {
             }
         }
         Command::Hook => hook::run(),
+        Command::Tei { command } => {
+            if let Err(e) = tei::run(command) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         Command::IndexSyncDryRun { repo, name } => {
             if let Err(e) = run_index_sync_dry_run(repo, name) {
                 eprintln!("error: {e}");
