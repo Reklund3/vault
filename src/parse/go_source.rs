@@ -27,13 +27,12 @@ impl Parser for GoParser {
                 && !inside_raw_string_at_start
                 && open.is_none()
                 && scanner.group_depth == 0
+                && let Some(name) = parse_decl_header(raw_line)
             {
-                if let Some(name) = parse_decl_header(raw_line) {
-                    open = Some(OpenDef {
-                        name,
-                        start_line: i,
-                    });
-                }
+                open = Some(OpenDef {
+                    name,
+                    start_line: i,
+                });
             }
 
             scanner.group_depth += net;
@@ -46,40 +45,42 @@ impl Parser for GoParser {
             // A declaration is complete only when every delimiter group has
             // closed *and* we are not suspended inside a multi-line raw string
             // or block comment (both of which leave `group_depth` untouched).
-            if let Some(def) = &open {
-                if scanner.group_depth == 0 && !scanner.in_raw_string && !scanner.in_block_comment {
-                    let (label, emit) = match &def.name {
-                        DeclName::Named { label, exported } => (label.clone(), *exported),
-                        DeclName::Method { label, exported } => (label.clone(), *exported),
-                        // Grouped `const (`/`var (`/`type (` blocks are emitted
-                        // whole, regardless of whether every member is exported.
-                        // This honors the literal "const/var blocks" boundary in
-                        // the plan; flipping to strict exported-only is a one-line
-                        // predicate change here if ever required.
-                        DeclName::Block { keyword } => {
-                            let ident = first_block_ident(&lines[def.start_line..=i])
-                                .unwrap_or_else(|| "block".to_string());
-                            (format!("{keyword} {ident}"), true)
-                        }
-                    };
-
-                    if emit {
-                        let doc_start = doc_comment_start(&lines, def.start_line);
-                        let content = lines[doc_start..=i].join("\n");
-                        let content_hash = sha256_hex(content.as_bytes());
-                        let token_est = estimate_tokens(&content);
-                        chunks.push(Chunk {
-                            language: Language::Go,
-                            label,
-                            content,
-                            content_hash,
-                            token_est,
-                            chunk_index,
-                        });
-                        chunk_index += 1;
+            if let Some(def) = &open
+                && scanner.group_depth == 0
+                && !scanner.in_raw_string
+                && !scanner.in_block_comment
+            {
+                let (label, emit) = match &def.name {
+                    DeclName::Named { label, exported } => (label.clone(), *exported),
+                    DeclName::Method { label, exported } => (label.clone(), *exported),
+                    // Grouped `const (`/`var (`/`type (` blocks are emitted
+                    // whole, regardless of whether every member is exported.
+                    // This honors the literal "const/var blocks" boundary in
+                    // the plan; flipping to strict exported-only is a one-line
+                    // predicate change here if ever required.
+                    DeclName::Block { keyword } => {
+                        let ident = first_block_ident(&lines[def.start_line..=i])
+                            .unwrap_or_else(|| "block".to_string());
+                        (format!("{keyword} {ident}"), true)
                     }
-                    open = None;
+                };
+
+                if emit {
+                    let doc_start = doc_comment_start(&lines, def.start_line);
+                    let content = lines[doc_start..=i].join("\n");
+                    let content_hash = sha256_hex(content.as_bytes());
+                    let token_est = estimate_tokens(&content);
+                    chunks.push(Chunk {
+                        language: Language::Go,
+                        label,
+                        content,
+                        content_hash,
+                        token_est,
+                        chunk_index,
+                    });
+                    chunk_index += 1;
                 }
+                open = None;
             }
         }
 

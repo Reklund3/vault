@@ -96,11 +96,17 @@ END;
 
 static VEC_INIT: Once = Once::new();
 
+type SqliteAutoExtensionFn = unsafe extern "C" fn(
+    *mut rusqlite::ffi::sqlite3,
+    *mut *mut std::os::raw::c_char,
+    *const rusqlite::ffi::sqlite3_api_routines,
+) -> std::os::raw::c_int;
+
 fn register_vec_extension() {
     VEC_INIT.call_once(|| unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )));
+        let init_fn: SqliteAutoExtensionFn =
+            std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ());
+        rusqlite::ffi::sqlite3_auto_extension(Some(init_fn));
     });
 }
 
@@ -112,6 +118,7 @@ pub(crate) fn open(path: &Path) -> Result<Connection, StoreError> {
     Ok(conn)
 }
 
+#[allow(dead_code)]
 pub(crate) fn open_in_memory() -> Result<Connection, StoreError> {
     register_vec_extension();
     let conn = Connection::open_in_memory().map_err(|e| StoreError::Backend(e.to_string()))?;

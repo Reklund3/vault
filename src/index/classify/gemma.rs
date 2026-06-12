@@ -10,9 +10,6 @@ use crate::index::classify::{
     parse_response,
 };
 
-/// Classification runs at `vault index sync` time, not on the hook hot path, so
-/// the timeout is generous relative to the router's 3s budget.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// A valid JSON reply is ~30 tokens, but Gemma 4 (and other thinking models)
 /// burn hundreds of tokens on internal reasoning before emitting the answer.
 /// 1024 gives the model room to think and still leave space for the JSON.
@@ -26,7 +23,7 @@ pub(crate) struct GemmaClassifier {
 
 impl GemmaClassifier {
     pub(crate) fn from_config(config: &Config) -> Result<Self, ClassifyError> {
-        Self::from_config_with_timeout(config, DEFAULT_TIMEOUT)
+        Self::from_config_with_timeout(config, config.classifier_timeout())
     }
 
     pub(crate) fn from_config_with_timeout(

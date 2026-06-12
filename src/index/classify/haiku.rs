@@ -11,7 +11,6 @@ use crate::index::classify::{
 
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TOKENS: u32 = 128;
 
 /// Anthropic Haiku classifier. The API key is held only in memory and only ever
@@ -26,7 +25,7 @@ pub(crate) struct HaikuClassifier {
 
 impl HaikuClassifier {
     pub(crate) fn from_config(config: &Config) -> Result<Self, ClassifyError> {
-        Self::from_config_with_timeout(config, DEFAULT_TIMEOUT)
+        Self::from_config_with_timeout(config, config.classifier_timeout())
     }
 
     pub(crate) fn from_config_with_timeout(

@@ -13,6 +13,7 @@ pub enum ConfigError {
     #[error("could not resolve home directory (set HOME or USERPROFILE)")]
     HomeNotFound,
     #[error("missing key {0}")]
+    #[allow(dead_code)]
     MissingKey(String),
     #[error("io error reading config: {0}")]
     IoError(#[from] std::io::Error),
@@ -26,6 +27,7 @@ struct Defaults {
     token_budget: u16,
     alpha: f32,
     min_score: f32,
+    #[allow(dead_code)]
     timeout: u8,
 }
 
@@ -48,6 +50,10 @@ fn default_router_timeout_secs() -> u32 {
 struct Classifier {
     mode: String,
     model: String,
+    /// HTTP timeout for one classifier call. Sync time, not hot path, so a
+    /// generous value is fine — large local models (e.g. Gemma 4 31b bf16) can
+    /// need 30–90s per call once warm, and longer on cold-load.
+    timeout_secs: u32,
 }
 
 impl Default for Classifier {
@@ -55,6 +61,7 @@ impl Default for Classifier {
         Self {
             mode: "auto".to_string(),
             model: "haiku".to_string(),
+            timeout_secs: 300,
         }
     }
 }
@@ -182,6 +189,10 @@ impl Config {
 
     pub fn classifier_model(&self) -> &str {
         &self.classifier.model
+    }
+
+    pub fn classifier_timeout(&self) -> Duration {
+        Duration::from_secs(self.classifier.timeout_secs as u64)
     }
 
     pub fn router_mode(&self) -> &str {

@@ -27,11 +27,10 @@ impl DefKind {
     /// the next real definition.
     fn skipped_from(line: &str) -> Option<&'static str> {
         for kw in ["option", "extend"] {
-            if line.starts_with(kw) {
-                let rest = &line[kw.len()..];
-                if rest.starts_with(|c: char| c.is_whitespace() || c == '(') {
-                    return Some(kw);
-                }
+            if let Some(rest) = line.strip_prefix(kw)
+                && rest.starts_with(|c: char| c.is_whitespace() || c == '(')
+            {
+                return Some(kw);
             }
         }
         None
@@ -77,26 +76,26 @@ impl Parser for ProtoParser {
                 });
             }
 
-            if let Some(def) = &open {
-                if scanner.brace_depth == 0 {
-                    if !def.name.is_empty() {
-                        let doc_start = doc_comment_start(&lines, def.start_line);
-                        let content = lines[doc_start..=i].join("\n");
-                        let label = format!("{} {}", def.kind.as_str(), def.name);
-                        let content_hash = sha256_hex(content.as_bytes());
-                        let token_est = estimate_tokens(&content);
-                        chunks.push(Chunk {
-                            language: Language::Proto,
-                            label,
-                            content,
-                            content_hash,
-                            token_est,
-                            chunk_index,
-                        });
-                        chunk_index += 1;
-                    }
-                    open = None;
+            if let Some(def) = &open
+                && scanner.brace_depth == 0
+            {
+                if !def.name.is_empty() {
+                    let doc_start = doc_comment_start(&lines, def.start_line);
+                    let content = lines[doc_start..=i].join("\n");
+                    let label = format!("{} {}", def.kind.as_str(), def.name);
+                    let content_hash = sha256_hex(content.as_bytes());
+                    let token_est = estimate_tokens(&content);
+                    chunks.push(Chunk {
+                        language: Language::Proto,
+                        label,
+                        content,
+                        content_hash,
+                        token_est,
+                        chunk_index,
+                    });
+                    chunk_index += 1;
                 }
+                open = None;
             }
         }
 

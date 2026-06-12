@@ -393,6 +393,99 @@ fn ext_fallback(extension: &str) -> Classification {
     }
 }
 
+/// Human-readable rendering of a `SyncReport` for `vault index sync`. Branches
+/// on `report.dry_run` because counters that are intentionally zero in dry-run
+/// (parse/embed/upsert/prune) would mislead the reader if printed unconditionally.
+pub fn format_report(report: &SyncReport) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+
+    if report.dry_run {
+        let _ = writeln!(
+            out,
+            "Dry run for project {:?} (no DB or remote services touched)",
+            report.project
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "  Walked:                 {} files",
+            report.files_walked
+        );
+        let _ = writeln!(
+            out,
+            "  Cache hits:             {} (vault.toml [classifications.*])",
+            report.files_cached
+        );
+        let _ = writeln!(
+            out,
+            "  Would classify:         {}",
+            report.files_would_classify
+        );
+        if report.estimated_haiku_cost_usd > 0.0 {
+            let _ = writeln!(
+                out,
+                "  Estimated Haiku cost:   ${:.4}",
+                report.estimated_haiku_cost_usd
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  Estimated Haiku cost:   $0.00 (auto resolved to Gemma)"
+            );
+        }
+    } else {
+        let _ = writeln!(
+            out,
+            "Synced project {:?} (id {})",
+            report.project, report.project_id
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "  Walked:                 {} files",
+            report.files_walked
+        );
+        let _ = writeln!(out, "  Cache hits:             {}", report.files_cached);
+        let _ = writeln!(out, "  Classified:             {}", report.files_classified);
+        let _ = writeln!(
+            out,
+            "  Skipped remote (head):  {} (secret pre-scan → ext fallback)",
+            report.files_skipped_remote_classify
+        );
+        let _ = writeln!(
+            out,
+            "  Unchanged:              {} (content_hash matched)",
+            report.files_unchanged
+        );
+        let _ = writeln!(
+            out,
+            "  Parsed via parser:      {}",
+            report.files_parsed_via_parser
+        );
+        let _ = writeln!(
+            out,
+            "  Parsed as whole-file:   {}",
+            report.files_parsed_as_whole
+        );
+        let _ = writeln!(out, "  Chunks indexed:         {}", report.chunks_indexed);
+        let _ = writeln!(
+            out,
+            "  Chunks dropped (secret): {}",
+            report.chunks_dropped_secret
+        );
+        let _ = writeln!(out, "  Orphans pruned:         {}", report.orphans_pruned);
+        if !report.files_skipped.is_empty() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "  Skipped ({}):", report.files_skipped.len());
+            for (path, reason) in &report.files_skipped {
+                let _ = writeln!(out, "    - {path}: {reason}");
+            }
+        }
+    }
+    out
+}
+
 fn derive_project_name(canonical_repo: &Path) -> String {
     canonical_repo
         .file_name()
@@ -1014,5 +1107,94 @@ dims = 768
         let mut err = Vec::new();
         let r = prompt_for_haiku_cost(10, &input[..], &mut err);
         assert!(matches!(r, Err(SyncError::DeclinedHaikuCost)));
+    }
+
+    // ---------- format_report ----------
+
+    #[test]
+    fn format_dry_run_with_gemma_shows_zero_cost_note() {
+        let r = SyncReport {
+            project: "vault".into(),
+            dry_run: true,
+            files_walked: 60,
+            files_cached: 0,
+            files_would_classify: 60,
+            estimated_haiku_cost_usd: 0.0,
+            ..SyncReport::default()
+        };
+        let s = format_report(&r);
+        assert!(s.contains("Dry run for project \"vault\""));
+        assert!(s.contains("Walked:                 60 files"));
+        assert!(s.contains("Would classify:         60"));
+        assert!(s.contains("auto resolved to Gemma"));
+        assert!(!s.contains("Chunks indexed"));
+    }
+
+    #[test]
+    fn format_dry_run_with_haiku_shows_dollar_estimate() {
+        let r = SyncReport {
+            project: "vault".into(),
+            dry_run: true,
+            files_walked: 60,
+            files_would_classify: 60,
+            estimated_haiku_cost_usd: 0.012,
+            ..SyncReport::default()
+        };
+        let s = format_report(&r);
+        assert!(s.contains("Estimated Haiku cost:   $0.0120"));
+    }
+
+    #[test]
+    fn format_real_sync_lists_all_counters() {
+        let r = SyncReport {
+            project: "vault".into(),
+            project_id: 7,
+            dry_run: false,
+            files_walked: 60,
+            files_cached: 5,
+            files_classified: 50,
+            files_skipped_remote_classify: 1,
+            files_unchanged: 4,
+            files_parsed_via_parser: 45,
+            files_parsed_as_whole: 10,
+            chunks_indexed: 342,
+            chunks_dropped_secret: 4,
+            orphans_pruned: 2,
+            ..SyncReport::default()
+        };
+        let s = format_report(&r);
+        assert!(s.contains("Synced project \"vault\" (id 7)"));
+        assert!(s.contains("Classified:             50"));
+        assert!(s.contains("Chunks indexed:         342"));
+        assert!(s.contains("Orphans pruned:         2"));
+        // Dry-run-only counters absent from real-sync output
+        assert!(!s.contains("Estimated Haiku cost"));
+        assert!(!s.contains("Would classify"));
+    }
+
+    #[test]
+    fn format_real_sync_lists_skipped_files_when_present() {
+        let r = SyncReport {
+            project: "vault".into(),
+            dry_run: false,
+            files_walked: 2,
+            files_classified: 1,
+            files_skipped: vec![("src/foo.tmp".into(), "io error".into())],
+            ..SyncReport::default()
+        };
+        let s = format_report(&r);
+        assert!(s.contains("Skipped (1):"));
+        assert!(s.contains("    - src/foo.tmp: io error"));
+    }
+
+    #[test]
+    fn format_real_sync_omits_skipped_section_when_empty() {
+        let r = SyncReport {
+            project: "vault".into(),
+            dry_run: false,
+            ..SyncReport::default()
+        };
+        let s = format_report(&r);
+        assert!(!s.contains("Skipped ("));
     }
 }

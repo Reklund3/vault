@@ -28,6 +28,7 @@ pub struct ChunkWithEmbedding {
 #[derive(Debug, Clone)]
 pub struct Hit {
     pub chunk_id: i64,
+    #[allow(dead_code)]
     pub project_id: i64,
     pub doc_type: DocType,
     pub label: String,
@@ -38,6 +39,7 @@ pub struct Hit {
     pub final_score: f32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RetrievalLogEntry {
     pub prompt_hash: String,

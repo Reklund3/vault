@@ -6,6 +6,7 @@ pub enum StoreError {
     #[error("migration failed: {0}")]
     Migration(String),
     #[error("not found")]
+    #[allow(dead_code)]
     NotFound,
     #[error("integrity violation: {0}")]
     Conflict(String),
@@ -98,5 +99,6 @@ pub trait Store {
         Ok(merge(bm25, cosine, alpha, TOP_K))
     }
 
+    #[allow(dead_code)]
     fn log_retrieval(&mut self, entry: &RetrievalLogEntry) -> Result<(), StoreError>;
 }

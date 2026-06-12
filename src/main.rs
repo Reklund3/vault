@@ -33,14 +33,26 @@ enum Command {
         #[command(subcommand)]
         command: tei::TeiCommand,
     },
-    /// Predict what `vault index sync` would do without touching anything.
-    /// Walks the repo, reports walk + cache hits + would-classify count + cost
-    /// estimate. The full `index sync` subcommand lands in 14.8; this is a smoke
-    /// entry so the orchestrator runs against real data before the slice is done.
-    IndexSyncDryRun {
+    /// Index management (sync, …).
+    Index {
+        #[command(subcommand)]
+        command: IndexCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum IndexCommand {
+    /// Walk a repo, classify each file, parse + embed, and upsert chunks into the store.
+    /// With `--dry-run`, only walks and reports counters — no remote calls, no DB writes.
+    Sync {
+        /// Path to the repo to index.
         repo: PathBuf,
+        /// Project name override (default: canonical path's last component).
         #[arg(long)]
         name: Option<String>,
+        /// Walk + cache-lookup only. Skips TEI, classifier, and store writes.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -60,26 +72,33 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::IndexSyncDryRun { repo, name } => {
-            if let Err(e) = run_index_sync_dry_run(repo, name) {
-                eprintln!("error: {e}");
-                std::process::exit(1);
+        Command::Index { command } => match command {
+            IndexCommand::Sync {
+                repo,
+                name,
+                dry_run,
+            } => {
+                if let Err(e) = run_index_sync(repo, name, dry_run) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
             }
-        }
+        },
     }
 }
 
-fn run_index_sync_dry_run(
+fn run_index_sync(
     repo: PathBuf,
     name: Option<String>,
+    dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config::Config::load()?;
     let opts = index::sync::SyncOptions {
         repo,
         explicit_name: name,
-        dry_run: true,
+        dry_run,
     };
     let report = index::sync::run_sync(opts, &config)?;
-    println!("{report:#?}");
+    print!("{}", index::sync::format_report(&report));
     Ok(())
 }

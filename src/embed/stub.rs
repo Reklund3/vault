@@ -74,6 +74,6 @@ mod tests {
         let v = e.embed_query("anything").unwrap();
         assert_eq!(v.len(), config.embedding_dim());
         assert_eq!(v.iter().filter(|f| **f != 0.0).count(), 1);
-        assert!(v.iter().any(|f| *f == 1.0));
+        assert!(v.contains(&1.0));
     }
 }

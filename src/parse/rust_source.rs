@@ -158,17 +158,16 @@ impl Parser for RustParser {
                 });
             }
 
-            if let Some(item) = &open {
-                if scanner.group_depth == item.close_depth
-                    && scanner.block_comment_depth == 0
-                    && !scanner.in_string_like()
-                {
-                    if item.emit {
-                        let content = lines[item.start_line..=i].join("\n");
-                        push_chunk(&mut chunks, &mut chunk_index, item.label.clone(), content);
-                    }
-                    open = None;
+            if let Some(item) = &open
+                && scanner.group_depth == item.close_depth
+                && scanner.block_comment_depth == 0
+                && !scanner.in_string_like()
+            {
+                if item.emit {
+                    let content = lines[item.start_line..=i].join("\n");
+                    push_chunk(&mut chunks, &mut chunk_index, item.label.clone(), content);
                 }
+                open = None;
             }
 
             let exit_impl =
@@ -382,13 +381,14 @@ impl LineScanner {
 
             // Raw (byte) string: r"…", r#"…"#, br"…", br#"…"#. Only when the
             // `r`/`b` does not continue a preceding identifier.
-            if (b == b'r' || b == b'b') && !prev_ident {
-                if let Some((consumed, hashes)) = raw_string_prefix(bytes, i) {
-                    self.in_raw_string = Some(hashes);
-                    i += consumed;
-                    prev_ident = false;
-                    continue;
-                }
+            if (b == b'r' || b == b'b')
+                && !prev_ident
+                && let Some((consumed, hashes)) = raw_string_prefix(bytes, i)
+            {
+                self.in_raw_string = Some(hashes);
+                i += consumed;
+                prev_ident = false;
+                continue;
             }
 
             if b == b'"' {
@@ -578,11 +578,11 @@ fn strip_modifiers(mut t: &str) -> &str {
         }
         if let Some(rest) = strip_word(t, "extern") {
             let rest = rest.trim_start();
-            if let Some(after_quote) = rest.strip_prefix('"') {
-                if let Some(close) = after_quote.find('"') {
-                    t = &after_quote[close + 1..];
-                    continue;
-                }
+            if let Some(after_quote) = rest.strip_prefix('"')
+                && let Some(close) = after_quote.find('"')
+            {
+                t = &after_quote[close + 1..];
+                continue;
             }
             t = rest;
             continue;

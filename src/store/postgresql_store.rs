@@ -4,6 +4,7 @@ use crate::store::types::{ChunkWithEmbedding, Document, Hit, RetrievalLogEntry};
 
 // Placeholder for the future distributed backend (tsvector + pgvector).
 // Methods stay as `todo!()` until vault gains a real distribution requirement.
+#[allow(dead_code)]
 pub struct PostgresStore {}
 
 impl Store for PostgresStore {

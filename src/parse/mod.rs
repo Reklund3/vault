@@ -15,6 +15,7 @@ pub use proto::ProtoParser;
 pub use rust_source::RustParser;
 
 pub trait Parser {
+    #[allow(dead_code)]
     fn language(&self) -> Language;
     fn parse(&self, source: &str) -> Result<Vec<Chunk>, ParseError>;
 }
@@ -56,7 +57,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 /// good enough for chunk-level filtering inside the store.
 pub(crate) fn estimate_tokens(content: &str) -> u32 {
     let chars = content.chars().count();
-    ((chars + 3) / 4) as u32
+    chars.div_ceil(4) as u32
 }
 
 /// Enforce `UNIQUE(document_id, label)` by suffixing duplicates `#2`, `#3`, …

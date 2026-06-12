@@ -250,6 +250,7 @@ timeout_secs = 3
 [classifier]
 mode = "{mode}"
 model = "haiku"
+timeout_secs = 3
 
 [mlx]
 endpoint = "http://127.0.0.1:1"

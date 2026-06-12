@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn skips_files_over_max_bytes() {
         let tmp = Tmp::new("large");
-        tmp.write("small.txt", &vec![b'x'; 100]);
+        tmp.write("small.txt", &[b'x'; 100]);
         tmp.write("huge.bin", &vec![b'x'; (MAX_FILE_BYTES + 1) as usize]);
         let out = walk_repo(&tmp.root, &WalkOptions::default()).unwrap();
         assert_eq!(rels(&out), vec!["small.txt".to_string()]);

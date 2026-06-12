@@ -7,6 +7,7 @@ pub use tei::TeiEmbedder;
 pub trait Embedder {
     /// Embedding dimension this embedder produces. Used by callers (the store,
     /// validation paths) to confirm three-way agreement: config ⟷ schema ⟷ server.
+    #[allow(dead_code)]
     fn dim(&self) -> usize;
 
     fn embed_document(&self, text: &str) -> Result<Vec<f32>, EmbedError>;
