@@ -739,7 +739,9 @@ endpoint = "http://localhost:8081"
 model = "nomic-ai/nomic-embed-text-v1.5"
 dims = 768
 
-[classifications."{key}"]
+# Literal (single-quoted) key: Windows canonical paths contain backslashes,
+# which a basic TOML string would treat as (invalid) escape sequences.
+[classifications.'{key}']
 "{pattern}" = {{ doc_type = "{doc_type}", language = "{language}" }}
 "#
         );
