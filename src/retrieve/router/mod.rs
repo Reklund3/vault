@@ -22,8 +22,6 @@ pub enum RouterError {
     Transport(String),
     #[error("bad response: {0}")]
     BadResponse(String),
-    #[error("unparseable query plan: {0}")]
-    Unparseable(String),
     #[error("ANTHROPIC_API_KEY not set (required for the haiku router)")]
     MissingApiKey,
 }
@@ -86,18 +84,19 @@ struct RawQueryPlan {
 }
 
 impl QueryPlan {
-    /// Build a `QueryPlan` from the model's raw string arrays. `doc_types` is
-    /// strict — the four-way set is closed, so an unrecognized value is a real
-    /// model failure. `languages` is lenient — unknown labels collapse to
-    /// `Language::Unknown` so the store still gets a useful filter. Both are
-    /// lowercased and trimmed first to tolerate capitalization drift.
-    fn from_raw(raw: RawQueryPlan) -> Result<Self, RouterError> {
-        let doc_types: Result<Vec<DocType>, _> = raw
+    /// Build a `QueryPlan` from the model's raw string arrays. Both label
+    /// arrays are lowercased and trimmed to tolerate capitalization drift.
+    /// `doc_types` drops unrecognized values (validated-drop): the set is
+    /// closed, but one hallucinated label ("readme") must not void an
+    /// otherwise-good plan — the filters are ANDed, so failing the whole plan
+    /// here costs total context loss (review P2). An emptied list means "no
+    /// doc_type filter", which degrades to searching all doc types.
+    /// `languages` collapses unknowns to `Language::Unknown` instead.
+    fn from_raw(raw: RawQueryPlan) -> Self {
+        let doc_types: Vec<DocType> = raw
             .doc_types
             .into_iter()
-            .map(|s| {
-                DocType::from_str(&s.trim().to_ascii_lowercase()).map_err(RouterError::Unparseable)
-            })
+            .filter_map(|s| DocType::from_str(&s.trim().to_ascii_lowercase()).ok())
             .collect();
         let languages: Vec<Language> = raw
             .languages
@@ -106,13 +105,13 @@ impl QueryPlan {
                 Language::from_str(&s.trim().to_ascii_lowercase()).unwrap_or(Language::Unknown)
             })
             .collect();
-        Ok(Self {
+        Self {
             projects: raw.projects,
             type_names: raw.type_names,
             topics: raw.topics,
-            doc_types: doc_types?,
+            doc_types,
             languages,
-        })
+        }
     }
 }
 
@@ -127,7 +126,7 @@ pub(crate) fn parse_response(text: &str) -> Result<RouterOutput, RouterError> {
     }
     let raw: RawQueryPlan = serde_json::from_str(json)
         .map_err(|e| RouterError::BadResponse(format!("invalid JSON: {e}")))?;
-    Ok(RouterOutput::Plan(QueryPlan::from_raw(raw)?))
+    Ok(RouterOutput::Plan(QueryPlan::from_raw(raw)))
 }
 
 /// Which backend `resolve_backend` selected. Kept separate from construction so
@@ -186,33 +185,44 @@ mod tests {
 
     #[test]
     fn from_raw_parses_known_labels() {
-        let plan = QueryPlan::from_raw(raw(&["contract", "plan"], &["proto", "rust"])).unwrap();
+        let plan = QueryPlan::from_raw(raw(&["contract", "plan"], &["proto", "rust"]));
         assert_eq!(plan.doc_types, vec![DocType::Contract, DocType::Plan]);
         assert_eq!(plan.languages, vec![Language::Proto, Language::Rust]);
     }
 
     #[test]
     fn from_raw_is_case_insensitive() {
-        let plan = QueryPlan::from_raw(raw(&["Contract"], &["Rust"])).unwrap();
+        let plan = QueryPlan::from_raw(raw(&["Contract"], &["Rust"]));
         assert_eq!(plan.doc_types, vec![DocType::Contract]);
         assert_eq!(plan.languages, vec![Language::Rust]);
     }
 
     #[test]
     fn from_raw_unknown_language_is_lenient() {
-        let plan = QueryPlan::from_raw(raw(&["convention"], &["python"])).unwrap();
+        let plan = QueryPlan::from_raw(raw(&["convention"], &["python"]));
         assert_eq!(plan.languages, vec![Language::Unknown]);
     }
 
     #[test]
-    fn from_raw_unknown_doc_type_is_strict() {
-        let err = QueryPlan::from_raw(raw(&["widget"], &[])).unwrap_err();
-        assert!(matches!(err, RouterError::Unparseable(_)));
+    fn from_raw_drops_unknown_doc_type_keeps_valid() {
+        // Validated-drop (review P2): "readme" is a hallucination, but the
+        // valid "convention" — and the rest of the plan — must survive it.
+        let plan = QueryPlan::from_raw(raw(&["readme", "convention"], &["go"]));
+        assert_eq!(plan.doc_types, vec![DocType::Convention]);
+        assert_eq!(plan.languages, vec![Language::Go]);
+    }
+
+    #[test]
+    fn from_raw_all_unknown_doc_types_mean_no_filter() {
+        // Every value dropped → empty list → build_filter_clause emits no
+        // doc_type clause; retrieval degrades to all doc types, not to zero.
+        let plan = QueryPlan::from_raw(raw(&["widget"], &[]));
+        assert!(plan.doc_types.is_empty());
     }
 
     #[test]
     fn from_raw_empty_arrays_are_fine() {
-        let plan = QueryPlan::from_raw(raw(&[], &[])).unwrap();
+        let plan = QueryPlan::from_raw(raw(&[], &[]));
         assert!(plan.doc_types.is_empty());
         assert!(plan.languages.is_empty());
     }
@@ -299,9 +309,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_response_unknown_doc_type_is_unparseable() {
-        let err = parse_response(r#"{"doc_types":["widget"],"languages":["go"]}"#).unwrap_err();
-        assert!(matches!(err, RouterError::Unparseable(_)));
+    fn parse_response_unknown_doc_type_is_dropped() {
+        let out =
+            parse_response(r#"{"doc_types":["readme","contract"],"languages":["go"]}"#).unwrap();
+        match out {
+            RouterOutput::Plan(plan) => {
+                assert_eq!(plan.doc_types, vec![DocType::Contract]);
+                assert_eq!(plan.languages, vec![Language::Go]);
+            }
+            RouterOutput::Skip => panic!("expected Plan"),
+        }
     }
 
     #[test]

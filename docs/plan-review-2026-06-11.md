@@ -18,11 +18,11 @@ The design plan was written before Steps 1–14.8 were implemented and has drift
 - Candidate resolutions to record: dedicated small routing model (or Haiku-for-hook), per-role model + timeout keys, hook-side hard clamp on router timeout.
 - *(The companion zero-observability finding was resolved 2026-06-12 — outcome telemetry in `~/.vault/hook.log` + stderr breadcrumb; see the plan's Hook Behavior section. The 15s router tax is now measured per call, not yet fixed.)*
 
-**P2. Query-plan → filter trust gap: three silent total-context-loss paths.**
+**P2. Query-plan → filter trust gap: two silent total-context-loss paths.**
 - Project names are filtered case-sensitively (`IN (SELECT id FROM projects WHERE name IN (...))`, BINARY collation) while domain-tag matching is `eq_ignore_ascii_case` — router emits "Vault", the tag resolves but every chunk is filtered out.
-- `doc_types` parsing is strict (src/retrieve/router/mod.rs:89–111): one hallucinated value ("readme") makes the entire plan `Unparseable` → passthrough.
 - `languages` is lenient but destructively so: unknown labels collapse to `Language::Unknown`, which then becomes `AND c.language IN ('unknown')` — router says `["python"]`, filter matches nothing. Lenient-parse-then-hard-filter is worse than dropping the value.
-- Fixes are small and mechanical (NOCASE/validated-drop/drop-unknown) — record as tracking items.
+- Fixes are small and mechanical (NOCASE / drop-unknown) — record as tracking items.
+- *(A third path — strict `doc_types` parsing, where one hallucinated value voided the whole plan — was resolved 2026-06-12: unrecognized values are now dropped (validated-drop), an emptied list means "no doc_type filter", and the dead `RouterError::Unparseable` variant was removed.)*
 
 **P3. The injection-framing contract is broken on two axes — and it's a now-decision (nothing is registered yet: `~/.claude/settings.json` has no hooks entry, `~/.claude/CLAUDE.md` doesn't exist).**
 - The proposed global CLAUDE.md text enumerates exactly three domain tags; the fallback `<vault-context>` tag (code default, returned whenever no project matches a domain) is **not covered** → context arrives with no data-not-instructions framing. Same hole every time a domain is added without the two-file edit. Improvement to record: **one constant wrapper tag with a domain attribute** (`<vault-context domain="software">`) — instruction written once, never drifts, kills the two-file coupling.
@@ -93,7 +93,7 @@ Doc-only pass; all code changes stay out of scope and land as decisions/tracking
 - [ ] Binary structure: rewrite the tree to match `src/`; reverse the Step-11 "absorbed" notes; correct the Store trait listing.
 - [ ] CLI: status-mark unimplemented commands; add `--name`/`--dry-run`; note diagnose flag reality.
 - [ ] Decisions table: token estimation → chars/4 (with revisit note); prompt-caching → correct mechanism (A11); hybrid placement → extracted (A2); latency table → real 31B numbers.
-- [ ] Tracking items: resolve A12; add items for P1 (per-role model+timeout, hook clamp, latency-aware fallback), P2 (name normalization, lenient doc_types, drop-unknown languages), P3 (single-tag+domain-attribute decision, block grouping vs contract text, doctor check), P4 (markdown parser priority, size guard, embed truncation), B1/B3 (retrieval_log fate + WAL as one decision), B6 (cache relocation), B7 (router prompt cleanup), C1, C2.
+- [ ] Tracking items: resolve A12; add items for P1 (per-role model+timeout, hook clamp, latency-aware fallback), P2 (name normalization, drop-unknown languages), P3 (single-tag+domain-attribute decision, block grouping vs contract text, doctor check), P4 (markdown parser priority, size guard, embed truncation), B1/B3 (retrieval_log fate + WAL as one decision), B6 (cache relocation), B7 (router prompt cleanup), C1, C2.
 
 ### `CLAUDE.md` (repo)
 - [ ] Key modules table: `writer.rs`/`query.rs` → `sqlite_store.rs`; add walk/sync/secrets/diagnose/hybrid.
