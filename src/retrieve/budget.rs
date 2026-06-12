@@ -1,15 +1,11 @@
 use crate::store::Hit;
 
 /// The result of fitting ranked hits into a token budget. `tokens_used` is the
-/// running sum of `token_est` over the selected chunks — the hook hands it to
-/// `RetrievalLogEntry.tokens_injected` and the context-block builder uses it
-/// for telemetry.
+/// running sum of `token_est` over the selected chunks — the hook records it
+/// in the `~/.vault/hook.log` telemetry record for each injection.
 #[derive(Debug, Clone)]
 pub struct BudgetedSelection {
     pub chunks: Vec<Hit>,
-    // Surfaced for `RetrievalLogEntry.tokens_injected` once the hook starts
-    // writing retrieval-log rows. Until then it has no production reader.
-    #[allow(dead_code)]
     pub tokens_used: u32,
 }
 

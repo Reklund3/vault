@@ -10,13 +10,13 @@ The design plan was written before Steps 1–14.8 were implemented and has drift
 
 ### Top 5 (priority order)
 
-**P1. Hot-path viability: the router cannot meet the hook's latency contract, and nothing detects or reports it.**
+**P1. Hot-path viability: the router cannot meet the hook's latency contract.**
 - The plan promises "3 second timeout" as an invariant (lines 495, 568, 909) and Gemma latency of "~100–300ms" (line 128). The deployed model (`gemma-4-31b-bf16`) runs ~15s/call warm — the live `vault.toml` comment says so.
 - One knob, two contexts: `[router].timeout_secs` governs both the hook hot path and interactive diagnose (`GemmaRouter::from_config` → `config.router_timeout()`, src/retrieve/router/gemma.rs:30). The live config raised it to 120s for diagnose — which silently rewrites the hook contract. Two failure modes fork from here: default config (3s) → every hook call times out → **systematic silent passthrough**; live config (120s) → the hook *succeeds* at a **~15s tax on every prompt** (within Claude Code's 60s default hook kill window). Both unacceptable, different bugs. The plan's `[defaults] timeout` knob is parsed-but-dead in code (`#[allow(dead_code)]`, src/config.rs:30).
 - The auto-probe is TCP-reachability only (200ms, src/util/probe.rs) — it cannot detect "reachable but too slow," so auto mode happily selects the unusable backend.
 - One `[mlx].router_model` serves both router and classifier (src/config.rs:213–219). Routing needs small/fast; classification tolerates big/slow. No per-role model knob.
-- **Zero failure observability** (advisor): every hook error collapses to empty-stdout/exit-0 with no stderr breadcrumb. You cannot distinguish "no relevant context" from "the router has been down for a month."
-- Candidate resolutions to record: dedicated small routing model (or Haiku-for-hook), per-role model + timeout keys, hook-side hard clamp on router timeout, one-line stderr breadcrumb.
+- Candidate resolutions to record: dedicated small routing model (or Haiku-for-hook), per-role model + timeout keys, hook-side hard clamp on router timeout.
+- *(The companion zero-observability finding was resolved 2026-06-12 — outcome telemetry in `~/.vault/hook.log` + stderr breadcrumb; see the plan's Hook Behavior section. The 15s router tax is now measured per call, not yet fixed.)*
 
 **P2. Query-plan → filter trust gap: three silent total-context-loss paths.**
 - Project names are filtered case-sensitively (`IN (SELECT id FROM projects WHERE name IN (...))`, BINARY collation) while domain-tag matching is `eq_ignore_ascii_case` — router emits "Vault", the tag resolves but every chunk is filtered out.
@@ -93,7 +93,7 @@ Doc-only pass; all code changes stay out of scope and land as decisions/tracking
 - [ ] Binary structure: rewrite the tree to match `src/`; reverse the Step-11 "absorbed" notes; correct the Store trait listing.
 - [ ] CLI: status-mark unimplemented commands; add `--name`/`--dry-run`; note diagnose flag reality.
 - [ ] Decisions table: token estimation → chars/4 (with revisit note); prompt-caching → correct mechanism (A11); hybrid placement → extracted (A2); latency table → real 31B numbers.
-- [ ] Tracking items: resolve A12; add items for P1 (per-role model+timeout, hook clamp, latency-aware fallback, stderr breadcrumb), P2 (name normalization, lenient doc_types, drop-unknown languages), P3 (single-tag+domain-attribute decision, block grouping vs contract text, doctor check), P4 (markdown parser priority, size guard, embed truncation), B1/B3 (retrieval_log fate + WAL as one decision), B6 (cache relocation), B7 (router prompt cleanup), C1, C2.
+- [ ] Tracking items: resolve A12; add items for P1 (per-role model+timeout, hook clamp, latency-aware fallback), P2 (name normalization, lenient doc_types, drop-unknown languages), P3 (single-tag+domain-attribute decision, block grouping vs contract text, doctor check), P4 (markdown parser priority, size guard, embed truncation), B1/B3 (retrieval_log fate + WAL as one decision), B6 (cache relocation), B7 (router prompt cleanup), C1, C2.
 
 ### `CLAUDE.md` (repo)
 - [ ] Key modules table: `writer.rs`/`query.rs` → `sqlite_store.rs`; add walk/sync/secrets/diagnose/hybrid.

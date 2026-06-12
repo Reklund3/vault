@@ -570,6 +570,24 @@ do not appear inside the context block.
 - Empty retrieval results — passthrough, no empty context block injected
 - Project in query plan not in vault — silently excluded, no error
 
+Passthrough is silent toward Claude Code but observable locally (added
+2026-06-12, resolving the P1 observability finding in
+`docs/plan-review-2026-06-11.md`):
+
+- Every invocation appends one JSON line to `~/.vault/hook.log` (`0600`,
+  rotated to `hook.log.1` at 5MB): timestamp, outcome (`injected` / `skip` /
+  `error`), skip reason or failed stage + truncated error detail, the resolved
+  router backend (`gemma` / `haiku`), per-stage latency
+  (`router_ms` / `embed_ms` / `query_ms`), and chunk/token counts on
+  injection. Metadata only — never the prompt, never chunk content.
+- `Failed` outcomes also emit a one-line stderr breadcrumb. Exit code stays 0
+  (fail-open preserved); with exit 0, Claude Code surfaces hook stderr only in
+  debug mode.
+- `skip` (working as designed: empty prompt, router skip, no hits) and `error`
+  (infrastructure: config, router, TEI, SQLite) are distinct outcomes — the
+  log answers "is vault injecting at all, and if not, why" without guesswork.
+  A future `vault doctor` can summarize it (see Tracking Items / C3).
+
 ---
 
 ## Binary Structure
@@ -1022,19 +1040,62 @@ Step 9  index/classify/{mod,gemma,haiku}.rs   — Classifier trait + Gemma + Hai
                                                 cost-estimate prompt on first Haiku use
 Step 10 retrieve/router/{mod,gemma,haiku}.rs  — Router trait + Gemma + Haiku impls
                                                 auto-mode startup probe, prompt caching
-Step 11 retrieve/hybrid.rs  — ABSORBED into Step 3 (sqlite_store::hybrid_search).
-                              Originally planned as a separate score-merge file; the
-                              trait-abstraction decision means each backend owns its
-                              own merge logic. Skip this step.
+Step 11 retrieve/hybrid.rs  — DONE (commit 455303d). `merge()` is the shared score-merge;
+                              `Store::hybrid_search` is now a PROVIDED trait method composing
+                              `bm25_search` + `cosine_search`, so every backend shares identical
+                              ranking math and the merge is unit-tested in isolation. (Supersedes
+                              the earlier "absorbed into Step 3 / skip" plan, which would have let
+                              each backend own its own merge.)
 Step 12 retrieve/budget.rs  — token budget selection
 Step 13 hook/mod.rs         — stdin/stdout protocol, full pipeline wired
-Step 14 first-run UX        — new project prompts during vault index sync (domain, classification cache)
+Step 14 first-run UX        — new-project prompts during vault index sync (project name, domain,
+                              classification confirm/override) + the vault.toml write-back they need.
+                              Orchestrator (Steps 1–13) done; the interactive layer remains.
+                              Full task breakdown below, after this step list.
 ```
 
 `vault diagnose` at step 4 is intentional — manually seed the DB with a few chunks
 and validate retrieval quality against real prompts before building parsers.
 Parser correctness and embedding quality problems are much easier to diagnose here
 than after the full hook pipeline is running.
+
+### Step 14 — First-Run UX: Work Breakdown
+
+The sync *orchestration* is built (Steps 1–13). Step 14 is the interactive
+first-run layer plus the `vault.toml` write-back it stands on. Target behavior
+is specified under **"`vault index sync` first-run behavior (new project)"**
+earlier in this doc.
+
+**Already in place:** full orchestrator (`run_sync` → `sync_with` →
+`process_file`: walk → classify → embed → upsert → prune); the one-time Haiku
+cost-estimate prompt (`prompt_for_haiku_cost`, wired + tested); dry-run preview
+and the `IndexSyncDryRun` smoke command; classification-cache *read* + path
+normalization; the "nothing written to the indexed repo" guarantee.
+
+**Task breakdown (live status):**
+
+| # | Task | Notes |
+|---|------|-------|
+| 1 | Atomic `vault.toml` write-back on `Config` | **Foundation.** Config is read-only today (no `save`/`to_string`; `cached_classification` is read-only). Temp-file + rename, re-harden `~/.vault` 0700 / file 0600, round-trip without dropping keys. Unblocks 3–5. |
+| 2 | ~~Wire the real `vault index sync` command~~ | **DONE (9192cfc).** `vault index sync <repo> [--name] [--dry-run]` wired in `main.rs`; dry-run folded in as a flag; readable output via `format_report`. |
+| 3 | Project-name first-run prompt + persist | Prompt when the project isn't in vault.toml (default = derived name). Follow `prompt_for_haiku_cost` (BufRead/Write injection); EOF → derived default. Needs #1. |
+| 4 | Domain-assignment prompt + persist | Offer software / finance / personal / new. A *new* domain also persists its block AND must surface the two-file reminder to update `~/.claude/CLAUDE.md` (so Claude can read the new `<…-context>` tag). Needs #1. |
+| 5 | Classification confirm/override + cache write-back | Show classifier labels, let the user confirm/override before chunks are written; persist results to the vault.toml cache so later syncs skip classify. Add the write counterpart to the read accessor. Needs #1. |
+| 6 | Reconcile docs + green CI | Update README, this doc, and CLAUDE.md to match; `cargo fmt` + `clippy -D warnings` clean; open the `init`→`main` PR so Linux CI runs `cargo test` (sidesteps the local Windows Application Control block). Needs #2–#5. |
+| 7 | ~~Hook error observability~~ | **DONE (2026-06-12).** Outcome enum (injected / skip / failed+stage), one metadata-only JSONL record per call to `~/.vault/hook.log` (0600, 5MB rotation), stderr breadcrumb on failure, exit-0 fail-open preserved. Resolves the P1 observability sub-finding in `docs/plan-review-2026-06-11.md`; suite green locally (285/0). |
+
+Dependency graph:
+
+```
+#1 ─┬─> #3 ─┐
+    ├─> #4 ─┤
+    └─> #5 ─┼─> #6
+#2 ────────┤
+#7 ────────┘
+```
+
+Recommended order: **#1 first** — it unlocks the three prompts (#3–#5), which
+are the only functional work left before the #6 docs/CI pass.
 
 ---
 

@@ -50,6 +50,10 @@ impl HaikuRouter {
 }
 
 impl Router for HaikuRouter {
+    fn name(&self) -> &'static str {
+        "haiku"
+    }
+
     fn plan(&self, prompt: &str) -> Result<RouterOutput, RouterError> {
         let user = build_user_prompt(prompt);
         let request = MessagesRequest {

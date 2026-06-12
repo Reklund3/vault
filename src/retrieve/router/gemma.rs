@@ -49,6 +49,10 @@ impl GemmaRouter {
 }
 
 impl Router for GemmaRouter {
+    fn name(&self) -> &'static str {
+        "gemma"
+    }
+
     fn plan(&self, prompt: &str) -> Result<RouterOutput, RouterError> {
         let user = build_user_prompt(prompt);
         let request = ChatRequest {

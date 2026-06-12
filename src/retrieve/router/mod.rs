@@ -30,6 +30,11 @@ pub enum RouterError {
 
 pub trait Router {
     fn plan(&self, prompt: &str) -> Result<RouterOutput, RouterError>;
+
+    /// Stable backend identity ("gemma", "haiku") for telemetry and diagnose
+    /// output. A method on the trait so call sites never have to re-probe to
+    /// learn which backend `auto` resolved to.
+    fn name(&self) -> &'static str;
 }
 
 /// System prompt shared by the Gemma and Haiku routers. It MUST stay

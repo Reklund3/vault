@@ -148,6 +148,13 @@ pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os(var).map(PathBuf::from)
 }
 
+/// `~/.vault` resolved from the home directory alone — no loaded `Config`
+/// required. The hook's logger needs a destination precisely when
+/// `vault.toml` failed to load, so this must not depend on `Config`.
+pub(crate) fn vault_dir_path() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(CONFIG_DIR))
+}
+
 impl Config {
     // Todo for now we do this. Will load from vault.toml later?
     pub(crate) fn load() -> Result<Self, ConfigError> {
@@ -293,9 +300,7 @@ impl Config {
     /// write into it (e.g. the TEI launcher) are responsible for `create_dir_all`
     /// and permission hardening.
     pub fn vault_dir(&self) -> Result<PathBuf, ConfigError> {
-        Ok(home_dir()
-            .ok_or(ConfigError::HomeNotFound)?
-            .join(CONFIG_DIR))
+        vault_dir_path().ok_or(ConfigError::HomeNotFound)
     }
 
     pub fn db_path(&self) -> Result<PathBuf, ConfigError> {

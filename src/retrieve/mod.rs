@@ -3,9 +3,9 @@ pub mod hybrid;
 mod router;
 
 pub use router::{ResolvedBackend, Router, build_router, resolve_backend};
-// Only the hook's test-only Router stub needs to name RouterError directly.
-// Production code only sees it inside the `Result<..., _>` from `Router::plan`,
-// which the hook chains through `.ok()?` without referring to the variant.
+// Only test-only Router stubs need to name RouterError directly. Production
+// code sees it inside the `Result<..., _>` from `Router::plan` and records it
+// via `Display` into hook.log without ever naming a variant.
 #[cfg(test)]
 pub(crate) use router::{RouterError, StubRouter};
 

@@ -15,7 +15,7 @@ Working across many projects means critical context (API contracts, design decis
 3. Top chunks are selected within a 10k token budget and prepended as a `<{domain}-context>` block
 4. Claude receives the decorated prompt — the router, SQLite, and the binary are invisible to it
 
-The hook has a 3-second timeout and silently passes through on failure — it never makes Claude Code feel broken.
+The hook has a 3-second timeout and silently passes through on failure — it never makes Claude Code feel broken. Silent toward Claude Code, not toward you: every call appends a one-line JSON record (outcome, per-stage latency, error detail) to `~/.vault/hook.log`, so an outage is diagnosable after the fact.
 
 `auto` mode (default) tries Gemma first and falls back to Haiku when Gemma is unreachable. Force a specific backend with `[router] mode = "gemma"` or `"haiku"` in `vault.toml`. Haiku mode requires `ANTHROPIC_API_KEY` and uses prompt caching to keep per-call cost in the ~$0.0002 range.
 
@@ -71,7 +71,9 @@ Nothing is written to the repos being indexed.
 ```
 ~/.vault/
 ├── vault.db      # SQLite: projects, chunks, FTS5 index, embeddings, retrieval log
-└── vault.toml    # Domain config, context tags, classification cache, tuning knobs
+├── vault.toml    # Domain config, context tags, classification cache, tuning knobs
+├── hook.log      # Hook telemetry: one JSON line per prompt (outcome, latency, errors); rotated at 5MB
+└── tei.pid/.log  # TEI launcher runtime files (vault tei start)
 ```
 
 ## Configuration

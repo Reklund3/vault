@@ -7,6 +7,10 @@ use crate::retrieve::{QueryPlan, RouterOutput};
 pub(crate) struct StubRouter;
 
 impl Router for StubRouter {
+    fn name(&self) -> &'static str {
+        "stub"
+    }
+
     fn plan(&self, _prompt: &str) -> Result<RouterOutput, RouterError> {
         Ok(RouterOutput::Plan(QueryPlan {
             projects: vec![],

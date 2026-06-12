@@ -42,7 +42,8 @@ The router returns `{ skip: true }` for prompts that need no context — immedia
 
 | Path | Responsibility |
 |------|---------------|
-| `src/hook/mod.rs` | stdin→stdout hook protocol, full pipeline entry |
+| `src/hook/mod.rs` | stdin→stdout hook protocol, full pipeline entry; outcome taxonomy (injected / skip / failed-at-stage) |
+| `src/hook/log.rs` | hook telemetry — one metadata-only JSONL record per call to `~/.vault/hook.log` (5MB rotation) |
 | `src/store/schema.rs` | embedded SQL, migration runner |
 | `src/store/writer.rs` | upsert + sync-time prune (file/document/chunk diff); reconciles deletions every sync |
 | `src/store/query.rs` | FTS5 + sqlite-vec hybrid retrieval, score merge, budget trim |
@@ -85,6 +86,7 @@ Haiku impls use `cache_control: ephemeral` on the system block so the JSON schem
 ```
 ~/.vault/vault.db      # SQLite store — projects, documents, chunks, FTS5, vec, retrieval_log
 ~/.vault/vault.toml    # domain assignments, context tags, router/classifier mode, classification cache, tuning defaults
+~/.vault/hook.log      # hook telemetry — one JSONL record per hook call (outcome, stage, latency, backend); rotated to hook.log.1 at 5MB
 ```
 
 Nothing is written to indexed repositories.
@@ -179,7 +181,7 @@ Vault is on the hot path of every Claude Code prompt. Full design constraints, t
 - **Indexer never follows symlinks** and is bounded to the canonical repo root. Default exclusion list (`.env`, `*.pem`, `.ssh/**`, etc.) is non-removable in v1.
 - **Index-time secret pre-scan.** Chunks matching common secret patterns (AWS keys, GitHub/Anthropic/OpenAI tokens, JWT, PEM headers) are dropped before storage.
 - **Classifier sees filename + extension + first 1KB only**, never full files. Full content reaches Anthropic only via retrieval-time injection, which the user controls via `vault diagnose`.
-- **Hook fails open.** Any error → stdin to stdout passthrough, exit 0. Never block the user.
+- **Hook fails open.** Any error → empty stdout, exit 0 — never block the user. Failures stay observable without breaking that contract: one stderr breadcrumb (visible only in Claude Code debug mode) plus a metadata-only JSONL record in `~/.vault/hook.log` — never prompt text, never chunk content; error detail truncated.
 - **`~/.claude/settings.json` should reference vault by absolute path** (not `vault hook` resolved via PATH).
 
 ## v1 Scope Boundaries

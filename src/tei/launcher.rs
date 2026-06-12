@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, ConfigError};
+use crate::util::fs::{harden_dir, harden_file};
 use crate::util::probe::tei_reachable;
 
 const PID_FILE: &str = "tei.pid";
@@ -378,27 +379,6 @@ fn kill(pid: u32) -> bool {
 fn kill(_pid: u32) -> bool {
     false
 }
-
-/// Best-effort `0700` on the vault dir (matches the security posture). Ignored
-/// on non-Unix; Windows inherits the user-profile ACL.
-#[cfg(unix)]
-fn harden_dir(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
-}
-
-#[cfg(not(unix))]
-fn harden_dir(_path: &Path) {}
-
-/// Best-effort `0600` on a file vault writes into `~/.vault/`.
-#[cfg(unix)]
-fn harden_file(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn harden_file(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {

@@ -143,6 +143,13 @@ Defenses, in order of importance:
   The launcher also writes `tei.pid` / `tei.log` `0600` and the `~/.vault/`
   dir `0700` (best-effort, Unix).
 
+- **The hook writes one telemetry record per invocation** to `~/.vault/hook.log`
+  (`0600`, dir `0700`, size-capped rotation to `hook.log.1`). Records are
+  metadata only — outcome, failed stage, truncated error detail, backend, and
+  per-stage latency; never the prompt and never chunk content, so the log adds
+  no plaintext-content surface beyond what `vault.db` already holds. Logging is
+  best-effort and swallowed on failure — fail-open applies to the logger too.
+
 ---
 
 ## Localhost is a trust assumption, not a guarantee
