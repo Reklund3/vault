@@ -93,6 +93,7 @@ pub fn run(args: Args) -> CliResult {
     print_header(&TraceHeader {
         prompt: &args.prompt,
         router_status: &router_status,
+        router_mode: config.router_mode(),
         plan: plan.as_ref(),
         overrides: &cli,
         alpha,
@@ -201,6 +202,9 @@ enum RouterStatus {
 struct TraceHeader<'a> {
     prompt: &'a str,
     router_status: &'a RouterStatus,
+    /// The configured `[router].mode` (`auto`/`gemma`/`haiku`) — shown verbatim
+    /// so a forced backend isn't mislabeled as auto-resolved.
+    router_mode: &'a str,
     plan: Option<&'a QueryPlan>,
     overrides: &'a Overrides,
     alpha: f32,
@@ -222,11 +226,12 @@ fn print_header(h: &TraceHeader<'_>) {
     match h.router_status {
         RouterStatus::Bypassed => println!("router:    bypassed (--no-router)"),
         RouterStatus::Skip { backend } => println!(
-            "router:    {} (auto) — decision: skip",
-            backend_label(*backend)
+            "router:    {} ({}) — decision: skip",
+            backend_label(*backend),
+            h.router_mode
         ),
         RouterStatus::Plan { backend } => {
-            println!("router:    {} (auto)", backend_label(*backend))
+            println!("router:    {} ({})", backend_label(*backend), h.router_mode)
         }
     }
     if let Some(plan) = h.plan {
