@@ -85,13 +85,19 @@ struct RawQueryPlan {
 
 impl QueryPlan {
     /// Build a `QueryPlan` from the model's raw string arrays. Both label
-    /// arrays are lowercased and trimmed to tolerate capitalization drift.
-    /// `doc_types` drops unrecognized values (validated-drop): the set is
-    /// closed, but one hallucinated label ("readme") must not void an
-    /// otherwise-good plan — the filters are ANDed, so failing the whole plan
-    /// here costs total context loss (review P2). An emptied list means "no
-    /// doc_type filter", which degrades to searching all doc types.
-    /// `languages` collapses unknowns to `Language::Unknown` instead.
+    /// arrays are lowercased and trimmed to tolerate capitalization drift, and
+    /// both validated-drop unrecognized values: the sets are closed, but one
+    /// hallucinated label must not void an otherwise-good plan. The filters are
+    /// ANDed, so a bad value in either list would otherwise cost total context
+    /// loss (review P2). An emptied list means "no filter on that field", which
+    /// degrades to searching all values.
+    ///
+    /// For `languages` this replaces an earlier `unwrap_or(Language::Unknown)`
+    /// that coerced any unknown label (e.g. router emits "python") into
+    /// `Language::Unknown`, producing `AND c.language IN ('unknown')` — a filter
+    /// that matches nothing (P2 path 3). Note `Language::from_str` still accepts
+    /// the literal `"unknown"` as a deliberate value, so an explicit unknown
+    /// filter is preserved; only unrecognized labels are dropped.
     fn from_raw(raw: RawQueryPlan) -> Self {
         let doc_types: Vec<DocType> = raw
             .doc_types
@@ -101,9 +107,7 @@ impl QueryPlan {
         let languages: Vec<Language> = raw
             .languages
             .into_iter()
-            .map(|s| {
-                Language::from_str(&s.trim().to_ascii_lowercase()).unwrap_or(Language::Unknown)
-            })
+            .filter_map(|s| Language::from_str(&s.trim().to_ascii_lowercase()).ok())
             .collect();
         Self {
             projects: raw.projects,
@@ -198,8 +202,28 @@ mod tests {
     }
 
     #[test]
-    fn from_raw_unknown_language_is_lenient() {
-        let plan = QueryPlan::from_raw(raw(&["convention"], &["python"]));
+    fn from_raw_drops_unknown_language_keeps_valid() {
+        // Validated-drop (review P2 path 3): "python" is not a vault language;
+        // dropping it leaves a clean `["rust"]` filter. The earlier behavior
+        // coerced it to Language::Unknown, yielding `IN ('unknown','rust')` and
+        // poisoning the result set — or `IN ('unknown')` when it was the only
+        // value, matching nothing.
+        let plan = QueryPlan::from_raw(raw(&["convention"], &["python", "rust"]));
+        assert_eq!(plan.languages, vec![Language::Rust]);
+    }
+
+    #[test]
+    fn from_raw_all_unknown_languages_mean_no_filter() {
+        let plan = QueryPlan::from_raw(raw(&[], &["python"]));
+        assert!(plan.languages.is_empty());
+    }
+
+    #[test]
+    fn from_raw_explicit_unknown_language_is_preserved() {
+        // "unknown" is a deliberate value (chunks whose language couldn't be
+        // determined), distinct from an unrecognized label — it must survive
+        // the drop.
+        let plan = QueryPlan::from_raw(raw(&[], &["unknown"]));
         assert_eq!(plan.languages, vec![Language::Unknown]);
     }
 
@@ -322,11 +346,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_response_unknown_language_is_lenient() {
+    fn parse_response_unknown_language_is_dropped() {
+        // End-to-end through parse_response: a hallucinated language is dropped,
+        // leaving an empty languages filter (no clause) rather than a poisoned
+        // `IN ('unknown')` that matches nothing (P2 path 3).
         let text = r#"{"doc_types":["convention"],"languages":["kotlin"]}"#;
         let out = parse_response(text).unwrap();
         match out {
-            RouterOutput::Plan(plan) => assert_eq!(plan.languages, vec![Language::Unknown]),
+            RouterOutput::Plan(plan) => assert!(plan.languages.is_empty()),
             RouterOutput::Skip => panic!("expected Plan"),
         }
     }

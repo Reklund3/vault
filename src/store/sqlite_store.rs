@@ -403,8 +403,13 @@ fn filter_bind_params<'a>(
 fn build_filter_clause(plan: &QueryPlan) -> String {
     let mut s = String::new();
     if !plan.projects.is_empty() {
+        // `COLLATE NOCASE` on the stored `name` makes the router-supplied list
+        // match case-insensitively (ASCII), mirroring the `eq_ignore_ascii_case`
+        // used for domain-tag resolution. Without it a router emitting "Vault"
+        // against a stored "vault" filters out every chunk — silent total
+        // context loss (P2 path 1, docs/plan-review-2026-06-11.md).
         s.push_str(&format!(
-            " AND c.project_id IN (SELECT id FROM projects WHERE name IN ({}))",
+            " AND c.project_id IN (SELECT id FROM projects WHERE name COLLATE NOCASE IN ({}))",
             placeholders(plan.projects.len())
         ));
     }
@@ -672,6 +677,56 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].bm25_score, 0.0);
         assert!(hits[0].cosine_score > 0.99);
+    }
+
+    #[test]
+    fn hybrid_search_matches_project_name_case_insensitively() {
+        // P2 path 1: the router may emit a different casing than the stored
+        // project name ("Build-Service" vs "build-service"). The project filter
+        // must match case-insensitively (ASCII) — otherwise every chunk is
+        // filtered out and the hook silently injects nothing.
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+        let project_id = create_project(&store, "build-service");
+
+        store
+            .upsert_document(
+                &Document {
+                    project_id,
+                    doc_type: DocType::Contract,
+                    source_path: "build.proto".into(),
+                    title: "build.proto".into(),
+                    content_hash: "h".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: proto_chunk(
+                        "BuildRequest",
+                        "message BuildRequest { string id = 1; }",
+                        0,
+                    ),
+                    embedding: unit_embedding(0),
+                }],
+            )
+            .unwrap();
+
+        // Router-supplied casing differs from the stored name.
+        let plan = QueryPlan {
+            projects: vec!["Build-Service".into()],
+            type_names: vec![],
+            topics: vec![],
+            doc_types: vec![],
+            languages: vec![],
+        };
+        let hits = store
+            .hybrid_search(&plan, &unit_embedding(0), config.alpha())
+            .unwrap();
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "case-mismatched project name must still match"
+        );
+        assert_eq!(hits[0].label, "BuildRequest");
     }
 
     #[test]
