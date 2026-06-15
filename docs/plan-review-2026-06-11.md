@@ -1,4 +1,4 @@
-# Review: docs/olympus-vault-plan.md
+# Review: docs/vault-plan.md
 
 **Date:** 2026-06-11 · **Verified against:** working tree at commit `6b08f9d` (branch `init`) · **Status:** findings recorded, follow-up not yet executed
 
@@ -80,7 +80,7 @@ CamelCase/FTS5 tokenization (one-line known-limitation at most — router extrac
 
 Doc-only pass; all code changes stay out of scope and land as decisions/tracking items.
 
-### `docs/olympus-vault-plan.md`
+### `docs/vault-plan.md`
 - [x] Hook contract: UserPromptSubmit everywhere; "emits only the context block, appended by Claude Code"; absolute-path settings.json example. *(done 2026-06-14 — A1; the minor "confirm hook key" plan note still to be removed in a later pass.)*
 - [ ] Config: example vault.toml that actually parses (`timeout = 3`, `timeout_secs` in both blocks); document `[router].timeout_secs`/`[classifier].timeout_secs` and the hook-budget implication (P1).
 - [ ] Schema: add `meta` table + `verify_or_init_embedding` + user_version note.

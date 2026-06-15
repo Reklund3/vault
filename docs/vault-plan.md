@@ -725,7 +725,7 @@ timeout_ms   = 3000              # hook Gemma timeout before passthrough
 
 [domains.software]
 context_tag = "software-context"
-projects    = ["olympus", "mcp-server", "vault"]
+projects    = ["build-service", "mcp-server", "vault"]
 
 [domains.finance]
 context_tag = "finance-context"

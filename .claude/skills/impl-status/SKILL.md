@@ -1,6 +1,6 @@
 ---
 name: impl-status
-description: Use this skill at the start of a vault development session, or when the user asks "where are we", "what's next", "what step am I on", or wants a progress check. Reads the current source tree against the 14-step implementation order in docs/olympus-vault-plan.md and reports which steps are complete, which is in progress, and what the next blocker is. Particularly useful because Step 0 (embedding dimension confirmation) is a hard prerequisite for Step 1 and the rest of the pipeline depends on lower layers being in place.
+description: Use this skill at the start of a vault development session, or when the user asks "where are we", "what's next", "what step am I on", or wants a progress check. Reads the current source tree against the 14-step implementation order in docs/vault-plan.md and reports which steps are complete, which is in progress, and what the next blocker is. Particularly useful because Step 0 (embedding dimension confirmation) is a hard prerequisite for Step 1 and the rest of the pipeline depends on lower layers being in place.
 ---
 
 # Implementation Status

@@ -4,7 +4,7 @@ Vault sits on the hot path of every Claude Code prompt. That makes it a high-val
 target and a place where small design choices have big consequences. This document
 captures the design constraints that protect the user; v1 implements all of them.
 
-For broader architecture see `olympus-vault-plan.md`. For the embedding-stack
+For broader architecture see `vault-plan.md`. For the embedding-stack
 specifics see `embeddings.md`.
 
 ---
@@ -94,12 +94,12 @@ README in a dependency.
 Defenses, in order of importance:
 
 1. **The global `~/.claude/CLAUDE.md` instruction frames the context block as
-   reference data, not commands.** See `olympus-vault-plan.md` → "CLAUDE.md
+   reference data, not commands.** See `vault-plan.md` → "CLAUDE.md
    Strategy" — the wording explicitly tells Claude not to follow instructions
    inside the block.
 2. **Vault never sanitizes chunk content** in v1. Users who index untrusted repos
    accept the risk. This is documented, not silently true.
-3. **The index-time secret pre-scan (see `olympus-vault-plan.md` → Indexing)
+3. **The index-time secret pre-scan (see `vault-plan.md` → Indexing)
    drops chunks containing common secret patterns** before they reach the
    store. This is a safety net, not a security boundary.
 
@@ -110,7 +110,7 @@ Defenses, in order of importance:
 - `vault index sync <repo>` is always explicit; vault never auto-indexes.
 - The walker does **not** follow symlinks (`follow_links = false`). Indexing is
   bounded to the repo root via canonical-path containment.
-- A default exclusion list (see `olympus-vault-plan.md` → Indexing → Exclusions)
+- A default exclusion list (see `vault-plan.md` → Indexing → Exclusions)
   keeps `.env`, key material, and similar out of the index regardless of file
   extension.
 - The classifier (Gemma local or Haiku fallback) sees **filename + extension +
@@ -237,7 +237,7 @@ sharing, hosted store, anything that takes plaintext indexed content
 beyond the user's filesystem — at minimum these need to be revisited:
 
 - **Indexed-content sensitivity.** "Don't index sensitive repos" (see
-  `olympus-vault-plan.md` → "What not to sync") goes from a soft rule
+  `vault-plan.md` → "What not to sync") goes from a soft rule
   of thumb to a hard prerequisite. Anything indexed under laptop-local
   trust must be re-evaluated under the new posture, including content
   already in the store.

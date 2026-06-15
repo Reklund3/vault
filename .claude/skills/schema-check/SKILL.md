@@ -1,6 +1,6 @@
 ---
 name: schema-check
-description: Use this skill before writing or modifying SQL schema files in src/store/schema.rs (or anywhere SQLite DDL is defined for the vault project). Verifies that implemented schema matches the canonical spec in docs/olympus-vault-plan.md. Critical because chunks_vec FLOAT[N] dimension is locked at creation and FTS5 triggers must stay in sync with the chunks table. Triggers when the user is creating, editing, or reviewing CREATE TABLE / CREATE VIRTUAL TABLE / CREATE TRIGGER statements for the vault store.
+description: Use this skill before writing or modifying SQL schema files in src/store/schema.rs (or anywhere SQLite DDL is defined for the vault project). Verifies that implemented schema matches the canonical spec in docs/vault-plan.md. Critical because chunks_vec FLOAT[N] dimension is locked at creation and FTS5 triggers must stay in sync with the chunks table. Triggers when the user is creating, editing, or reviewing CREATE TABLE / CREATE VIRTUAL TABLE / CREATE TRIGGER statements for the vault store.
 ---
 
 # Schema Check
@@ -15,7 +15,7 @@ The `vault` project's SQLite schema is locked once the database is created. Vect
 
 ## Procedure
 
-1. **Read the spec.** Open `docs/olympus-vault-plan.md` and locate the `## Storage Schema` section. The canonical tables are: `projects`, `documents`, `chunks`, `chunks_fts` (virtual, FTS5), `chunks_vec` (virtual, vec0), `retrieval_log`. Also note the three FTS5 sync triggers: `chunks_ai`, `chunks_au`, `chunks_ad`.
+1. **Read the spec.** Open `docs/vault-plan.md` and locate the `## Storage Schema` section. The canonical tables are: `projects`, `documents`, `chunks`, `chunks_fts` (virtual, FTS5), `chunks_vec` (virtual, vec0), `retrieval_log`. Also note the three FTS5 sync triggers: `chunks_ai`, `chunks_au`, `chunks_ad`.
 
 2. **Read the implementation.** Open the SQL file(s) under review.
 

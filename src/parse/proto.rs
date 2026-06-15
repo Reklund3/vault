@@ -397,7 +397,7 @@ message RealMessage {
     fn syntax_and_imports_alone_produce_no_chunks() {
         let src = "\
 syntax = \"proto3\";
-package olympus.build.v1;
+package example.build.v1;
 import \"google/protobuf/timestamp.proto\";
 ";
         let chunks = parse(src);

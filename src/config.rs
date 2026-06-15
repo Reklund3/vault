@@ -366,7 +366,7 @@ mod tests {
     fn resolve_context_tag_matches_first_named_project() {
         let cfg = config_with_domains(&[(
             "software",
-            domain("software-context", &["olympus", "vault"]),
+            domain("software-context", &["build-service", "vault"]),
         )]);
         let tag = cfg.resolve_context_tag(&["vault".to_string()]);
         assert_eq!(tag, "software-context");

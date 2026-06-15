@@ -4,7 +4,7 @@ This document explains the embeddings layer in `vault` — what embeddings are, 
 they provide, where they fit in the pipeline, and why we picked the specific model
 and runtime we did.
 
-For the broader architecture, see `olympus-vault-plan.md`. For the design-conversation
+For the broader architecture, see `vault-plan.md`. For the design-conversation
 log, see `vault-context.md`.
 
 ---

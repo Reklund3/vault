@@ -15,7 +15,7 @@ Parsers in `src/parse/` extract chunks from source files at definition boundarie
 
 ## Boundary expectations
 
-From `docs/olympus-vault-plan.md` § Chunking Strategy:
+From `docs/vault-plan.md` § Chunking Strategy:
 
 | doc_type | language | Boundary |
 |----------|----------|----------|
