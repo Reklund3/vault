@@ -9,8 +9,8 @@ technical artifacts into a SQLite store and decorates every prompt with relevant
 before it reaches Claude.
 
 Routing is local-first via Gemma (zero Claude token cost). For machines that can't run
-MLX, vault falls back to Anthropic Haiku via API — minimal cost (~$0.0002/hook call with
-prompt caching) and the hook keeps working everywhere.
+MLX, vault falls back to Anthropic Haiku via API — minimal cost (~$0.0002/hook call; the
+routing prompt is tiny) and the hook keeps working everywhere.
 
 The core problem: working across multiple projects means critical context (API contracts,
 design decisions, domain conventions, library patterns) lives in other places. Without
@@ -57,9 +57,9 @@ Your prompt (typed in Claude Code)
   │
   ├── score merge + token-budget selection (10k ceiling)
   ├── assembles <{context_tag}> block grouped by project
-  └── prepends context to prompt → stdout → Claude Code → Anthropic API
+  └── emits only the block → stdout → Claude Code appends it to the prompt → Anthropic API
 
-  Claude only ever sees the decorated prompt.
+  Claude only ever sees its prompt with the context block appended.
   The router, SQLite, and the Rust binary are invisible to it.
 
   The context tag is domain-driven — all projects in the same domain share one tag (see Global Config).
@@ -104,8 +104,12 @@ The router lives behind a trait. Two impls:
 - **`GemmaRouter`** — POSTs to `mlx_lm.server` at `localhost:8080`. Zero Claude token cost.
   Best on machines with MLX (typically Apple Silicon).
 - **`HaikuRouter`** — calls Anthropic's API with the latest Haiku model. The system
-  prompt (schema + few-shot examples) uses `cache_control: ephemeral` so per-call cost
-  stays around $0.0002. Best for machines that can't run MLX (Linux, low-RAM, VMs, CI).
+  prompt sets `cache_control: ephemeral`, but caching is **inert** at the current prompt
+  size: Haiku's minimum cacheable prefix is ~4096 tokens and `ROUTER_SYSTEM` is only a
+  few hundred, so no cache entry is created. Per-call cost stays ~$0.0002 because the
+  prompt is tiny, not because of caching; the marker only does work if the system block
+  later grows past ~4096 tokens. Best for machines that can't run MLX (Linux, low-RAM,
+  VMs, CI).
 
 Selection comes from `vault.toml`:
 
@@ -123,7 +127,7 @@ The same trait pattern applies to `Classifier` (used by `vault index sync`). Tra
 
 | Aspect            | Gemma (local)            | Haiku (fallback)                          |
 |-------------------|--------------------------|-------------------------------------------|
-| Cost / hook call  | $0                       | ~$0.0002 (with prompt caching)            |
+| Cost / hook call  | $0                       | ~$0.0002 (tiny prompt; cache marker inert <4096 tok) |
 | Cost / index sync | $0                       | ~$0.01–0.05 per 200-file repo             |
 | Latency           | ~100–300ms               | ~400–800ms (still under 3s hook timeout)  |
 | Privacy           | Prompts stay local       | Routing prompts go to Anthropic           |
@@ -694,7 +698,7 @@ in `~/.claude/settings.json` — no per-project installation needed.
 // ~/.claude/settings.json
 {
   "hooks": {
-    "PreToolUse": [{ "command": "vault hook" }]
+    "UserPromptSubmit": [{ "command": "/absolute/path/to/vault hook" }]
   }
 }
 ```
@@ -794,7 +798,7 @@ no new tag decision.
 ```bash
 # Hook — invoked by Claude Code automatically, not run manually
 # Register once in ~/.claude/settings.json (see Global Config)
-# vault hook reads prompt JSON from stdin, writes decorated prompt to stdout
+# vault hook reads prompt JSON from stdin, writes only the context block to stdout (Claude Code appends it)
 vault hook
 
 # Indexing — always explicit, never automated
@@ -939,7 +943,7 @@ No session state lives in vault.db. The hook binary is read-only at runtime.
 | Hook runtime access | Read-only | No session writes; vault.db only written during explicit index sync |
 | Context tag | Domain-level in vault.toml | Tag signals knowledge domain (software, finance, personal) not individual project; projects grouped inside the block by header |
 | Routing model | Gemma 4 (27B MoE or 31B Dense) via mlx_lm.server | Local, free, handles natural language → structured query signals |
-| Router fallback | Anthropic Haiku via API | `auto` mode falls back when Gemma unreachable; `cache_control: ephemeral` keeps per-call cost ~$0.0002; preserves hook on machines without MLX |
+| Router fallback | Anthropic Haiku via API | `auto` mode falls back when Gemma unreachable; per-call cost ~$0.0002 because the routing prompt is tiny (`cache_control: ephemeral` is set but inert below Haiku's ~4096-token minimum); preserves hook on machines without MLX |
 | Routing strategy | Every send with skip escape hatch | Router decides relevance; short prompts return immediately |
 | Hook timeout | 3 seconds | Silent passthrough on timeout — never block the session |
 | Context injection | Prepend as `<{context_tag}>` block | Tag driven by domain assignment in vault.toml |

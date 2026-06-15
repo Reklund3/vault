@@ -8,23 +8,23 @@ Working across many projects means critical context (API contracts, design decis
 
 ## How It Works
 
-`vault` registers as a Claude Code pre-send hook. Every time you send a prompt:
+`vault` registers as a Claude Code `UserPromptSubmit` hook. Every time you send a prompt:
 
 1. The router (Gemma running locally, or Anthropic Haiku via API as a fallback) reads the prompt and extracts structured retrieval signals — project names, type names, topics — or returns `skip: true` for prompts that need no context
 2. SQLite runs a hybrid query: FTS5 BM25 keyword match + cosine similarity against stored embeddings
-3. Top chunks are selected within a 10k token budget and prepended as a `<{domain}-context>` block
-4. Claude receives the decorated prompt — the router, SQLite, and the binary are invisible to it
+3. Top chunks are selected within a 10k token budget and emitted on stdout as a `<{domain}-context>` block
+4. Claude Code appends that block to your prompt before sending — the router, SQLite, and the binary are invisible to the model
 
 The hook has a 3-second timeout and silently passes through on failure — it never makes Claude Code feel broken. Silent toward Claude Code, not toward you: every call appends a one-line JSON record (outcome, per-stage latency, error detail) to `~/.vault/hook.log`, so an outage is diagnosable after the fact.
 
-`auto` mode (default) tries Gemma first and falls back to Haiku when Gemma is unreachable. Force a specific backend with `[router] mode = "gemma"` or `"haiku"` in `vault.toml`. Haiku mode requires `ANTHROPIC_API_KEY` and uses prompt caching to keep per-call cost in the ~$0.0002 range.
+`auto` mode (default) tries Gemma first and falls back to Haiku when Gemma is unreachable. Force a specific backend with `[router] mode = "gemma"` or `"haiku"` in `vault.toml`. Haiku mode requires `ANTHROPIC_API_KEY`; per-call cost stays in the ~$0.0002 range because the routing prompt is tiny (the `cache_control` marker is set but inert below Haiku's ~4096-token minimum cacheable prefix).
 
 ## Usage
 
 ```bash
 # Register the hook once globally
 # Add to ~/.claude/settings.json:
-# { "hooks": { "PreToolUse": [{ "command": "vault hook" }] } }
+# { "hooks": { "UserPromptSubmit": [{ "command": "/absolute/path/to/vault hook" }] } }
 
 # Start the embeddings server (needs [embeddings].launcher_cmd in vault.toml)
 vault tei start
@@ -110,7 +110,7 @@ The global `~/.claude/CLAUDE.md` should include a `## Vault Context` section exp
 - **Rust** — single binary, no per-project installation
 - **SQLite** via rusqlite (bundled) — FTS5 BM25 + sqlite-vec cosine similarity
 - **Gemma 4** via MLX — local routing and file classification, zero API cost (primary)
-- **Anthropic Haiku** — fallback router/classifier when Gemma is unavailable; prompt-cached for minimal token cost
+- **Anthropic Haiku** — fallback router/classifier when Gemma is unavailable; minimal token cost because the routing prompt is tiny (`cache_control` marker set but inert at this size)
 - **nomic-embed-text-v1.5** (768-dim) via HuggingFace [text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference) (TEI) — embeddings at index and query time
 
 ## Build
@@ -132,6 +132,6 @@ Vault is the central trust pivot of every Claude Code prompt — full design con
 - **Both backend services bind loopback only** — `127.0.0.1:8080` for `mlx_lm.server`, `127.0.0.1:8081` for TEI. Vault assumes anything answering on those ports is authoritative; that is a single-user-workstation assumption.
 - **`ANTHROPIC_API_KEY` is environment-only.** Never written to `vault.toml`, never logged, redacted in `vault diagnose`.
 - **`~/.vault/` is `0700`, files inside `0600`.** `vault.db` contains plaintext indexed content; rely on OS-level disk encryption for stolen-laptop scenarios.
-- **The hook fails open.** Any error path returns stdin → stdout passthrough so a vault failure never blocks Claude Code.
+- **The hook fails open.** Any error path emits empty stdout and exits 0, so your prompt passes through unchanged and a vault failure never blocks Claude Code.
 
 If you index repos containing secrets or content you don't trust, read [`docs/security.md`](docs/security.md) before doing so.

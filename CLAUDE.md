@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `vault` is a single Rust binary that injects relevant project context into every Claude Code prompt before it reaches the Anthropic API. It indexes stable artifacts (proto contracts, design docs, conventions, CLAUDE.md files) into a local SQLite store and decorates prompts via a pre-send hook.
 
-Routing is local-first via Gemma (zero Claude token cost). When Gemma is unreachable, vault falls back to Anthropic Haiku via API — minimal cost (~$0.0002/hook call with prompt caching) so the hook keeps working on machines without MLX.
+Routing is local-first via Gemma (zero Claude token cost). When Gemma is unreachable, vault falls back to Anthropic Haiku via API — minimal cost (~$0.0002/hook call; the routing prompt is tiny) so the hook keeps working on machines without MLX.
 
 ## Build & Run
 
@@ -21,7 +21,7 @@ cargo run -- <subcommand>    # e.g. cargo run -- diagnose "what does BuildReques
 ## Architecture
 
 Three execution modes from one binary, dispatched by subcommand in `main.rs`:
-- **`vault hook`** — pre-send hook (registered globally in `~/.claude/settings.json`); reads prompt JSON from stdin, returns decorated prompt to stdout
+- **`vault hook`** — pre-send hook (registered globally in `~/.claude/settings.json`); reads prompt JSON from stdin, emits only the `<{domain}-context>` block to stdout (Claude Code appends it to the prompt)
 - **`vault index sync <repo>`** — explicit manual indexing; the classifier (Gemma local or Haiku fallback) labels files, you confirm, chunks written to SQLite
 - **`vault diagnose "<prompt>"`** — full retrieval trace for tuning alpha and token budget
 
@@ -30,10 +30,10 @@ Three execution modes from one binary, dispatched by subcommand in `main.rs`:
 ```
 prompt → vault hook → Router extracts query plan
                       ├── primary:  Gemma at localhost:8080 (zero token cost)
-                      └── fallback: Haiku via Anthropic API (~$0.0002/call cached)
+                      └── fallback: Haiku via Anthropic API (~$0.0002/call, tiny prompt)
        → SQLite hybrid query (FTS5 BM25 + sqlite-vec cosine)
        → score merge (α=0.6 BM25, 0.4 cosine) + token budget (10k)
-       → prepend <{domain-context}> block → Claude Code → Anthropic API
+       → emit <{domain-context}> block on stdout → Claude Code appends it → Anthropic API
 ```
 
 The router returns `{ skip: true }` for prompts that need no context — immediate passthrough with no SQLite query. 3-second timeout on all router calls (Gemma or Haiku); silent passthrough on timeout or unavailability.
@@ -44,12 +44,14 @@ The router returns `{ skip: true }` for prompts that need no context — immedia
 |------|---------------|
 | `src/hook/mod.rs` | stdin→stdout hook protocol, full pipeline entry; outcome taxonomy (injected / skip / failed-at-stage) |
 | `src/hook/log.rs` | hook telemetry — one metadata-only JSONL record per call to `~/.vault/hook.log` (5MB rotation) |
+| `src/store/traits.rs` | `Store` trait + `StoreError` — backend abstraction; carries the embedding model/dim lock error |
 | `src/store/schema.rs` | embedded SQL, migration runner |
-| `src/store/writer.rs` | upsert + sync-time prune (file/document/chunk diff); reconciles deletions every sync |
-| `src/store/query.rs` | FTS5 + sqlite-vec hybrid retrieval, score merge, budget trim |
+| `src/store/sqlite_store.rs` | the live (SQLite-only) backend — upsert + sync-time prune (file/document/chunk diff, reconciles deletions every sync) **and** FTS5 + sqlite-vec hybrid retrieval, score merge, budget trim |
+| `src/store/postgresql_store.rs` | `PostgresStore` — `todo!()` placeholder for a future distributed backend (pgvector/tsvector); declared but not exported, not wired up |
+| `src/store/types.rs` | shared store types: `Document`, `Chunk`, `Hit`, `RetrievalLogEntry` |
 | `src/retrieve/router/mod.rs` | Router trait + auto/gemma/haiku mode selection |
 | `src/retrieve/router/gemma.rs` | Local Gemma impl (mlx_lm.server HTTP) |
-| `src/retrieve/router/haiku.rs` | Anthropic Haiku impl (with prompt caching) |
+| `src/retrieve/router/haiku.rs` | Anthropic Haiku impl (sets `cache_control`; inert at current prompt size) |
 | `src/retrieve/hybrid.rs` | BM25 + cosine score merge |
 | `src/retrieve/budget.rs` | token-aware chunk selection |
 | `src/parse/` | per-language parsers (proto, go, rust, openapi, markdown) |
@@ -77,7 +79,7 @@ model = "haiku"
 - **`gemma`** — force local Gemma. Silent passthrough if unavailable (preserves the zero-token-cost guarantee).
 - **`haiku`** — force remote Haiku. Requires `ANTHROPIC_API_KEY`.
 
-Haiku impls use `cache_control: ephemeral` on the system block so the JSON schema and few-shot examples don't burn input tokens on every call. Without caching, hook overhead is roughly 25× higher.
+Haiku impls set `cache_control: ephemeral` on the system block, but the marker is **inert today**: prompt caching only engages once the cached prefix reaches Haiku's ~4096-token minimum, and `ROUTER_SYSTEM` (schema + instruction) is only a few hundred tokens — so no cache entry is ever created (`cache_creation_input_tokens: 0`, no error). Per-call cost is ~$0.0002 because the prompt is *tiny*, not because caching is working. The marker is forward-looking: if the system block ever grows past ~4096 tokens (e.g. added few-shot examples), caching kicks in and the byte-identical-between-backends requirement on `ROUTER_SYSTEM` starts mattering.
 
 `vault index sync` shows a one-time cost estimate the first time a session falls back to Haiku for classification — e.g. *"Gemma not detected. Use Haiku for classification? Estimated cost: ~$0.03 for 200 files. [y/N]"*.
 

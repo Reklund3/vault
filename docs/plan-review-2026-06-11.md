@@ -41,7 +41,7 @@ The design plan was written before Steps 1–14.8 were implemented and has drift
 
 | # | Plan says | Reality | Where |
 |---|-----------|---------|-------|
-| A1 | `PreToolUse` hook; "prepends context"; "writes decorated prompt to stdout" | `UserPromptSubmit`; emits **only** the `<tag>` block; Claude Code appends it (echoing the prompt would duplicate it) | plan 43–66, 658–668, 762–763 vs src/hook/mod.rs:10–23 |
+| A1 | `PreToolUse` hook; "prepends context"; "writes decorated prompt to stdout" | ✅ **fixed 2026-06-14** across all three docs — `UserPromptSubmit`, absolute-path example, and "emits **only** the block; Claude Code appends it" now consistent in README, plan, and CLAUDE.md (matches src/hook/mod.rs:10–23) | plan 43–66, 658–668, 762–763 |
 | A2 | `retrieve/hybrid.rs` "absorbed into sqlite_store::hybrid_search — skip Step 11"; Store trait = 5 methods | Reversed by commit 455303d: Store exposes `bm25_search`/`cosine_search` primitives; shared merge in retrieve/hybrid.rs so all backends score identically. Trait also has `get_or_create_project`, `get_document_content_hash`, alpha param | plan 613–617, 637–643, 1025–1028 |
 | A3 | Token estimation = "tiktoken cl100k_base, accurate counts" (a "Confirmed" decision) | chars/4 heuristic (`estimate_tokens`, div_ceil). cl100k is OpenAI's tokenizer anyway — never matched Claude | plan 199, 911 vs src/parse/mod.rs |
 | A4 | Canonical vault.toml example | **Fails to parse twice**: `[defaults]` has `timeout_ms` but code requires `timeout` (no serde default); `[classifier]` block without `timeout_secs` is a hard error (field required when block present) | plan 681–705 vs src/config.rs:24–57 |
@@ -51,7 +51,7 @@ The design plan was written before Steps 1–14.8 were implemented and has drift
 | A8 | Hybrid SQL: skip-if-empty for languages only; `c.project_id IN (...)` directly from router "projects" (names!) | All three filters skip-if-empty; projects resolve via name subselect; empty type_names+topics skips the BM25 arm entirely (cosine-only); MATCH = quoted-escaped type_names+topics joined `" OR "` | plan 505–526 vs sqlite_store.rs `build_filter_clause`/`build_match_query` |
 | A9 | Re-embed skip + byte-compare collision defense ("Confirmed" behavior) | **Not implemented**: a changed file re-embeds every chunk; `upsert_document` wipes and reinserts; `chunks.content_hash` stored but never compared | plan 389–413 vs src/index/sync.rs, sqlite_store.rs |
 | A10 | retrieval_log drives alpha tuning | Zero producers — neither hook nor diagnose calls `log_retrieval` (budget.rs: "once the hook starts writing") | plan 219–227, 965 |
-| A11 | "~$0.0002/call **with prompt caching**" | Caching is inert: ROUTER_SYSTEM ≈ 300 tokens < Haiku's 4096-token min cacheable prefix — no cache entry is ever created. Cost lands in that ballpark only because the prompt is tiny. Becomes real if few-shot examples grow the system block past 4096 | plan 12, 106–108, 907 |
+| A11 | "~$0.0002/call **with prompt caching**" | ✅ **fixed 2026-06-14** — Haiku's 4096-token min cacheable prefix verified against current Anthropic docs; ROUTER_SYSTEM (~300 tok) is far below it, so `cache_control` is inert (`cache_creation_input_tokens: 0`, no error) and cost is low only because the prompt is tiny. CLAUDE.md + plan now say so and note caching engages only if the system block grows past ~4096 tokens | plan 12, 106–108, 942; CLAUDE.md 9/33/52/80 |
 | A12 | "Gemma 4 MLX model tag — Unconfirmed" tracking item; `router_model = "gemma4-27b-moe"` | Resolved: `/Users/kenobi/git/hub/mlx/gemma-4-31b-bf16` | plan 709, 934, 955 |
 
 ### B. Internal contradictions / underspecification
@@ -81,7 +81,7 @@ CamelCase/FTS5 tokenization (one-line known-limitation at most — router extrac
 Doc-only pass; all code changes stay out of scope and land as decisions/tracking items.
 
 ### `docs/olympus-vault-plan.md`
-- [ ] Hook contract: UserPromptSubmit everywhere; "emits only the context block, appended by Claude Code"; absolute-path settings.json example; resolve the "confirm hook key" note.
+- [x] Hook contract: UserPromptSubmit everywhere; "emits only the context block, appended by Claude Code"; absolute-path settings.json example. *(done 2026-06-14 — A1; the minor "confirm hook key" plan note still to be removed in a later pass.)*
 - [ ] Config: example vault.toml that actually parses (`timeout = 3`, `timeout_secs` in both blocks); document `[router].timeout_secs`/`[classifier].timeout_secs` and the hook-budget implication (P1).
 - [ ] Schema: add `meta` table + `verify_or_init_embedding` + user_version note.
 - [ ] Retrieval: fix the SQL to match `build_filter_clause` semantics (skip-if-empty ×3, name subselect, BM25-arm skip, MATCH construction); ~~add the B5 scoring-tradeoff paragraph~~ *(done 2026-06-14)*.
@@ -93,15 +93,19 @@ Doc-only pass; all code changes stay out of scope and land as decisions/tracking
 - [ ] Tracking items: resolve A12; add items for P1 (per-role model+timeout, hook clamp, latency-aware fallback), ~~P2 (name normalization, drop-unknown languages)~~ *(resolved 2026-06-14)*, P3 (single-tag+domain-attribute decision, block grouping vs contract text, doctor check), P4 (markdown parser priority, size guard, embed truncation), B1/B3 (retrieval_log fate + WAL as one decision), B6 (cache relocation), ~~B7 (router prompt cleanup)~~ *(resolved 2026-06-14)*, C1, C2.
 
 ### `CLAUDE.md` (repo)
-- [ ] Key modules table: `writer.rs`/`query.rs` → `sqlite_store.rs`; add walk/sync/secrets/diagnose/hybrid.
-- [ ] Hook wording: "returns decorated prompt" → emits block; parser list truth.
+- Key modules table:
+  - [x] Store rows aligned to the trait-based, SQLite-only backend (`writer.rs`/`query.rs` → `traits.rs` + `schema.rs` + `sqlite_store.rs` + `postgresql_store.rs` stub + `types.rs`). *(done 2026-06-14 — the doc had referenced the pre-refactor SQLite-only layout; `PostgresStore` is a `todo!()` placeholder, not exported.)*
+  - [ ] Add the missing module rows — sub-items: [ ] `config.rs`; [ ] `diagnose/mod.rs`; [ ] `index/walk.rs`; [ ] `index/sync.rs`; [ ] `index/secrets.rs`; [ ] `util/{json,path,probe,fs}.rs`.
+  - [ ] Implementation Order section still names `store/writer.rs` (Step 2) / `store/query.rs` (Step 3) → `sqlite_store.rs`; keep the `impl-status` skill's 14-step list in sync.
+- [x] ~~Hook wording: "returns decorated prompt" → emits block~~ *(done 2026-06-14 — A1)*. (Parser-list truth split into its own item below.)
+- [ ] **Parser list — doc claims parsers that don't exist** *(separate tracking item)*: the module table + Architecture prose list `openapi`/`markdown` parsers, but `src/parse/` has only `proto.rs`/`go_source.rs`/`rust_source.rs`. Correct the list and mark markdown/openapi "planned" — ties to **P4** (markdown is the highest-value missing parser) and the chunking-table "planned — whole-file fallback today" caveat.
 - [x] Verify the "30s per-call timeout" claim against current Claude Code docs. *(verified 2026-06-14: CLAUDE.md's 30s is **correct** — `UserPromptSubmit` is special-cased to a 30s default per code.claude.com/docs/en/hooks.md; the advisor's "60s" was wrong. Corrected the stray "60s default hook kill window" in P1 above to 30s instead.)*
 
 ### `docs/security.md`
 - [x] Fix the `PreToolUse` example + the false "exits non-zero" claim (contradicts fail-open). *(resolved 2026-06-14: missing-key now described as fail-open exit-0 + `hook.log`/breadcrumb, surfacing loudly in `diagnose`/`sync`; example event `PreToolUse` → `UserPromptSubmit`.)*
 
 ### `README.md`
-- [ ] Same hook-event / prepend / caching family of fixes.
+- [x] Same hook-event / prepend / caching family of fixes. *(done 2026-06-14 — A1 + A11: `UserPromptSubmit`, emits-only-the-block/appended wording, absolute-path example, fail-open empty-stdout phrasing, and the inert-caching cost note.)*
 
 ### Verification (when executing)
 - `cargo test` stays green (docs only).
