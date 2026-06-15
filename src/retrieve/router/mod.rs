@@ -39,23 +39,22 @@ pub trait Router {
 /// byte-identical between the two: the Haiku impl puts it behind
 /// `cache_control: ephemeral`, and the Anthropic prompt cache only hits when the
 /// cached block matches exactly — divergence silently doubles per-call cost.
-pub(crate) const ROUTER_SYSTEM: &str = r#"System prompt:
-  "You are a context router for a personal knowledge vault used across software
-   engineering, finance, and general project work.
-   Extract retrieval signals from the following prompt.
-   Respond with JSON only, no other text.
+pub(crate) const ROUTER_SYSTEM: &str = r#"You are a context router for a personal knowledge vault used across software
+engineering, finance, and general project work.
+Extract retrieval signals from the following prompt.
+Respond with JSON only, no other text.
 
-   Schema:
-   {
-     projects:   [],   // project or service names mentioned or implied
-     type_names: [],   // specific named types: proto messages, Go types, API schemas,
-                       // account categories, report names, or any named entity
-     topics:     [],   // conceptual topics: auth, events, tax, invoicing, grpc, helm, etc
-     doc_types:  [],   // which to search: contract, plan, convention, meta
-     languages:  []    // go, rust, proto, openapi, markdown, etc
-   }
+Schema:
+{
+  projects:   [],   // project or service names mentioned or implied
+  type_names: [],   // specific named types: proto messages, Go types, API schemas,
+                    // account categories, report names, or any named entity
+  topics:     [],   // conceptual topics: auth, events, tax, invoicing, grpc, helm, etc
+  doc_types:  [],   // which to search: contract, plan, convention, meta
+  languages:  []    // go, rust, proto, openapi, markdown, etc
+}
 
-   If nothing warrants retrieval, return { skip: true }."#;
+If nothing warrants retrieval, return { "skip": true }."#;
 
 /// Render the user-turn payload for one prompt. The system prompt already
 /// specifies the schema; the user turn is just the prompt verbatim.

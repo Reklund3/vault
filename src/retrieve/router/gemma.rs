@@ -246,9 +246,9 @@ mod tests {
     #[ignore = "requires live mlx_lm.server at http://localhost:8080"]
     fn live_gemma_route_skip() {
         // Skip is the zero-cost-passthrough optimization for the hook. ROUTER_SYSTEM
-        // shows the skip shape as `{ skip: true }` (unquoted key, invalid JSON); if
-        // the model echoes that, parse fails silently and skip never fires. This
-        // test is the gate that proves Gemma produces valid JSON for the skip path.
+        // shows the skip shape as valid JSON (`{ "skip": true }`), so a faithful echo
+        // parses straight through. This test is the gate that proves Gemma actually
+        // produces that shape for a trivial prompt, so the skip path fires.
         let config = Config::default();
         let router = GemmaRouter::from_config_with_timeout(&config, LIVE_TIMEOUT).expect("client");
         let out = router.plan("hi").expect("plan");
