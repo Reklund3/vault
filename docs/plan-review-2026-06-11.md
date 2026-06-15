@@ -61,7 +61,7 @@ The design plan was written before Steps 1–14.8 were implemented and has drift
 - **B4.** Cross-domain tag selection is first-listed-project-wins (`resolve_context_tag`) — order-sensitive to LLM output ordering; plan never specifies mixed-domain behavior. (Subsumed by P3's single-tag proposal.)
 - **B5.** Scoring tradeoff undocumented: BM25 normalizes against result-set max, so the top keyword hit always gets 1.0 → final ≥ α (0.6) regardless of absolute relevance; scores aren't comparable across queries. One-paragraph "known tradeoff, revisit during tuning" note.
 - **B6.** vault.toml is human-edited AND machine-written (`[classifications]` cache; planned domain writeback). Comment-clobbering unaddressed. Writeback isn't implemented yet, so relocating the cache (vault.db or a separate file) is still cheap — record the decision now.
-- **B7.** Router system prompt is a copy-paste artifact: `ROUTER_SYSTEM` literally begins `System prompt:\n  "You are...` — wrapper label + unbalanced quote sent verbatim to both backends; the in-prompt `{ skip: true }` example is invalid JSON (live tests note the model echoing it would fail parsing silently).
+- **B7.** ~~Router system prompt is a copy-paste artifact.~~ *RESOLVED 2026-06-14: the `System prompt:\n  "You are...` wrapper label + unbalanced quote are stripped — `ROUTER_SYSTEM` now opens directly on the instruction; the in-prompt skip example is valid JSON (`{ "skip": true }`), so a faithful echo parses straight to the zero-cost skip path. Both backends still read the byte-identical const, so Haiku's ephemeral cache is unaffected.*
 - **B8.** `chunks_vec` has no delete trigger while FTS5 does — deliberate (a vec0-referencing trigger breaks every delete when the extension isn't loaded) but undocumented; fold the rationale + cleanup order into the `index remove` item.
 - **B9.** Minor: diagnose prints a hardcoded "(auto)" mode label even when forced; `migrations/` dir at repo root is empty; live vault.toml still carries the example `[classifications."~/repos/build-service"]` block.
 
@@ -90,7 +90,7 @@ Doc-only pass; all code changes stay out of scope and land as decisions/tracking
 - [ ] Binary structure: rewrite the tree to match `src/`; reverse the Step-11 "absorbed" notes; correct the Store trait listing.
 - [ ] CLI: status-mark unimplemented commands; add `--name`/`--dry-run`; note diagnose flag reality.
 - [ ] Decisions table: token estimation → chars/4 (with revisit note); prompt-caching → correct mechanism (A11); hybrid placement → extracted (A2); latency table → real 31B numbers.
-- [ ] Tracking items: resolve A12; add items for P1 (per-role model+timeout, hook clamp, latency-aware fallback), ~~P2 (name normalization, drop-unknown languages)~~ *(resolved 2026-06-14)*, P3 (single-tag+domain-attribute decision, block grouping vs contract text, doctor check), P4 (markdown parser priority, size guard, embed truncation), B1/B3 (retrieval_log fate + WAL as one decision), B6 (cache relocation), B7 (router prompt cleanup), C1, C2.
+- [ ] Tracking items: resolve A12; add items for P1 (per-role model+timeout, hook clamp, latency-aware fallback), ~~P2 (name normalization, drop-unknown languages)~~ *(resolved 2026-06-14)*, P3 (single-tag+domain-attribute decision, block grouping vs contract text, doctor check), P4 (markdown parser priority, size guard, embed truncation), B1/B3 (retrieval_log fate + WAL as one decision), B6 (cache relocation), ~~B7 (router prompt cleanup)~~ *(resolved 2026-06-14)*, C1, C2.
 
 ### `CLAUDE.md` (repo)
 - [ ] Key modules table: `writer.rs`/`query.rs` → `sqlite_store.rs`; add walk/sync/secrets/diagnose/hybrid.
@@ -98,7 +98,7 @@ Doc-only pass; all code changes stay out of scope and land as decisions/tracking
 - [ ] Verify the "30s per-call timeout" claim against current Claude Code docs (advisor: default is 60s) and correct.
 
 ### `docs/security.md`
-- [ ] Fix the `PreToolUse` example + the false "exits non-zero" claim (contradicts fail-open).
+- [x] Fix the `PreToolUse` example + the false "exits non-zero" claim (contradicts fail-open). *(resolved 2026-06-14: missing-key now described as fail-open exit-0 + `hook.log`/breadcrumb, surfacing loudly in `diagnose`/`sync`; example event `PreToolUse` → `UserPromptSubmit`.)*
 
 ### `README.md`
 - [ ] Same hook-event / prepend / caching family of fixes.

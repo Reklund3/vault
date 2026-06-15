@@ -125,9 +125,14 @@ Defenses, in order of importance:
 - `ANTHROPIC_API_KEY` is read from the **environment only**. Never from
   `vault.toml`, never from any file on disk that vault writes. If `mode =
   "haiku"` (or `auto` with Gemma unreachable) and the key is missing,
-  `vault hook` exits non-zero at startup-probe time so the user notices, but
-  the *hook protocol* still passes through stdin to stdout — Claude Code never
-  sees an error.
+  `vault hook` honors the fail-open contract: router construction returns
+  `MissingApiKey`, the hook treats it as any other failure — empty stdout,
+  **exit 0** — and Claude Code sees no error and never blocks. The miss is
+  still observable locally: a metadata-only record in `~/.vault/hook.log` plus
+  a one-line stderr breadcrumb (which Claude Code shows only in debug mode).
+  The missing key surfaces *loudly* where it should — in the interactive
+  `vault diagnose` and `vault index sync` commands, which build the same
+  Haiku backend off the fail-open hot path and report the error directly.
 - Vault never logs, echoes, or includes the key in `vault diagnose` output.
 - `vault.toml` may contain repo paths and domain assignments but no secrets.
 - **When vault spawns a child process** (the `vault tei start` launcher for
@@ -201,7 +206,7 @@ through the router into the database.
 `~/.claude/settings.json` should reference vault by **absolute path**:
 
 ```json
-{ "hooks": { "PreToolUse": [{ "command": "/usr/local/bin/vault hook" }] } }
+{ "hooks": { "UserPromptSubmit": [{ "command": "/usr/local/bin/vault hook" }] } }
 ```
 
 A bare `"vault hook"` is PATH-resolved; anything earlier in the user's PATH
