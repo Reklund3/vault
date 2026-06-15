@@ -538,6 +538,23 @@ TokenBudget = 10_000
 Budget fill: sort by score descending, skip oversized chunks (`continue` not `break`),
 stop when budget exhausted.
 
+**BM25 normalization — known tradeoff & intended evolution.** `bm25_normalized`
+divides each chunk's raw BM25 by the *result-set maximum* (`src/retrieve/hybrid.rs`),
+so the top keyword hit in any query always normalizes to `1.0` and therefore scores
+`final ≥ α` (0.6) regardless of its absolute match strength; the `MinChunkScore = 0.15`
+floor can only trim the tail, never the top hit. A corollary: because the divisor is
+each query's own max, `final_score` ranks chunks *within* a query but is **not
+comparable across queries**. This is a deliberate simplicity choice (bounded blending
+with no calibration), but it discards absolute match magnitude — "the delta". Candidate
+replacements that preserve it, in rough order of effort: a **fixed-divisor-with-clamp**
+(`min(1.0, raw / BM25_REF)`), a **sigmoid calibration** of raw BM25, or
+**theoretical-max** normalization (`Σ idf·(k1+1)`). Reciprocal Rank Fusion is the common
+hybrid-search alternative but is purely ordinal — it would discard the delta too, so it
+is *not* the chosen direction. **Gated on C2 (golden-prompt eval set):** any change must
+beat max-normalization on real ground truth before adoption — the store already retains
+raw `bm25_score`/`cosine_score` on every `Hit`, so this can be measured and swapped
+without a migration.
+
 ### Step 4 — Context Assembly
 
 The context tag wraps the injected block. It is determined by the project's domain
