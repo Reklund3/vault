@@ -27,18 +27,17 @@ pub struct SyncReport {
     pub project_id: i64, // 0 in dry-run (no store touched)
     pub dry_run: bool,
     pub files_walked: usize,
-    pub files_cached: usize,                  // matched a vault.toml override
-    pub files_classified: usize,              // called the live classifier (0 in dry-run)
-    pub files_would_classify: usize,          // dry-run only — # that would have classified
-    pub files_unchanged: usize,               // content_hash matched (0 in dry-run)
+    pub files_classified: usize, // called the live classifier (0 in dry-run)
+    pub files_would_classify: usize, // dry-run only — # that would have classified
+    pub files_unchanged: usize,  // content_hash matched (0 in dry-run)
     pub files_skipped_remote_classify: usize, // head trip → ext fallback (0 in dry-run)
-    pub files_parsed_via_parser: usize,       // 0 in dry-run
-    pub files_parsed_as_whole: usize,         // 0 in dry-run
+    pub files_parsed_via_parser: usize, // 0 in dry-run
+    pub files_parsed_as_whole: usize, // 0 in dry-run
     pub files_skipped: Vec<(String, String)>, // (relative_path, reason)
-    pub chunks_indexed: usize,                // 0 in dry-run
-    pub chunks_dropped_secret: usize,         // 0 in dry-run
-    pub orphans_pruned: usize,                // 0 in dry-run
-    pub estimated_haiku_cost_usd: f64,        // dry-run; 0.0 if not auto→Haiku
+    pub chunks_indexed: usize,   // 0 in dry-run
+    pub chunks_dropped_secret: usize, // 0 in dry-run
+    pub orphans_pruned: usize,   // 0 in dry-run
+    pub estimated_haiku_cost_usd: f64, // dry-run; 0.0 if not auto→Haiku
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -83,7 +82,7 @@ pub fn run_sync(opts: SyncOptions, config: &Config) -> Result<SyncReport, SyncEr
     .map_err(SyncError::Walk)?;
 
     if opts.dry_run {
-        return Ok(dry_run_report(&walked, config, &canonical, project_name));
+        return Ok(dry_run_report(&walked, config, project_name));
     }
 
     let embedder = TeiEmbedder::from_config(config).map_err(SyncError::TeiUnreachable)?;
@@ -115,8 +114,6 @@ pub fn run_sync(opts: SyncOptions, config: &Config) -> Result<SyncReport, SyncEr
     sync_with(
         project_id,
         project_name,
-        &canonical,
-        config,
         &walked,
         &mut store,
         &embedder,
@@ -127,19 +124,14 @@ pub fn run_sync(opts: SyncOptions, config: &Config) -> Result<SyncReport, SyncEr
 /// Core orchestrator. Takes trait objects so tests can swap stubs without
 /// constructing TEI / SQLite. Caller is responsible for the cost-prompt and
 /// project-id resolution.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn sync_with(
     project_id: i64,
     project_name: String,
-    canonical_repo: &Path,
-    config: &Config,
     walked: &[Walked],
     store: &mut dyn Store,
     embedder: &dyn Embedder,
     classifier: &dyn Classifier,
 ) -> Result<SyncReport, SyncError> {
-    let canonical_repo_str = canonical_repo.to_str().unwrap_or_default();
-
     // Populated from the walk up front. Deletion-detection is decoupled from
     // indexing success — a transient TEI failure on one file must not wipe
     // its prior index row on the next prune.
@@ -154,16 +146,7 @@ pub(crate) fn sync_with(
     };
 
     for w in walked {
-        process_file(
-            w,
-            config,
-            project_id,
-            canonical_repo_str,
-            store,
-            embedder,
-            classifier,
-            &mut report,
-        )?;
+        process_file(w, project_id, store, embedder, classifier, &mut report)?;
     }
 
     let pruned = store
@@ -173,29 +156,13 @@ pub(crate) fn sync_with(
     Ok(report)
 }
 
-/// Cheap preview: walks, checks the vault.toml cache, computes a cost estimate.
-/// Never reads file bodies past what the walker already saw, never embeds, never
-/// touches the store, never calls the classifier.
-fn dry_run_report(
-    walked: &[Walked],
-    config: &Config,
-    canonical_repo: &Path,
-    project_name: String,
-) -> SyncReport {
-    let canonical_repo_str = canonical_repo.to_str().unwrap_or_default();
-    let mut cached = 0usize;
-    let mut would_classify = 0usize;
-    for w in walked {
-        if config
-            .cached_classification(canonical_repo_str, &w.relative_path)
-            .is_some()
-        {
-            cached += 1;
-        } else {
-            would_classify += 1;
-        }
-    }
-
+/// Cheap preview: walks and computes a cost estimate. Never reads file bodies
+/// past what the walker already saw, never embeds, never touches the store,
+/// never calls the classifier. Because it doesn't open the DB it can't tell
+/// which files are unchanged, so the estimate is an upper bound over every
+/// walked file.
+fn dry_run_report(walked: &[Walked], config: &Config, project_name: String) -> SyncReport {
+    let would_classify = walked.len();
     let cost = if config.classifier_mode() == "auto"
         && resolve_backend(config) == ResolvedBackend::Haiku
     {
@@ -209,19 +176,15 @@ fn dry_run_report(
         project_id: 0,
         dry_run: true,
         files_walked: walked.len(),
-        files_cached: cached,
         files_would_classify: would_classify,
         estimated_haiku_cost_usd: cost,
         ..SyncReport::default()
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn process_file(
     w: &Walked,
-    config: &Config,
     project_id: i64,
-    canonical_repo_str: &str,
     store: &mut dyn Store,
     embedder: &dyn Embedder,
     classifier: &dyn Classifier,
@@ -259,34 +222,28 @@ fn process_file(
         .unwrap_or_default()
         .to_string();
 
-    let classification = match config.cached_classification(canonical_repo_str, &w.relative_path) {
-        Some(c) => {
-            report.files_cached += 1;
-            c
-        }
-        None => {
-            let head_end = bytes.len().min(HEAD_BYTES);
-            let head = String::from_utf8_lossy(&bytes[..head_end]).into_owned();
-            if secrets::looks_like_secret(&head) {
-                report.files_skipped_remote_classify += 1;
-                ext_fallback(&extension)
-            } else {
-                let input = ClassifyInput {
-                    filename: filename.clone(),
-                    extension: extension.clone(),
-                    head,
-                };
-                match classifier.classify(&input) {
-                    Ok(c) => {
-                        report.files_classified += 1;
-                        c
-                    }
-                    Err(e) => {
-                        report
-                            .files_skipped
-                            .push((w.relative_path.clone(), format!("classify error: {e}")));
-                        return Ok(());
-                    }
+    let classification = {
+        let head_end = bytes.len().min(HEAD_BYTES);
+        let head = String::from_utf8_lossy(&bytes[..head_end]).into_owned();
+        if secrets::looks_like_secret(&head) {
+            report.files_skipped_remote_classify += 1;
+            ext_fallback(&extension)
+        } else {
+            let input = ClassifyInput {
+                filename: filename.clone(),
+                extension: extension.clone(),
+                head,
+            };
+            match classifier.classify(&input) {
+                Ok(c) => {
+                    report.files_classified += 1;
+                    c
+                }
+                Err(e) => {
+                    report
+                        .files_skipped
+                        .push((w.relative_path.clone(), format!("classify error: {e}")));
+                    return Ok(());
                 }
             }
         }
@@ -379,7 +336,7 @@ fn process_file(
 fn ext_fallback(extension: &str) -> Classification {
     // Used when the head-guard trips on remote-classify. doc_type defaults to
     // Convention per the plan — head-guard hits are rare and a uniform fallback
-    // is good enough until a user pins it via `[classifications.*]`.
+    // is good enough for them.
     let language = match extension.to_ascii_lowercase().as_str() {
         "proto" => Language::Proto,
         "go" => Language::Go,
@@ -414,11 +371,6 @@ pub fn format_report(report: &SyncReport) -> String {
         );
         let _ = writeln!(
             out,
-            "  Cache hits:             {} (vault.toml [classifications.*])",
-            report.files_cached
-        );
-        let _ = writeln!(
-            out,
             "  Would classify:         {}",
             report.files_would_classify
         );
@@ -446,7 +398,6 @@ pub fn format_report(report: &SyncReport) -> String {
             "  Walked:                 {} files",
             report.files_walked
         );
-        let _ = writeln!(out, "  Cache hits:             {}", report.files_cached);
         let _ = writeln!(out, "  Classified:             {}", report.files_classified);
         let _ = writeln!(
             out,
@@ -522,7 +473,6 @@ fn prompt_for_haiku_cost<R: BufRead, W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::CachedClassification;
     use crate::embed::StubEmbedder;
     use crate::retrieve::QueryPlan;
     use crate::store::{Hit, RetrievalLogEntry};
@@ -711,43 +661,6 @@ mod tests {
         }
     }
 
-    fn config_with_cache(repo: &Path, pattern: &str, cls: CachedClassification) -> Config {
-        // Round-trip via TOML so we don't poke private fields. The cache
-        // normalizes keys, so the canonical tempdir path works directly.
-        let key = repo.to_str().unwrap();
-        let doc_type = cls.doc_type.as_str();
-        let language = cls.language.as_str();
-        let toml_text = format!(
-            r#"
-[defaults]
-context_tag = "vault-context"
-token_budget = 10000
-alpha = 0.6
-min_score = 0.15
-timeout = 3
-
-[router]
-mode = "auto"
-model = "haiku"
-
-[mlx]
-endpoint = "http://localhost:8080"
-router_model = "test"
-
-[embeddings]
-endpoint = "http://localhost:8081"
-model = "nomic-ai/nomic-embed-text-v1.5"
-dims = 768
-
-# Literal (single-quoted) key: Windows canonical paths contain backslashes,
-# which a basic TOML string would treat as (invalid) escape sequences.
-[classifications.'{key}']
-"{pattern}" = {{ doc_type = "{doc_type}", language = "{language}" }}
-"#
-        );
-        toml::from_str(&toml_text).expect("parse")
-    }
-
     // ---------- Plan's 10 cases ----------
 
     // 1. Happy path: tempdir + .proto + .go, stubs, classifier called twice.
@@ -767,8 +680,6 @@ dims = 768
         let report = sync_with(
             1,
             "test-project".to_string(),
-            &canonical,
-            &config,
             &walked,
             &mut store,
             &embedder,
@@ -804,8 +715,6 @@ dims = 768
         let report = sync_with(
             1,
             "p".to_string(),
-            &canonical,
-            &config,
             &walked,
             &mut store,
             &embedder,
@@ -821,40 +730,7 @@ dims = 768
         );
     }
 
-    // 3. Cache override hit: classifier zero calls; files_cached == 1.
-    #[test]
-    fn cache_override_skips_classifier() {
-        let tmp = Tmp::new("cache");
-        tmp.write("svc.proto", b"syntax = \"proto3\";\nmessage S {}");
-        let canonical = tmp.canonical();
-
-        let cached = CachedClassification {
-            doc_type: DocType::Contract,
-            language: Language::Proto,
-        };
-        let config = config_with_cache(&canonical, "**/*.proto", cached);
-        let mut store = StubStore::new();
-        let embedder = StubEmbedder::from_config(&config);
-        let classifier = CountingClassifier::new(ExtClassifier);
-
-        let walked = walk_repo(&canonical, &WalkOptions::default()).unwrap();
-        let report = sync_with(
-            1,
-            "p".to_string(),
-            &canonical,
-            &config,
-            &walked,
-            &mut store,
-            &embedder,
-            &classifier,
-        )
-        .unwrap();
-
-        assert_eq!(report.files_cached, 1);
-        assert_eq!(classifier.calls(), 0);
-    }
-
-    // 4. Head-guard bypass: PEM header in first 1 KiB triggers ext fallback.
+    // 3. Head-guard bypass: PEM header in first 1 KiB triggers ext fallback.
     #[test]
     fn head_guard_bypasses_remote_classifier() {
         let tmp = Tmp::new("head-guard");
@@ -873,8 +749,6 @@ dims = 768
         let report = sync_with(
             1,
             "p".to_string(),
-            &canonical,
-            &config,
             &walked,
             &mut store,
             &embedder,
@@ -906,8 +780,6 @@ dims = 768
         let report = sync_with(
             1,
             "p".to_string(),
-            &canonical,
-            &config,
             &walked,
             &mut store,
             &embedder,
@@ -967,8 +839,6 @@ dims = 768
         let report = sync_with(
             1,
             "p".to_string(),
-            &canonical,
-            &config,
             &walked,
             &mut store,
             &embedder,
@@ -1003,8 +873,6 @@ dims = 768
         let report = sync_with(
             1,
             "p".to_string(),
-            &canonical,
-            &config,
             &walked,
             &mut store,
             &embedder,
@@ -1068,8 +936,6 @@ dims = 768
         let report = sync_with(
             1,
             "p".to_string(),
-            &canonical,
-            &config,
             &walked,
             &mut store,
             &embedder,
@@ -1119,7 +985,6 @@ dims = 768
             project: "vault".into(),
             dry_run: true,
             files_walked: 60,
-            files_cached: 0,
             files_would_classify: 60,
             estimated_haiku_cost_usd: 0.0,
             ..SyncReport::default()
@@ -1153,7 +1018,6 @@ dims = 768
             project_id: 7,
             dry_run: false,
             files_walked: 60,
-            files_cached: 5,
             files_classified: 50,
             files_skipped_remote_classify: 1,
             files_unchanged: 4,

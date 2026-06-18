@@ -358,9 +358,13 @@ explicit CLI flag (--type, --language) → classifier (Gemma local or Haiku fall
 
 The classifier is given **filename + extension + the first 1KB of content** and
 proposes `doc_type` and `language`. You confirm or override interactively on
-first index. Confirmed classifications are cached in vault.toml so subsequent
-syncs of the same repo are non-interactive. The 1KB cap means file content sent
-to Anthropic in Haiku mode is bounded and inspectable — full files reach
+first index. Confirmed classifications persist in **vault.db** — the
+`documents` row records `doc_type` per file, keyed `UNIQUE(project_id,
+source_path)` with a `content_hash`. On a later sync, an unchanged file (same
+hash) is skipped wholesale: no classifier call, no re-parse, no re-embed. The
+key is the logical project + repo-relative path, so the cache survives a clone
+on another device and a shared Postgres backend. The 1KB cap means file content
+sent to Anthropic in Haiku mode is bounded and inspectable — full files reach
 Anthropic only via retrieval-time context injection, which the user controls
 through `vault diagnose`.
 
@@ -759,18 +763,17 @@ dims     = 768                           # locked at schema creation — chunks_
 patterns = [
   # project-specific extras go here
 ]
-
-# Classification cache — written by vault index sync on first run for each file pattern.
-# Prevents re-prompting on subsequent syncs of the same repo.
-[classifications."~/repos/build-service"]
-"**/*.proto"   = { doc_type = "contract", language = "proto" }
-"**/docs/*.md" = { doc_type = "plan",     language = "markdown" }
-"CLAUDE.md"    = { doc_type = "meta",     language = "markdown" }
 ```
 
-The `[classifications]` block is written automatically during `vault index sync`.
-You never edit it manually — but you can delete an entry to force re-classification
-on the next sync.
+`vault.toml` is **read-only** from vault's perspective — it is hand-authored and
+vault never writes to it. The classification cache is *not* stored here; it lives
+in **vault.db** as the `documents` row for each file (`doc_type` keyed
+`UNIQUE(project_id, source_path)` with a `content_hash`). A later sync skips any
+file whose hash is unchanged — no re-classify, no re-embed — and to force
+re-classification you change the file or run `vault index remove` for the
+project. Because the key is the logical project + repo-relative path (never an
+absolute path), the cache survives a clone on another device or a shared Postgres
+backend.
 
 The assembled context block for a software session:
 
@@ -1090,18 +1093,19 @@ earlier in this doc.
 **Already in place:** full orchestrator (`run_sync` → `sync_with` →
 `process_file`: walk → classify → embed → upsert → prune); the one-time Haiku
 cost-estimate prompt (`prompt_for_haiku_cost`, wired + tested); dry-run preview
-and the `IndexSyncDryRun` smoke command; classification-cache *read* + path
-normalization; the "nothing written to the indexed repo" guarantee.
+and the `IndexSyncDryRun` smoke command; content-hash skip of unchanged files
+(the `documents` row is the classification cache — see the B6 decision); the
+"nothing written to the indexed repo" guarantee.
 
 **Task breakdown (live status):**
 
 | # | Task | Notes |
 |---|------|-------|
-| 1 | Atomic `vault.toml` write-back on `Config` | **Foundation.** Config is read-only today (no `save`/`to_string`; `cached_classification` is read-only). Temp-file + rename, re-harden `~/.vault` 0700 / file 0600, round-trip without dropping keys. Unblocks 3–5. |
+| 1 | ~~Atomic `vault.toml` write-back on `Config`~~ | **DROPPED 2026-06-17 (B6 decision).** The classification cache moves to **vault.db** (the `documents` row already holds `doc_type` + `content_hash`, keyed portably on `project_id` + relative path), so no `vault.toml` writer is built — vault.toml stays read-only. If #3/#4 later persist project/domain assignments to vault.toml, they use a *format-preserving* `toml_edit` edit (comments + `dims` untouched), not a whole-struct re-serialize. |
 | 2 | ~~Wire the real `vault index sync` command~~ | **DONE (9192cfc).** `vault index sync <repo> [--name] [--dry-run]` wired in `main.rs`; dry-run folded in as a flag; readable output via `format_report`. |
-| 3 | Project-name first-run prompt + persist | Prompt when the project isn't in vault.toml (default = derived name). Follow `prompt_for_haiku_cost` (BufRead/Write injection); EOF → derived default. Needs #1. |
-| 4 | Domain-assignment prompt + persist | Offer software / finance / personal / new. A *new* domain also persists its block AND must surface the two-file reminder to update `~/.claude/CLAUDE.md` (so Claude can read the new `<…-context>` tag). Needs #1. |
-| 5 | Classification confirm/override + cache write-back | Show classifier labels, let the user confirm/override before chunks are written; persist results to the vault.toml cache so later syncs skip classify. Add the write counterpart to the read accessor. Needs #1. |
+| 3 | Project-name first-run prompt + persist | Prompt when the project isn't in vault.toml (default = derived name). Follow `prompt_for_haiku_cost` (BufRead/Write injection); EOF → derived default. Persist via a format-preserving `toml_edit` edit (not the dropped #1 whole-file writer). |
+| 4 | Domain-assignment prompt + persist | Offer software / finance / personal / new. A *new* domain also persists its block AND must surface the two-file reminder to update `~/.claude/CLAUDE.md` (so Claude can read the new `<…-context>` tag). Persist via format-preserving `toml_edit`. |
+| 5 | Classification confirm/override + cache write-back | Show classifier labels, let the user confirm/override before chunks are written; the override persists as the `documents.doc_type` written by `upsert_document`, so a later unchanged-hash sync reuses it (no vault.toml). Sticky overrides *across content edits* are an open sub-decision here. |
 | 6 | Reconcile docs + green CI | Update README, this doc, and CLAUDE.md to match; `cargo fmt` + `clippy -D warnings` clean; open the `init`→`main` PR so Linux CI runs `cargo test` (sidesteps the local Windows Application Control block). Needs #2–#5. |
 | 7 | ~~Hook error observability~~ | **DONE (2026-06-12).** Outcome enum (injected / skip / failed+stage), one metadata-only JSONL record per call to `~/.vault/hook.log` (0600, 5MB rotation), stderr breadcrumb on failure, exit-0 fail-open preserved. Resolves the P1 observability sub-finding in `docs/plan-review-2026-06-11.md`; suite green locally (285/0). |
 

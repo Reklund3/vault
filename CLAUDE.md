@@ -93,8 +93,8 @@ Haiku impls set `cache_control: ephemeral` on the system block, but the marker i
 ### Runtime data
 
 ```
-~/.vault/vault.db      # SQLite store — projects, documents, chunks, FTS5, vec, retrieval_log
-~/.vault/vault.toml    # domain assignments, context tags, router/classifier mode, classification cache, tuning defaults
+~/.vault/vault.db      # SQLite store — projects, documents, chunks, FTS5, vec, retrieval_log; documents.content_hash is the classification/re-embed cache
+~/.vault/vault.toml    # domain assignments, context tags, router/classifier mode, tuning defaults (hand-authored; vault never writes it)
 ~/.vault/hook.log      # hook telemetry — one JSONL record per hook call (outcome, stage, latency, backend); rotated to hook.log.1 at 5MB
 ```
 

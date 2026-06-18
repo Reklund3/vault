@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use crate::config::home_dir;
 
 /// Expand a leading `~` (or `~/`) to the user's home directory. Anything else
-/// returns unchanged. Pure — no filesystem access. Used as the first step of
-/// `normalize_repo_key` so vault.toml keys written as `~/repos/foo` line up
-/// with what the sync command canonicalizes from the user's `$HOME`.
+/// returns unchanged. Pure — no filesystem access. A general path primitive
+/// retained for the planned `toml_edit`-based first-run persistence (tasks
+/// #3/#4), which expands `~` in user-supplied repo paths.
+#[allow(dead_code)] // next consumer arrives with first-run vault.toml persistence
 pub fn expand_tilde(input: &str) -> PathBuf {
     let Some(rest) = input.strip_prefix('~') else {
         return PathBuf::from(input);
@@ -19,23 +20,6 @@ pub fn expand_tilde(input: &str) -> PathBuf {
     // Accept both `~/foo` and `~foo` (the latter is unusual but cheap to handle).
     let trimmed = rest.strip_prefix('/').unwrap_or(rest);
     home.join(trimmed)
-}
-
-/// Canonicalize a repo path into the string form used as a `[classifications.*]`
-/// key. Tilde-expands first (always), then attempts `std::fs::canonicalize`;
-/// falls back to the expanded form on failure (the path may not exist on disk
-/// — e.g. an archived repo entry in vault.toml — and we still want
-/// deterministic, equal-on-both-sides keys).
-///
-/// Both `Config::cached_classification` (read) and the cache write-back at
-/// 14.5 must run through this helper so the key generated on either side
-/// agrees. Without it, a sync against `/Users/me/git/foo` would never match a
-/// user-authored `~/git/foo` section, and write-back would create a duplicate
-/// entry alongside the existing one.
-pub fn normalize_repo_key(input: &str) -> String {
-    let expanded = expand_tilde(input);
-    let canonical = std::fs::canonicalize(&expanded).unwrap_or(expanded);
-    canonical.to_string_lossy().to_string()
 }
 
 #[allow(dead_code)] // first consumer arrives with 14.6 walker integration
@@ -73,43 +57,6 @@ mod tests {
         let home = home_dir().expect("HOME must be set for tests");
         assert_eq!(expand_tilde("~"), home);
         assert_eq!(expand_tilde("~/git/foo"), home.join("git/foo"));
-    }
-
-    #[test]
-    fn normalize_repo_key_canonicalizes_real_path() {
-        // Tempdir exists on disk — canonicalize resolves symlinks (e.g. macOS
-        // `/var` → `/private/var`) so the returned key is the real path, not
-        // whatever the caller passed.
-        let dir = std::env::temp_dir();
-        let key = normalize_repo_key(dir.to_str().expect("temp dir is utf8"));
-        let expected = std::fs::canonicalize(&dir)
-            .expect("temp dir canonicalizes")
-            .to_string_lossy()
-            .to_string();
-        assert_eq!(key, expected);
-    }
-
-    #[test]
-    fn normalize_repo_key_falls_back_when_path_missing() {
-        // The path doesn't exist; we expect the tilde-expanded form back, not
-        // a panic or an empty string. This is the path archived-repo entries
-        // in vault.toml take.
-        let key = normalize_repo_key("/definitely/not/a/real/path/zzz-vault-test");
-        assert_eq!(key, "/definitely/not/a/real/path/zzz-vault-test");
-    }
-
-    #[test]
-    fn normalize_repo_key_expands_tilde_in_fallback_path() {
-        let home = home_dir().expect("HOME set");
-        // A tilde-keyed entry pointing to a non-existent subpath should still
-        // be expanded — that's how `~/git/archived/foo` keys keep working
-        // even after the user deletes the directory.
-        let key = normalize_repo_key("~/this-subdir-definitely-does-not-exist-zzz");
-        let expected = home
-            .join("this-subdir-definitely-does-not-exist-zzz")
-            .to_string_lossy()
-            .to_string();
-        assert_eq!(key, expected);
     }
 
     #[test]
