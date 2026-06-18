@@ -58,8 +58,15 @@ The router returns `{ skip: true }` for prompts that need no context — immedia
 | `src/index/classify/mod.rs` | Classifier trait + auto/gemma/haiku selection |
 | `src/index/classify/gemma.rs` | Local Gemma classifier |
 | `src/index/classify/haiku.rs` | Anthropic Haiku classifier (cost prompt on first use) |
+| `src/index/walk.rs` | repo walker — globset exclusions, symlink refusal, canonical-root bound (enforces the indexer security rules) |
+| `src/index/sync.rs` | `vault index sync` pipeline — classify → parse (whole-file fallback) → embed → upsert; `SyncReport` |
+| `src/index/secrets.rs` | index-time secret pre-scan (`RegexSet`) — drops chunks matching AWS/GitHub/Anthropic/OpenAI/JWT/PEM patterns before storage |
 | `src/embed/tei.rs` | nomic-embed-text-v1.5 embeddings via TEI HTTP (`localhost:8081`) |
 | `src/tei/launcher.rs` | `vault tei start\|stop\|status\|logs` — spawn TEI from `[embeddings].launcher_cmd` with env scrubbing; PID + log in `~/.vault/`; cross-platform detach |
+| `src/diagnose/mod.rs` | `vault diagnose "<prompt>"` — full retrieval trace for tuning α and token budget |
+| `src/config.rs` | `vault.toml` parsing — `Config`, `ConfigError`, context-tag resolution, router/classifier mode + timeout knobs |
+| `src/types.rs` | top-level shared enums — `Language`, `DocType` (orthogonal axes used across parse/classify/router) |
+| `src/util/` | `fs.rs` (0700/0600 hardening for `~/.vault/`), `json.rs` (balanced-brace extraction from model replies), `path.rs` (`~` expansion), `probe.rs` (200ms loopback TCP probe for auto-mode) |
 
 ### Router selection
 
@@ -100,8 +107,8 @@ The store layer must come before retrieval; `vault diagnose` must work before pa
 ```
 Step 0  Confirm embedding stack (TEI reachable, nomic-embed-text-v1.5 = 768 dims) — locks chunks_vec FLOAT[768]
 Step 1  store/schema.rs
-Step 2  store/writer.rs (upsert + sync-time prune)
-Step 3  store/query.rs
+Step 2  store/sqlite_store.rs — upsert + sync-time prune (behind the Store trait in store/traits.rs)
+Step 3  store/sqlite_store.rs — FTS5 + sqlite-vec hybrid query, score merge, budget trim
 Step 4  vault diagnose — validate retrieval with manually seeded data before building parsers
 Step 5  parse/proto.rs
 Step 6  parse/go_source.rs

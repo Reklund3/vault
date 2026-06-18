@@ -277,9 +277,9 @@ meta). If no context block is present, none was relevant.
 
 ```
 Step 0  Confirm TEI reachable + 768 dims (nomic-embed-text-v1.5) → update vault.toml [embeddings]
-Step 1  store/schema.rs     — embedded SQL, migration runner
-Step 2  store/writer.rs     — upsert project, document, chunk, vec
-Step 3  store/query.rs      — FTS5 + vec queries, score merge, budget trim
+Step 1  store/schema.rs       — embedded SQL, migration runner
+Step 2  store/sqlite_store.rs — upsert project, document, chunk, vec (behind Store trait)
+Step 3  store/sqlite_store.rs — FTS5 + vec queries, score merge, budget trim
 Step 4  vault diagnose      — validate retrieval with real data before parsers exist
 Step 5  parse/proto.rs      — first parser
 Step 6  parse/go_source.rs

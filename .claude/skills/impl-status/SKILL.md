@@ -18,8 +18,8 @@ The `vault` project follows a strict bottom-up implementation order with hard de
 ```
 Step 0   Confirm TEI reachable + 768 dims         (curl localhost:8081, write vault.toml [embeddings])
 Step 1   src/store/schema.rs                       (DDL, migration runner)
-Step 2   src/store/writer.rs                       (upsert project/document/chunk/vec)
-Step 3   src/store/query.rs                        (FTS5 + vec hybrid, score merge, budget)
+Step 2   src/store/sqlite_store.rs                 (upsert project/document/chunk/vec, behind Store trait)
+Step 3   src/store/sqlite_store.rs                 (FTS5 + vec hybrid, score merge, budget)
 Step 4   vault diagnose                            (CLI cmd to validate retrieval)
 Step 5   src/parse/proto.rs
 Step 6   src/parse/go_source.rs
@@ -60,7 +60,7 @@ Implementation Status
 
 Step 0   Embedding stack            ⚠ NOT CONFIRMED — vault.toml missing [embeddings] or TEI unreachable
 Step 1   store/schema.rs            ✗ not started (BLOCKED on Step 0)
-Step 2   store/writer.rs            ✗ not started
+Step 2   store/sqlite_store.rs      ✗ not started
 ...
 Step 14  First-run UX               ✗ not started
 
