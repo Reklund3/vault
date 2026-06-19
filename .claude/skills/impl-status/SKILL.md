@@ -24,6 +24,8 @@ Step 4   vault diagnose                            (CLI cmd to validate retrieva
 Step 5   src/parse/proto.rs
 Step 6   src/parse/go_source.rs
 Step 7   src/parse/rust_source.rs
+Step 7a  src/parse/openapi.rs                      (paths × methods + schemas; yaml-rust2)
+Step 7b  src/parse/markdown.rs                     (per `##` block; convention/meta only)
 Step 8   src/embed/tei.rs                          (HTTP client against TEI /embeddings)
 Step 9   src/index/classify/{mod,gemma,haiku}.rs   (Classifier trait + Gemma + Haiku impls)
 Step 10  src/retrieve/router/{mod,gemma,haiku}.rs  (Router trait + Gemma + Haiku impls)

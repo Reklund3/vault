@@ -54,7 +54,7 @@ The router returns `{ skip: true }` for prompts that need no context — immedia
 | `src/retrieve/router/haiku.rs` | Anthropic Haiku impl (sets `cache_control`; inert at current prompt size) |
 | `src/retrieve/hybrid.rs` | BM25 + cosine score merge |
 | `src/retrieve/budget.rs` | token-aware chunk selection |
-| `src/parse/` | per-language parsers (proto, go, rust, openapi, markdown) |
+| `src/parse/` | per-language parsers (proto, go, rust, openapi, markdown); `select_parser` dispatches on `(doc_type, language)` — `plan` and unrecognized types fall back to a single whole-file chunk |
 | `src/index/classify/mod.rs` | Classifier trait + auto/gemma/haiku selection |
 | `src/index/classify/gemma.rs` | Local Gemma classifier |
 | `src/index/classify/haiku.rs` | Anthropic Haiku classifier (cost prompt on first use) |
@@ -113,6 +113,8 @@ Step 4  vault diagnose — validate retrieval with manually seeded data before b
 Step 5  parse/proto.rs
 Step 6  parse/go_source.rs
 Step 7  parse/rust_source.rs
+Step 7a parse/openapi.rs                       — paths × methods + schemas (yaml-rust2; JSON parses as YAML)
+Step 7b parse/markdown.rs                      — per `##` block (convention/meta; plan stays whole-file)
 Step 8a embed/tei.rs                          — HTTP client against TEI /embeddings
 Step 8b tei/launcher.rs                       — `vault tei start|stop|status|logs` subcommands
 Step 9  index/classify/{mod,gemma,haiku}.rs   — Classifier trait + impls (cost prompt on first Haiku use)

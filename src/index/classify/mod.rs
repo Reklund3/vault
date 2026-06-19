@@ -93,6 +93,17 @@ syntax = "proto3";
 message BuildRequest { string id = 1; }
 Output: {"doc_type": "contract", "language": "proto"}
 
+Input: file "petstore.yaml" (yaml)
+---
+openapi: 3.0.0
+info:
+  title: Petstore
+paths:
+  /pets:
+    get:
+      summary: List pets
+Output: {"doc_type": "contract", "language": "openapi"}
+
 Input: file "CONVENTIONS.md" (md)
 ---
 # Error handling
@@ -296,6 +307,16 @@ dims = 768
         let c = parse_response(r#"{"doc_type":"contract","language":"proto"}"#).unwrap();
         assert_eq!(c.doc_type, DocType::Contract);
         assert_eq!(c.language, Language::Proto);
+    }
+
+    #[test]
+    fn parse_response_openapi_spec() {
+        // Guards the OpenAPI few-shot example in CLASSIFY_SYSTEM: a `.yaml`
+        // spec must resolve to language `openapi`, which is what routes it to
+        // the OpenAPI parser via `select_parser`.
+        let c = parse_response(r#"{"doc_type":"contract","language":"openapi"}"#).unwrap();
+        assert_eq!(c.doc_type, DocType::Contract);
+        assert_eq!(c.language, Language::OpenApi);
     }
 
     #[test]

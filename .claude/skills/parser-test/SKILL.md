@@ -1,6 +1,6 @@
 ---
 name: parser-test
-description: Use this skill when working on language parsers in src/parse/ for the vault project (proto.rs, go_source.rs, rust_source.rs, openapi.rs, helm.rs, markdown.rs). Runs a parser against a sample input file and pretty-prints the extracted chunks (label, doc_type, language, token estimate, content preview) so chunk boundary correctness can be validated without the full hook pipeline. Triggers when the user is implementing, debugging, or reviewing a parser, or asks to "test the parser", "check chunk boundaries", or similar.
+description: Use this skill when working on language parsers in src/parse/ for the vault project (proto.rs, go_source.rs, rust_source.rs, openapi.rs, markdown.rs). Runs a parser against a sample input file and pretty-prints the extracted chunks (label, doc_type, language, token estimate, content preview) so chunk boundary correctness can be validated without the full hook pipeline. Triggers when the user is implementing, debugging, or reviewing a parser, or asks to "test the parser", "check chunk boundaries", or similar.
 ---
 
 # Parser Test

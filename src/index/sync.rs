@@ -9,7 +9,7 @@ use crate::index::classify::{
 };
 use crate::index::secrets;
 use crate::index::walk::{WalkError, WalkOptions, Walked, walk_repo};
-use crate::parse::{self, parser_for};
+use crate::parse::{self, select_parser};
 use crate::store::{Chunk, ChunkWithEmbedding, Document, SqliteStore, Store, StoreError};
 use crate::types::{DocType, Language};
 
@@ -259,31 +259,32 @@ fn process_file(
         }
     };
 
-    let mut chunks = match parser_for(&extension) {
-        Some(parser) => match parser.parse(&content_str) {
-            Ok(chunks) => {
-                report.files_parsed_via_parser += 1;
-                chunks
+    let mut chunks =
+        match select_parser(classification.doc_type, classification.language, &extension) {
+            Some(parser) => match parser.parse(&content_str) {
+                Ok(chunks) => {
+                    report.files_parsed_via_parser += 1;
+                    chunks
+                }
+                Err(e) => {
+                    report
+                        .files_skipped
+                        .push((w.relative_path.clone(), format!("parse error: {e}")));
+                    return Ok(());
+                }
+            },
+            None => {
+                report.files_parsed_as_whole += 1;
+                vec![Chunk {
+                    language: classification.language,
+                    label: filename.clone(),
+                    content: content_str.clone(),
+                    content_hash: parse::sha256_hex(content_str.as_bytes()),
+                    token_est: parse::estimate_tokens(&content_str),
+                    chunk_index: 0,
+                }]
             }
-            Err(e) => {
-                report
-                    .files_skipped
-                    .push((w.relative_path.clone(), format!("parse error: {e}")));
-                return Ok(());
-            }
-        },
-        None => {
-            report.files_parsed_as_whole += 1;
-            vec![Chunk {
-                language: classification.language,
-                label: filename.clone(),
-                content: content_str.clone(),
-                content_hash: parse::sha256_hex(content_str.as_bytes()),
-                token_est: parse::estimate_tokens(&content_str),
-                chunk_index: 0,
-            }]
-        }
-    };
+        };
 
     let before = chunks.len();
     chunks.retain(|c| !secrets::looks_like_secret(&c.content));

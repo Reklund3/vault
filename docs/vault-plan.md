@@ -285,9 +285,9 @@ END;
 - `message`, `service`, `enum`
 - State machine parser, no AST library required
 
-**OpenAPI** — YAML/JSON:
-- Disambiguate from Helm by presence of `openapi:` or `swagger:` root key
-- Chunk per path+method combination, per `components/schemas` entry
+**OpenAPI** — YAML/JSON (parsed via `yaml-rust2`; JSON is a YAML subset, so both parse through one path):
+- Dispatched by the classifier's `openapi` language label, not the file extension — `.yaml`/`.yml`/`.json` are shared with non-spec files, and the classifier (which reads the `openapi:`/`swagger:` root key in the head) is what marks a document as a spec
+- Chunk per path+method combination, per `components/schemas` entry (plus Swagger 2 top-level `definitions`)
 
 **Markdown** (plans, conventions, meta):
 - Plans: whole file
@@ -636,13 +636,12 @@ vault/                           -- source repository
     │   ├── sqlite_store.rs      -- SqliteStore impl: upsert/prune/hybrid_search/log (Steps 2+3+11)
     │   └── postgresql_store.rs  -- stub for future distributed backend
     ├── parse/
-    │   ├── mod.rs               -- Parser trait + registry (ext → parser)
+    │   ├── mod.rs               -- Parser trait + select_parser ((doc_type, language) → parser; ext fallback)
     │   ├── proto.rs
     │   ├── go_source.rs
     │   ├── rust_source.rs
-    │   ├── openapi.rs           -- disambiguates from Helm by root key
-    │   ├── helm.rs
-    │   └── markdown.rs
+    │   ├── openapi.rs           -- paths × methods + schemas (yaml-rust2)
+    │   └── markdown.rs          -- per `##` block (convention/meta)
     ├── embed/
     │   └── tei.rs               -- nomic-embed-text-v1.5 via TEI HTTP (localhost:8081)
     ├── retrieve/
