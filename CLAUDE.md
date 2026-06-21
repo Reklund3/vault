@@ -80,6 +80,7 @@ model = "haiku"     # alias — vault resolves to the current latest Haiku model
 [classifier]
 mode  = "auto"
 model = "haiku"
+timeout_secs = 300   # required when this block is present
 ```
 
 - **`auto`** (default) — probe `localhost:8080` once at startup with a 200ms timeout. If reachable, use Gemma; otherwise fall back to Haiku. Decision is cached for the process lifetime; no per-call probing.
@@ -161,7 +162,7 @@ final_score = α * bm25_normalized + (1 - α) * cos_sim
 α = 0.6 (initial), MinChunkScore = 0.15, TokenBudget = 10_000
 ```
 
-Tune via `vault diagnose "<prompt>" --alpha X --budget Y` after seeding real data. Budget fill is score-descending with `continue` (not `break`) on oversized chunks.
+Tune `alpha` via `vault diagnose "<prompt>" --alpha X` after seeding real data; the token budget is set in `vault.toml` (`defaults.token_budget`), not a diagnose flag. Budget fill is score-descending with `continue` (not `break`) on oversized chunks.
 
 ## Global Hook Registration
 

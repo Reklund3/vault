@@ -33,19 +33,13 @@ vault tei logs
 vault tei stop
 
 # Index a repo before starting a cross-service session
-vault index sync ~/repos/build-service
-vault index sync ~/repos/auth-lib
-
-# Inspect what's indexed
-vault list
-vault list --project build-service
+vault index sync ~/repos/build-service                # first sync prompts for project name + domain
+vault index sync ~/repos/auth-lib --domain software   # or pass --domain to skip the prompt
+vault index sync ~/repos/build-service --dry-run      # preview: walk + counts only, no writes
 
 # Diagnose retrieval quality
 vault diagnose "what does BuildRequest need for auth?"
-vault diagnose "what does BuildRequest need for auth?" --alpha 0.75 --budget 5000
-
-# Force re-index ignoring content hash
-vault reindex --project build-service
+vault diagnose "what does BuildRequest need for auth?" --alpha 0.75
 
 # Remove a project
 vault index remove --project build-service
@@ -81,19 +75,23 @@ Nothing is written to the repos being indexed.
 Context tags operate at the domain level — all projects in a domain share one tag, signaling the *kind* of knowledge Claude is receiving. A project's domain is assigned during `vault index sync` and stored in `vault.db` (`projects.domain`), not in `vault.toml`; the tag is derived by convention as `{domain}-context`.
 
 ```toml
+# Abbreviated — [mlx] and [embeddings] are also required; see docs/vault-plan.md for the full file.
 [defaults]
 context_tag  = "vault-context"  # fallback when a project has no domain assignment
 token_budget = 10000
 alpha        = 0.6              # BM25/cosine weight
-timeout_ms   = 3000
+min_score    = 0.15
+timeout      = 3                # required; the real hook timeout is [router].timeout_secs
 
 [router]
-mode  = "auto"          # "auto" | "gemma" | "haiku"
-model = "haiku"         # vault resolves to the current latest Haiku model
+mode         = "auto"   # "auto" | "gemma" | "haiku"
+model        = "haiku"  # vault resolves to the current latest Haiku model
+timeout_secs = 3        # optional; defaults to 3
 
 [classifier]
-mode  = "auto"          # same selection rules as [router]
-model = "haiku"
+mode         = "auto"   # same selection rules as [router]
+model        = "haiku"
+timeout_secs = 300      # required when this block is present
 ```
 
 Project→domain assignment is **not** configured here — it's set during `vault index sync` and stored in `vault.db` (`projects.domain`). The context tag is derived by convention as `{domain}-context`.

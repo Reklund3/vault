@@ -403,7 +403,10 @@ expected) without prompting anyone.
 ### Staleness handling
 
 `content_hash` (sha256) on each document — files that haven't changed since last sync
-are skipped automatically. Re-indexing a previously synced repo is fast.
+are skipped automatically (no classify / parse / embed). Re-indexing a previously synced
+repo is fast. *Open:* a *changed* file re-embeds all of its chunks — the per-chunk
+`content_hash` is stored but not yet compared, so incremental per-chunk skip remains a
+future optimization.
 
 ### Pruning on sync
 
@@ -760,7 +763,7 @@ context_tag  = "vault-context"   # fallback if project has no domain assignment
 token_budget = 10000
 alpha        = 0.6               # BM25/cosine weight — 0.0 = pure semantic, 1.0 = pure keyword
 min_score    = 0.15
-timeout_ms   = 3000              # hook Gemma timeout before passthrough
+timeout      = 3                 # required; currently unused — the real hook timeout is [router].timeout_secs
 
 # Domains are NOT configured here. Project→domain assignment is interactive
 # runtime state stored in vault.db (projects.domain), set during `vault index
@@ -768,12 +771,14 @@ timeout_ms   = 3000              # hook Gemma timeout before passthrough
 # matching `## {domain}-context` framing lives in ~/.claude/CLAUDE.md.
 
 [router]
-mode  = "auto"                           # "auto" | "gemma" | "haiku"
-model = "haiku"                          # alias — vault resolves to current latest Haiku
+mode         = "auto"                    # "auto" | "gemma" | "haiku"
+model        = "haiku"                   # alias — vault resolves to current latest Haiku
+timeout_secs = 3                         # hot-path router timeout before passthrough (optional; defaults to 3)
 
 [classifier]
-mode  = "auto"                           # same selection rules as [router]
-model = "haiku"
+mode         = "auto"                    # same selection rules as [router]
+model        = "haiku"
+timeout_secs = 300                       # sync-time, not hot path — generous for slow local models (REQUIRED when this block is present)
 
 [mlx]
 endpoint      = "http://localhost:8080"  # mlx_lm.server (used in gemma or auto+reachable)
@@ -837,19 +842,18 @@ tag decision; a *brand-new* domain needs a matching `## {domain}-context` sectio
 vault hook
 
 # Indexing — always explicit, never automated
-vault index sync <repo-path>              # Classifier (Gemma or Haiku) classifies automatically; skips unchanged files
-                                          # Verifies TEI first; if unreachable, errors with a hint to run `vault tei start`
-vault index add <path> --project <name> --type <doc_type> [--language <lang>]
-vault index remove --project <name>       # drop all documents for a project
-
-# Inspection
-vault list                                # all projects + chunk/doc counts
-vault list --project <name>              # all documents in project with types
+vault index sync <repo-path> [--name <name>] [--domain <domain>] [--dry-run]
+                                          # Classifier (Gemma or Haiku) classifies automatically; skips unchanged files.
+                                          # Verifies TEI first; if unreachable, errors with a hint to run `vault tei start`.
+                                          # First sync prompts for project name + domain unless --name/--domain given;
+                                          # --dry-run walks + reports counts only (no TEI, no DB writes).
 
 # Diagnostics
 vault diagnose "<prompt>"                 # full retrieval trace (router plan + SQLite results)
-vault diagnose "<prompt>" --budget 5000  # test different token budgets
-vault diagnose "<prompt>" --alpha 0.75   # test different BM25/cosine weights
+vault diagnose "<prompt>" --alpha 0.75   # override BM25/cosine weight
+vault diagnose "<prompt>" --top 20       # limit displayed results (default 10)
+                                          # also: --projects / --type-names / --topics / --doc-types / --languages
+                                          # (override the router plan); --stub (deterministic embedder); --no-router
 
 # TEI lifecycle (embedding service — runs as a separate process by design)
 vault tei start                           # spawn TEI from [embeddings].launcher_cmd; detach; write PID file; no-op if already reachable
@@ -857,11 +861,13 @@ vault tei stop                            # terminate the recorded PID (kill on 
 vault tei status                          # endpoint reachability, pidfile/PID, configured launcher_cmd
 vault tei logs                            # print the tail of ~/.vault/tei.log
 
-# Maintenance
-vault reindex --project <name>           # force full re-index ignoring hash
-
-# MCP server (optional future — same binary, different subcommand)
-vault serve                              # expose retrieval as MCP tool over stdio
+# --- Planned, NOT yet implemented ---
+# vault index add <path> --project <name> --type <doc_type> [--language <lang>]   # manual single-file add
+# vault index remove --project <name>     # drop a project — load-bearing for cleanup: documents FK has no CASCADE, so
+#                                          # it needs explicit child deletes + a chunks_vec sweep (a manual delete once left orphaned vec rows)
+# vault list [--project <name>]           # list projects / documents + counts
+# vault reindex --project <name>          # force full re-index ignoring content_hash
+# vault serve                             # expose retrieval as an MCP tool over stdio (out of v1 scope)
 ```
 
 **TEI launcher behavior (implemented):**
