@@ -57,6 +57,18 @@ pub trait Store {
         source_path: &str,
     ) -> Result<Option<String>, StoreError>;
 
+    /// Resolve the domain assigned to the first of `project_names` (in router
+    /// order) that has one. Case-insensitive name match. Returns `Ok(None)` when
+    /// no named project is assigned a domain — the hook then derives the tag
+    /// from `defaults.context_tag` instead of `{domain}-context`.
+    ///
+    /// **Provided default returns `Ok(None)`** (every project unassigned).
+    /// Backends that persist `projects.domain` override this; test doubles and
+    /// the Postgres placeholder inherit the no-domain default.
+    fn resolve_domain(&self, _project_names: &[String]) -> Result<Option<String>, StoreError> {
+        Ok(None)
+    }
+
     fn prune_orphans(
         &mut self,
         project_id: i64,

@@ -16,6 +16,10 @@ CREATE TABLE IF NOT EXISTS projects (
     id         INTEGER PRIMARY KEY,
     name       TEXT NOT NULL UNIQUE,
     repo_path  TEXT,
+    -- domain assignment (NULL = unassigned -> hook falls back to
+    -- defaults.context_tag). Interactive runtime state vault writes during sync;
+    -- only the name is stored, the context tag is derived as `{domain}-context`.
+    domain     TEXT,
     created_at INTEGER NOT NULL
 );
 
@@ -254,6 +258,26 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, 1);
+    }
+
+    #[test]
+    fn projects_table_has_domain_column() {
+        let conn = open_in_memory().expect("open");
+        migrate(&conn).expect("migrate");
+
+        // Column exists, is selectable, and a row inserted without it is NULL
+        // (= unassigned; the hook falls back to defaults.context_tag).
+        conn.execute(
+            "INSERT INTO projects (name, repo_path, created_at) VALUES ('p', '/tmp/p', 0)",
+            [],
+        )
+        .expect("insert project");
+        let domain: Option<String> = conn
+            .query_row("SELECT domain FROM projects WHERE name = 'p'", [], |r| {
+                r.get(0)
+            })
+            .expect("select domain");
+        assert_eq!(domain, None);
     }
 
     #[test]

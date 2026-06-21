@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -98,15 +97,6 @@ struct IndexerExclude {
     patterns: Vec<String>,
 }
 
-/// A logical group of projects that share one context tag. Configured under
-/// `[domains.<name>]` in `vault.toml`. The hook uses `projects` to match the
-/// router's named projects back to a `context_tag` for the injected block.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct Domain {
-    pub context_tag: String,
-    pub projects: Vec<String>,
-}
-
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
     defaults: Defaults,
@@ -121,10 +111,6 @@ pub struct Config {
     // falls back to the built-in exclusion list.
     #[serde(default)]
     indexer: Indexer,
-    // Optional so configs without any [domains.*] section still load — the hook
-    // falls back to `defaults.context_tag` when no project matches.
-    #[serde(default)]
-    domains: HashMap<String, Domain>,
 }
 
 // Todo: Move to a helper file/dir
@@ -229,19 +215,11 @@ impl Config {
         &self.indexer.exclude.patterns
     }
 
-    /// Resolve the context tag for an injection from the router's named
-    /// projects. First project whose name appears in any `[domains.X].projects`
-    /// list wins; otherwise the global `defaults.context_tag` is returned. Match
-    /// is case-insensitive. Domain-overlap policy is not enforced — single
-    /// source of truth in `vault.toml`.
-    pub fn resolve_context_tag(&self, projects: &[String]) -> &str {
-        for p in projects {
-            for d in self.domains.values() {
-                if d.projects.iter().any(|dp| dp.eq_ignore_ascii_case(p)) {
-                    return &d.context_tag;
-                }
-            }
-        }
+    /// The global fallback context tag (`defaults.context_tag`), used for the
+    /// injected block when no router-named project has a domain assignment in
+    /// vault.db. Per-domain tags are derived by convention as `{domain}-context`
+    /// in the hook, not configured here.
+    pub fn default_context_tag(&self) -> &str {
         &self.defaults.context_tag
     }
 
@@ -285,7 +263,6 @@ impl Default for Config {
                 launcher_cmd: None,
             },
             indexer: Indexer::default(),
-            domains: HashMap::new(),
         }
     }
 }
@@ -294,72 +271,12 @@ impl Default for Config {
 mod tests {
     use super::*;
 
-    fn domain(tag: &str, projects: &[&str]) -> Domain {
-        Domain {
-            context_tag: tag.to_string(),
-            projects: projects.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
-    fn config_with_domains(pairs: &[(&str, Domain)]) -> Config {
-        Config {
-            domains: pairs
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.clone()))
-                .collect(),
-            ..Config::default()
-        }
-    }
-
     #[test]
-    fn resolve_context_tag_matches_first_named_project() {
-        let cfg = config_with_domains(&[(
-            "software",
-            domain("software-context", &["build-service", "vault"]),
-        )]);
-        let tag = cfg.resolve_context_tag(&["vault".to_string()]);
-        assert_eq!(tag, "software-context");
-    }
-
-    #[test]
-    fn resolve_context_tag_is_case_insensitive() {
-        let cfg = config_with_domains(&[("software", domain("software-context", &["Vault"]))]);
-        let tag = cfg.resolve_context_tag(&["VAULT".to_string()]);
-        assert_eq!(tag, "software-context");
-    }
-
-    #[test]
-    fn resolve_context_tag_falls_back_when_no_project_matches() {
-        let cfg = config_with_domains(&[("finance", domain("finance-context", &["bookkeeping"]))]);
-        let tag = cfg.resolve_context_tag(&["unknown-project".to_string()]);
-        assert_eq!(tag, "vault-context");
-    }
-
-    #[test]
-    fn resolve_context_tag_falls_back_on_empty_projects() {
-        let cfg = config_with_domains(&[("software", domain("software-context", &["vault"]))]);
-        let tag = cfg.resolve_context_tag(&[]);
-        assert_eq!(tag, "vault-context");
-    }
-
-    #[test]
-    fn resolve_context_tag_falls_back_when_no_domains_configured() {
+    fn default_context_tag_returns_defaults_value() {
+        // Domain-driven tags (`{domain}-context`) are resolved in the hook from
+        // vault.db; config only supplies the unassigned fallback.
         let cfg = Config::default();
-        let tag = cfg.resolve_context_tag(&["vault".to_string()]);
-        assert_eq!(tag, "vault-context");
-    }
-
-    #[test]
-    fn resolve_context_tag_first_listed_project_wins_across_domains() {
-        // First project mentioned that hits any domain wins, even if a later
-        // project would hit a different one. Mirrors `[domains.*]` first-match
-        // policy documented in the plan.
-        let cfg = config_with_domains(&[
-            ("software", domain("software-context", &["vault"])),
-            ("finance", domain("finance-context", &["bookkeeping"])),
-        ]);
-        let tag = cfg.resolve_context_tag(&["bookkeeping".to_string(), "vault".to_string()]);
-        assert_eq!(tag, "finance-context");
+        assert_eq!(cfg.default_context_tag(), "vault-context");
     }
 
     // ----- indexer_exclude_patterns -----

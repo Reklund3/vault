@@ -214,13 +214,25 @@ fn pipeline_with(
             reason: SkipReason::NoHits,
         };
     }
-    let tag = config.resolve_context_tag(&plan.projects);
+    let tag = resolve_tag(store, config, &plan.projects);
     let chunks = sel.chunks.len();
     let tokens = sel.tokens_used;
     Outcome::Injected {
-        block: render_block(tag, &sel.chunks),
+        block: render_block(&tag, &sel.chunks),
         chunks,
         tokens,
+    }
+}
+
+/// Resolve the context tag for the injected block. The first router-named
+/// project with a domain assignment in vault.db drives it, derived by
+/// convention as `{domain}-context`; otherwise the global `defaults.context_tag`
+/// fallback applies. A store error degrades to the fallback rather than
+/// discarding an otherwise-good injection — the tag is framing, not content.
+fn resolve_tag(store: &dyn Store, config: &Config, projects: &[String]) -> String {
+    match store.resolve_domain(projects) {
+        Ok(Some(domain)) => format!("{domain}-context"),
+        Ok(None) | Err(_) => config.default_context_tag().to_string(),
     }
 }
 
@@ -263,6 +275,9 @@ mod tests {
     /// keeps the pipeline tests focused on hook logic, not SQL behavior.
     struct StubStore {
         hits: Vec<Hit>,
+        /// Domain returned by `resolve_domain`; `None` exercises the
+        /// `defaults.context_tag` fallback (the default for most pipeline tests).
+        domain: Option<String>,
     }
 
     impl Store for StubStore {
@@ -282,6 +297,9 @@ mod tests {
             _source_path: &str,
         ) -> Result<Option<String>, StoreError> {
             Ok(None)
+        }
+        fn resolve_domain(&self, _project_names: &[String]) -> Result<Option<String>, StoreError> {
+            Ok(self.domain.clone())
         }
         fn upsert_document(
             &mut self,
@@ -364,6 +382,7 @@ mod tests {
         let config = Config::default();
         let store = StubStore {
             hits: vec![sample_hit("BuildRequest", "message BuildRequest {}", 0.9)],
+            domain: None,
         };
         let embedder = StubEmbedder::from_config(&config);
         let mut tel = log::Telemetry::default();
@@ -392,10 +411,30 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_uses_domain_context_tag_when_project_assigned() {
+        let config = Config::default();
+        let store = StubStore {
+            hits: vec![sample_hit("BuildRequest", "message BuildRequest {}", 0.9)],
+            domain: Some("finance".to_string()),
+        };
+        let embedder = StubEmbedder::from_config(&config);
+        let mut tel = log::Telemetry::default();
+        let out = pipeline_with("q", &config, &StubRouter, &embedder, &store, &mut tel);
+        let Outcome::Injected { block, .. } = out else {
+            panic!("expected Injected, got {out:?}");
+        };
+        // The assigned domain drives the tag by convention (`{domain}-context`);
+        // the defaults.context_tag fallback ("vault-context") is not used.
+        assert!(block.starts_with("<finance-context>\n"));
+        assert!(block.ends_with("</finance-context>\n"));
+    }
+
+    #[test]
     fn pipeline_records_per_stage_telemetry_on_success() {
         let config = Config::default();
         let store = StubStore {
             hits: vec![sample_hit("A", "alpha", 0.9)],
+            domain: None,
         };
         let embedder = StubEmbedder::from_config(&config);
         let mut tel = log::Telemetry::default();
@@ -409,7 +448,10 @@ mod tests {
     #[test]
     fn pipeline_skips_when_router_says_skip() {
         let config = Config::default();
-        let store = StubStore { hits: vec![] };
+        let store = StubStore {
+            hits: vec![],
+            domain: None,
+        };
         let embedder = StubEmbedder::from_config(&config);
         let mut tel = log::Telemetry::default();
         let out = pipeline_with("hi", &config, &SkipRouter, &embedder, &store, &mut tel);
@@ -428,7 +470,10 @@ mod tests {
     #[test]
     fn pipeline_failed_router_keeps_stage_detail_and_timing() {
         let config = Config::default();
-        let store = StubStore { hits: vec![] };
+        let store = StubStore {
+            hits: vec![],
+            domain: None,
+        };
         let embedder = StubEmbedder::from_config(&config);
         let mut tel = log::Telemetry::default();
         let out = pipeline_with("q", &config, &ErrRouter, &embedder, &store, &mut tel);
@@ -444,7 +489,10 @@ mod tests {
     #[test]
     fn pipeline_skips_no_hits_when_store_empty() {
         let config = Config::default();
-        let store = StubStore { hits: vec![] };
+        let store = StubStore {
+            hits: vec![],
+            domain: None,
+        };
         let embedder = StubEmbedder::from_config(&config);
         let mut tel = log::Telemetry::default();
         let out = pipeline_with(
@@ -470,6 +518,7 @@ mod tests {
         // an empty selection.
         let store = StubStore {
             hits: vec![sample_hit("low", "noise", 0.05)],
+            domain: None,
         };
         let embedder = StubEmbedder::from_config(&config);
         let mut tel = log::Telemetry::default();

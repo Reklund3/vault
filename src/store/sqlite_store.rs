@@ -107,6 +107,29 @@ impl Store for SqliteStore {
             .map_err(backend_err)
     }
 
+    fn resolve_domain(&self, project_names: &[String]) -> Result<Option<String>, StoreError> {
+        // First named project (in router order) with a non-NULL domain wins —
+        // mirrors the old config-side "first listed project" policy. The name
+        // list is small (the router returns a handful), so a query per name is
+        // fine and keeps the order-preserving logic trivial.
+        for name in project_names {
+            // Outer Option = row found?; inner Option = domain column NULL?
+            let row: Option<Option<String>> = self
+                .conn
+                .query_row(
+                    "SELECT domain FROM projects WHERE name = ?1 COLLATE NOCASE",
+                    params![name],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(backend_err)?;
+            if let Some(Some(domain)) = row {
+                return Ok(Some(domain));
+            }
+        }
+        Ok(None)
+    }
+
     fn upsert_document(
         &mut self,
         doc: &Document,
@@ -492,6 +515,62 @@ mod tests {
             token_est: 10,
             chunk_index: idx,
         }
+    }
+
+    fn set_domain(store: &SqliteStore, project_id: i64, domain: &str) {
+        store
+            .conn
+            .execute(
+                "UPDATE projects SET domain = ?1 WHERE id = ?2",
+                params![domain, project_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn resolve_domain_returns_first_assigned_project_in_order() {
+        let store = SqliteStore::open_in_memory(&Config::default()).unwrap();
+        create_project(&store, "docs-site"); // left unassigned (domain NULL)
+        let assigned = create_project(&store, "build-service");
+        set_domain(&store, assigned, "software");
+
+        // The unassigned project is listed first but skipped; the assigned one wins.
+        let domain = store
+            .resolve_domain(&["docs-site".to_string(), "build-service".to_string()])
+            .unwrap();
+        assert_eq!(domain, Some("software".to_string()));
+    }
+
+    #[test]
+    fn resolve_domain_is_case_insensitive_on_project_name() {
+        let store = SqliteStore::open_in_memory(&Config::default()).unwrap();
+        let id = create_project(&store, "Build-Service");
+        set_domain(&store, id, "software");
+
+        let domain = store
+            .resolve_domain(&["BUILD-SERVICE".to_string()])
+            .unwrap();
+        assert_eq!(domain, Some("software".to_string()));
+    }
+
+    #[test]
+    fn resolve_domain_returns_none_when_unassigned_or_unknown() {
+        let store = SqliteStore::open_in_memory(&Config::default()).unwrap();
+        create_project(&store, "build-service"); // domain stays NULL
+
+        // Unassigned project, unknown name, and empty list all resolve to None
+        // (the hook then uses defaults.context_tag).
+        assert_eq!(
+            store
+                .resolve_domain(&["build-service".to_string()])
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store.resolve_domain(&["nonexistent".to_string()]).unwrap(),
+            None
+        );
+        assert_eq!(store.resolve_domain(&[]).unwrap(), None);
     }
 
     #[test]
