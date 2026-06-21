@@ -32,7 +32,7 @@ Step 10  src/retrieve/router/{mod,gemma,haiku}.rs  (Router trait + Gemma + Haiku
 Step 11  src/retrieve/hybrid.rs                    (score merge)
 Step 12  src/retrieve/budget.rs                    (token budget selection)
 Step 13  src/hook/mod.rs                           (full pipeline wired)
-Step 14  First-run UX                              (domain + classification prompts)
+Step 14  First-run UX                              (project-name + domain prompts; classification automatic)
 ```
 
 ## Procedure

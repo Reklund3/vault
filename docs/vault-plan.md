@@ -147,7 +147,7 @@ vault index sync <repo-path>
         │
   ├── Classifier (Gemma local or Haiku fallback) classifies unmapped files
   │     → first Haiku fallback in a session prompts for cost confirmation
-  ├── user confirms or overrides interactively
+  │     → labels applied automatically; no interactive override (see "Classification is a black box")
   ├── parses files into chunks by definition boundary
   ├── generates embeddings via TEI on localhost:8081 (nomic-embed-text-v1.5, 768 dims)
   └── upserts into SQLite store (content_hash skips unchanged files)
@@ -353,12 +353,13 @@ boundary against deliberate exfiltration.
 ### Classification fallback chain
 
 ```
-explicit CLI flag (--type, --language) → classifier (Gemma local or Haiku fallback) → prompt user
+explicit CLI flag (--type, --language) → classifier (Gemma local or Haiku fallback)
 ```
 
 The classifier is given **filename + extension + the first 1KB of content** and
-proposes `doc_type` and `language`. You confirm or override interactively on
-first index. Confirmed classifications persist in **vault.db** — the
+proposes `doc_type` and `language`, which are **applied automatically** — there
+is no interactive confirm/override step (decision 2026-06-21; rationale below).
+Classifications persist in **vault.db** — the
 `documents` row records `doc_type` per file, keyed `UNIQUE(project_id,
 source_path)` with a `content_hash`. On a later sync, an unchanged file (same
 hash) is skipped wholesale: no classifier call, no re-parse, no re-embed. The
@@ -367,6 +368,37 @@ on another device and a shared Postgres backend. The 1KB cap means file content
 sent to Anthropic in Haiku mode is bounded and inspectable — full files reach
 Anthropic only via retrieval-time context injection, which the user controls
 through `vault diagnose`.
+
+### Classification is a black box
+
+**Decision (2026-06-21): classification is automatic and non-interactive — no
+per-file confirm/override UX.** `doc_type`/`language` stay *pure derived state*:
+a deterministic function of `(file content, classifier version)`. You can delete
+`vault.db` and recompute it identically. A per-file human override would turn
+`doc_type` into *partially curated* state and pull in a permanent tail of
+questions (preserve across re-sync? machine-said-X vs human-said-Y? content
+changed — does the override still apply?). We don't step off that cliff.
+
+The safety case backs it: a wrong label is bounded, not corrupting. Retrieval
+filters on the label only when the router *emits* a `doc_types`/`languages`
+constraint (`build_filter_clause` adds the clause only when the list is
+non-empty); for the common no-filter query a mislabeled chunk is still fully
+reachable by FTS + cosine over its content. The label's sharper effect is on
+chunk *boundaries* (`select_parser` dispatches on it) — but that, too, is
+recoverable by re-indexing, not corrupting.
+
+Corrections therefore live at the **rule level, never the instance level**, and
+all of them are content-independent (survive re-sync, keep the DB pure-derived):
+
+- classifier few-shots in `CLASSIFY_SYSTEM` (`src/index/classify/mod.rs`),
+- the `ext_fallback` table (`src/index/sync.rs`),
+- *(optional, v-next)* a glob→label map in `vault.toml` (`"**/*.proto" =
+  "contract/proto"`) — still a rule, not a per-file DB edit.
+
+Observability replaces interactivity: the `SyncReport`
+(`files_classified` / `files_parsed_via_parser` / `files_parsed_as_whole`)
+surfaces a systematic misclassification (e.g. `parsed_as_whole` far higher than
+expected) without prompting anyone.
 
 ### Staleness handling
 
@@ -664,8 +696,8 @@ vault/                           -- source repository
     └── types.rs                 -- DocType, Language (cross-cutting domain enums)
 
 ~/.vault/                        -- runtime data (never in source repo)
-├── vault.db                     -- SQLite store
-└── vault.toml                   -- domains, classification cache, defaults
+├── vault.db                     -- SQLite store (chunks, embeddings, classification cache)
+└── vault.toml                   -- domains, defaults (hand-authored; never written by vault)
 ```
 
 ### Store backend abstraction
@@ -804,7 +836,7 @@ no new tag decision.
 vault hook
 
 # Indexing — always explicit, never automated
-vault index sync <repo-path>              # Classifier (Gemma or Haiku) classifies, you confirm; skips unchanged files
+vault index sync <repo-path>              # Classifier (Gemma or Haiku) classifies automatically; skips unchanged files
                                           # Verifies TEI first; if unreachable, errors with a hint to run `vault tei start`
 vault index add <path> --project <name> --type <doc_type> [--language <lang>]
 vault index remove --project <name>       # drop all documents for a project
@@ -862,9 +894,9 @@ vault serve                              # expose retrieval as MCP tool over std
 `vault index sync` first-run behavior (new project):
 - Prompts for project name if not already in vault.toml
 - Prompts for domain assignment (software / finance / personal / new)
-- The classifier (Gemma local or Haiku fallback) labels each file, you confirm or override
+- The classifier (Gemma local or Haiku fallback) labels each file automatically (no confirm/override — classification is a black box)
 - First Haiku fallback in a session shows a cost-estimate confirmation prompt
-- Classifications cached in vault.toml for future syncs
+- Classifications cached in vault.db (`documents.doc_type`) for future syncs
 - No files written to the repo being indexed
 
 ---
@@ -960,7 +992,7 @@ No session state lives in vault.db. The hook binary is read-only at runtime.
 | Re-index trigger | Manual explicit sync | Avoids WIP branch state and teammate branch pollution |
 | Sync pruning | Always-on; `UNIQUE(document_id, label)` for chunk identity; per-chunk `content_hash` with byte-compare to skip re-embeds | Deletions in source repos must propagate to the vault, otherwise removed routes/messages linger as authoritative chunks |
 | Indexing primary | Explicit CLI sync | No per-project config files; no files written to indexed repos |
-| Indexing classification | Gemma content classification | Classifies on first sync; cached in vault.toml for subsequent syncs |
+| Indexing classification | Gemma content classification | Classifies on first sync; cached in vault.db (`documents.doc_type`) for subsequent syncs |
 | Cold start / missing project | Silent no-op | Partial vault is normal state; no error warranted |
 | Multi-language support | language field on chunks | Orthogonal to doc_type, enables language-scoped retrieval |
 | Sharing (v1) | Out of scope | Validate retrieval quality before adding distribution complexity |
@@ -1071,8 +1103,9 @@ Step 11 retrieve/hybrid.rs  — DONE (commit 455303d). `merge()` is the shared s
                               each backend own its own merge.)
 Step 12 retrieve/budget.rs  — token budget selection
 Step 13 hook/mod.rs         — stdin/stdout protocol, full pipeline wired
-Step 14 first-run UX        — new-project prompts during vault index sync (project name, domain,
-                              classification confirm/override) + the vault.toml write-back they need.
+Step 14 first-run UX        — new-project prompts during vault index sync (project name, domain
+                              assignment) + the vault.toml write-back they need. Classification is a
+                              black box — no confirm/override prompt (decision 2026-06-21).
                               Orchestrator (Steps 1–13) done; the interactive layer remains.
                               Full task breakdown below, after this step list.
 ```
@@ -1104,7 +1137,7 @@ and the `IndexSyncDryRun` smoke command; content-hash skip of unchanged files
 | 2 | ~~Wire the real `vault index sync` command~~ | **DONE (9192cfc).** `vault index sync <repo> [--name] [--dry-run]` wired in `main.rs`; dry-run folded in as a flag; readable output via `format_report`. |
 | 3 | ~~Project-name first-run prompt~~ + persist | **PROMPT DONE 2026-06-18.** `run_sync` offers the directory-derived default when `--name` is absent (`prompt_for_project_name`, BufRead/Write injection mirroring `prompt_for_haiku_cost`; empty line / EOF → derived default; dry-run never prompts). The chosen name persists to the DB via `get_or_create_project`. *Still open:* writing the confirmed name into vault.toml so a later sync skips the prompt — deferred until the format-preserving `toml_edit` write path lands with #4 (today an interactive sync re-prompts unless `--name` is passed). |
 | 4 | Domain-assignment prompt + persist | Offer software / finance / personal / new. A *new* domain also persists its block AND must surface the two-file reminder to update `~/.claude/CLAUDE.md` (so Claude can read the new `<…-context>` tag). Persist via format-preserving `toml_edit`. |
-| 5 | Classification confirm/override + cache write-back | Show classifier labels, let the user confirm/override before chunks are written; the override persists as the `documents.doc_type` written by `upsert_document`, so a later unchanged-hash sync reuses it (no vault.toml). Sticky overrides *across content edits* are an open sub-decision here. |
+| 5 | ~~Classification confirm/override + cache write-back~~ → Surface classifications in the sync report | **RESCOPED 2026-06-21 to black box (see "Classification is a black box").** No interactive confirm/override: a per-file override would make `doc_type` curated state and desync the denormalized `chunks.doc_type`/`chunks.language` columns that retrieval filters on (a documents-only write would leave stale chunk labels *and* stale chunk boundaries). Classification stays pure derived state; corrections happen at the rule level (few-shots / `ext_fallback` / optional `vault.toml` glob map), never per-file. This task shrinks to **making the `SyncReport` classification counts legible** in `format_report` — mostly already tracked — and folds into #6. |
 | 6 | Reconcile docs + green CI | Update README, this doc, and CLAUDE.md to match; `cargo fmt` + `clippy -D warnings` clean; open the `init`→`main` PR so Linux CI runs `cargo test` (sidesteps the local Windows Application Control block). Needs #2–#5. |
 | 7 | ~~Hook error observability~~ | **DONE (2026-06-12).** Outcome enum (injected / skip / failed+stage), one metadata-only JSONL record per call to `~/.vault/hook.log` (0600, 5MB rotation), stderr breadcrumb on failure, exit-0 fail-open preserved. Resolves the P1 observability sub-finding in `docs/plan-review-2026-06-11.md`; suite green locally (285/0). |
 

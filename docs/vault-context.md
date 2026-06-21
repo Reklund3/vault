@@ -204,8 +204,8 @@ not competing. MemPalace + Vault together cover both concerns cleanly.
 
 ```
 ~/.vault/
-├── vault.db       — SQLite store (projects, documents, chunks, vectors, FTS5, retrieval_log)
-└── vault.toml     — domains, context tags, MLX config, classification cache, defaults
+├── vault.db       — SQLite store (projects, documents, chunks, vectors, FTS5, retrieval_log, classification cache)
+└── vault.toml     — domains, context tags, MLX config, defaults (hand-authored; never written by vault)
 ```
 
 Nothing is written to indexed repos.
@@ -292,5 +292,5 @@ Step 10 retrieve/router/{mod,gemma,haiku}.rs  — Router trait + Gemma + Haiku i
 Step 11 retrieve/hybrid.rs  — score merge
 Step 12 retrieve/budget.rs  — token budget selection
 Step 13 hook/mod.rs         — full pipeline wired
-Step 14 first-run UX        — domain + classification prompts on new project sync
+Step 14 first-run UX        — project-name + domain prompts on new project sync (classification automatic — no confirm/override)
 ```

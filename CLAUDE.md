@@ -22,7 +22,7 @@ cargo run -- <subcommand>    # e.g. cargo run -- diagnose "what does BuildReques
 
 Three execution modes from one binary, dispatched by subcommand in `main.rs`:
 - **`vault hook`** — pre-send hook (registered globally in `~/.claude/settings.json`); reads prompt JSON from stdin, emits only the `<{domain}-context>` block to stdout (Claude Code appends it to the prompt)
-- **`vault index sync <repo>`** — explicit manual indexing; the classifier (Gemma local or Haiku fallback) labels files, you confirm, chunks written to SQLite
+- **`vault index sync <repo>`** — explicit manual indexing; the classifier (Gemma local or Haiku fallback) labels files automatically (black box — no confirm/override), chunks written to SQLite
 - **`vault diagnose "<prompt>"`** — full retrieval trace for tuning alpha and token budget
 
 ### Request Flow (hook mode)
@@ -122,7 +122,7 @@ Step 10 retrieve/router/{mod,gemma,haiku}.rs  — Router trait + impls (auto-mod
 Step 11 retrieve/hybrid.rs
 Step 12 retrieve/budget.rs
 Step 13 hook/mod.rs
-Step 14 first-run UX (domain + classification prompts on new project sync)
+Step 14 first-run UX (project-name + domain prompts on new project sync; classification is automatic — no confirm/override)
 ```
 
 ## Embeddings

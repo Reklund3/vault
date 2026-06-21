@@ -70,8 +70,8 @@ Nothing is written to the repos being indexed.
 
 ```
 ~/.vault/
-├── vault.db      # SQLite: projects, chunks, FTS5 index, embeddings, retrieval log
-├── vault.toml    # Domain config, context tags, classification cache, tuning knobs
+├── vault.db      # SQLite: projects, chunks, FTS5 index, embeddings, classification cache, retrieval log
+├── vault.toml    # Domain config, context tags, tuning knobs (hand-authored; never written by vault)
 ├── hook.log      # Hook telemetry: one JSON line per prompt (outcome, latency, errors); rotated at 5MB
 └── tei.pid/.log  # TEI launcher runtime files (vault tei start)
 ```
