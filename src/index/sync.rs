@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -35,11 +36,16 @@ pub struct SyncReport {
     pub files_skipped_remote_classify: usize, // head trip → ext fallback (0 in dry-run)
     pub files_parsed_via_parser: usize, // 0 in dry-run
     pub files_parsed_as_whole: usize, // 0 in dry-run
+    // Label distribution: "doc_type/language" → count, over every file the
+    // classifier (or ext fallback) labeled this run. Surfaces a systematic
+    // misclassification (e.g. protos landing as plan/whole-file) — the
+    // observability that replaces the dropped confirm/override UX.
+    pub classifications: BTreeMap<String, usize>,
     pub files_skipped: Vec<(String, String)>, // (relative_path, reason)
-    pub chunks_indexed: usize,   // 0 in dry-run
-    pub chunks_dropped_secret: usize, // 0 in dry-run
-    pub orphans_pruned: usize,   // 0 in dry-run
-    pub estimated_haiku_cost_usd: f64, // dry-run; 0.0 if not auto→Haiku
+    pub chunks_indexed: usize,                // 0 in dry-run
+    pub chunks_dropped_secret: usize,         // 0 in dry-run
+    pub orphans_pruned: usize,                // 0 in dry-run
+    pub estimated_haiku_cost_usd: f64,        // dry-run; 0.0 if not auto→Haiku
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -295,6 +301,15 @@ fn process_file(
         }
     };
 
+    *report
+        .classifications
+        .entry(format!(
+            "{}/{}",
+            classification.doc_type.as_str(),
+            classification.language.as_str()
+        ))
+        .or_default() += 1;
+
     let content_str = match std::str::from_utf8(&bytes) {
         Ok(s) => s.to_string(),
         Err(_) => {
@@ -477,6 +492,20 @@ pub fn format_report(report: &SyncReport) -> String {
             "  Parsed as whole-file:   {}",
             report.files_parsed_as_whole
         );
+        if !report.classifications.is_empty() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "  Label breakdown (doc_type/language):");
+            let width = report
+                .classifications
+                .keys()
+                .map(String::len)
+                .max()
+                .unwrap_or(0);
+            for (label, count) in &report.classifications {
+                let _ = writeln!(out, "    {label:<width$}  {count}");
+            }
+            let _ = writeln!(out);
+        }
         let _ = writeln!(out, "  Chunks indexed:         {}", report.chunks_indexed);
         let _ = writeln!(
             out,
@@ -797,6 +826,10 @@ mod tests {
         assert!(report.chunks_indexed > 0);
         assert_eq!(report.orphans_pruned, 0);
         assert_eq!(store.upserts.borrow().len(), 2);
+        // Label breakdown tallies each assigned (doc_type/language).
+        assert_eq!(report.classifications.get("contract/proto"), Some(&1));
+        assert_eq!(report.classifications.get("convention/go"), Some(&1));
+        assert_eq!(report.classifications.values().sum::<usize>(), 2);
     }
 
     // 2. Unchanged gate: pre-seed real sha256 → classifier never called.
@@ -1206,6 +1239,35 @@ mod tests {
         // Dry-run-only counters absent from real-sync output
         assert!(!s.contains("Estimated Haiku cost"));
         assert!(!s.contains("Would classify"));
+    }
+
+    #[test]
+    fn format_real_sync_renders_label_breakdown() {
+        let mut classifications = BTreeMap::new();
+        classifications.insert("contract/proto".to_string(), 5);
+        classifications.insert("convention/rust".to_string(), 12);
+        let r = SyncReport {
+            project: "vault".into(),
+            dry_run: false,
+            classifications,
+            ..SyncReport::default()
+        };
+        let s = format_report(&r);
+        assert!(s.contains("Label breakdown (doc_type/language):"));
+        assert!(s.contains("contract/proto"));
+        // Widest key (convention/rust) needs no padding, so the count abuts it.
+        assert!(s.contains("convention/rust  12"));
+    }
+
+    #[test]
+    fn format_real_sync_omits_label_breakdown_when_empty() {
+        let r = SyncReport {
+            project: "vault".into(),
+            dry_run: false,
+            ..SyncReport::default()
+        };
+        let s = format_report(&r);
+        assert!(!s.contains("Label breakdown"));
     }
 
     #[test]
