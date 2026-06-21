@@ -18,13 +18,15 @@ const HEAD_BYTES: usize = 1024;
 pub struct SyncOptions {
     pub repo: PathBuf,
     pub explicit_name: Option<String>,
+    pub explicit_domain: Option<String>,
     pub dry_run: bool,
 }
 
 #[derive(Debug, Default)]
 pub struct SyncReport {
     pub project: String,
-    pub project_id: i64, // 0 in dry-run (no store touched)
+    pub project_id: i64,        // 0 in dry-run (no store touched)
+    pub domain: Option<String>, // project's domain assignment (None = unassigned; always None in dry-run)
     pub dry_run: bool,
     pub files_walked: usize,
     pub files_classified: usize, // called the live classifier (0 in dry-run)
@@ -120,14 +122,49 @@ pub fn run_sync(opts: SyncOptions, config: &Config) -> Result<SyncReport, SyncEr
             other => SyncError::Store(other),
         })?;
 
-    sync_with(
+    // First-run domain assignment. Skip silently if the project already has one
+    // (re-sync). Otherwise take `--domain`, else prompt; empty / EOF /
+    // non-interactive stdin leaves it unassigned (the hook then falls back to
+    // defaults.context_tag). Assignment lives in vault.db; the context tag is
+    // derived by convention as `{domain}-context`, never stored.
+    let domain = match store
+        .resolve_domain(&[project_name.clone()])
+        .map_err(SyncError::Store)?
+    {
+        Some(existing) => Some(existing),
+        None => {
+            let chosen = match opts.explicit_domain.clone() {
+                Some(d) => Some(d),
+                None => prompt_for_domain(std::io::stdin().lock(), std::io::stderr())?,
+            };
+            if let Some(ref d) = chosen {
+                store
+                    .set_project_domain(project_id, d)
+                    .map_err(SyncError::Store)?;
+                // A new domain needs matching framing in the user's global
+                // CLAUDE.md or the emitted tag means nothing to Claude — the
+                // taxonomy's single source of truth (see `docs/vault-plan.md`).
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Assigned to domain {d:?} (context tag <{d}-context>). \
+                     Add a `## {d}-context` section to ~/.claude/CLAUDE.md so Claude \
+                     interprets the tag."
+                );
+            }
+            chosen
+        }
+    };
+
+    let mut report = sync_with(
         project_id,
         project_name,
         &walked,
         &mut store,
         &embedder,
         classifier.as_ref(),
-    )
+    )?;
+    report.domain = domain;
+    Ok(report)
 }
 
 /// Core orchestrator. Takes trait objects so tests can swap stubs without
@@ -403,6 +440,17 @@ pub fn format_report(report: &SyncReport) -> String {
             report.project, report.project_id
         );
         let _ = writeln!(out);
+        match &report.domain {
+            Some(d) => {
+                let _ = writeln!(out, "  Domain:                 {d} (tag <{d}-context>)");
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "  Domain:                 unassigned (uses defaults.context_tag)"
+                );
+            }
+        }
         let _ = writeln!(
             out,
             "  Walked:                 {} files",
@@ -498,6 +546,30 @@ fn prompt_for_project_name<R: BufRead, W: Write>(
         Ok(trimmed.to_string())
     } else {
         Ok(derived.to_string())
+    }
+}
+
+/// First-run domain prompt. Returns the chosen domain (trimmed, non-empty) or
+/// `None` to leave the project unassigned. Empty line / EOF / non-interactive
+/// stdin → `None`, mirroring the fail-open contract of the other sync prompts.
+/// Only called when `--domain` was not passed and the project has no assignment
+/// yet; the choice persists via `Store::set_project_domain`.
+fn prompt_for_domain<R: BufRead, W: Write>(
+    mut stdin: R,
+    mut stderr: W,
+) -> Result<Option<String>, SyncError> {
+    let _ = writeln!(
+        stderr,
+        "Domain for this project? (e.g. software, finance, personal) [skip] "
+    );
+    let _ = stderr.flush();
+    let mut line = String::new();
+    let read = stdin.read_line(&mut line).map_err(SyncError::Io)?;
+    let trimmed = line.trim();
+    if read > 0 && !trimmed.is_empty() {
+        Ok(Some(trimmed.to_string()))
+    } else {
+        Ok(None)
     }
 }
 
@@ -688,6 +760,7 @@ mod tests {
         SyncOptions {
             repo: repo.to_path_buf(),
             explicit_name: Some("test-project".to_string()),
+            explicit_domain: None,
             dry_run: dry,
         }
     }
@@ -1040,6 +1113,38 @@ mod tests {
         let mut err = Vec::new();
         let name = prompt_for_project_name("derived", &input[..], &mut err).expect("name");
         assert_eq!(name, "spaced-name");
+    }
+
+    #[test]
+    fn domain_prompt_uses_input_when_provided() {
+        let input = b"finance\n".to_vec();
+        let mut err = Vec::new();
+        let domain = prompt_for_domain(&input[..], &mut err).expect("domain");
+        assert_eq!(domain, Some("finance".to_string()));
+    }
+
+    #[test]
+    fn domain_prompt_skips_on_empty_line() {
+        let input = b"\n".to_vec();
+        let mut err = Vec::new();
+        let domain = prompt_for_domain(&input[..], &mut err).expect("domain");
+        assert_eq!(domain, None);
+    }
+
+    #[test]
+    fn domain_prompt_skips_on_eof() {
+        let input: &[u8] = b"";
+        let mut err = Vec::new();
+        let domain = prompt_for_domain(input, &mut err).expect("domain");
+        assert_eq!(domain, None);
+    }
+
+    #[test]
+    fn domain_prompt_trims_surrounding_whitespace() {
+        let input = b"  software  \n".to_vec();
+        let mut err = Vec::new();
+        let domain = prompt_for_domain(&input[..], &mut err).expect("domain");
+        assert_eq!(domain, Some("software".to_string()));
     }
 
     // ---------- format_report ----------

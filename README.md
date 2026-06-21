@@ -71,19 +71,20 @@ Nothing is written to the repos being indexed.
 ```
 ~/.vault/
 ├── vault.db      # SQLite: projects, chunks, FTS5 index, embeddings, classification cache, retrieval log
-├── vault.toml    # Domain config, context tags, tuning knobs (hand-authored; never written by vault)
+├── vault.toml    # Context-tag fallback, router/classifier mode, tuning knobs, backend config (hand-authored; never written by vault)
 ├── hook.log      # Hook telemetry: one JSON line per prompt (outcome, latency, errors); rotated at 5MB
 └── tei.pid/.log  # TEI launcher runtime files (vault tei start)
 ```
 
 ## Configuration
 
-`vault.toml` maps projects to domains. Context tags operate at the domain level — all projects in a domain share one tag, signaling the *kind* of knowledge Claude is receiving.
+Context tags operate at the domain level — all projects in a domain share one tag, signaling the *kind* of knowledge Claude is receiving. A project's domain is assigned during `vault index sync` and stored in `vault.db` (`projects.domain`), not in `vault.toml`; the tag is derived by convention as `{domain}-context`.
 
 ```toml
 [defaults]
+context_tag  = "vault-context"  # fallback when a project has no domain assignment
 token_budget = 10000
-alpha        = 0.6      # BM25/cosine weight
+alpha        = 0.6              # BM25/cosine weight
 timeout_ms   = 3000
 
 [router]
@@ -93,17 +94,11 @@ model = "haiku"         # vault resolves to the current latest Haiku model
 [classifier]
 mode  = "auto"          # same selection rules as [router]
 model = "haiku"
-
-[domains.software]
-context_tag = "software-context"
-projects    = ["build-service", "auth-lib", "vault"]
-
-[domains.finance]
-context_tag = "finance-context"
-projects    = ["bookkeeping"]
 ```
 
-The global `~/.claude/CLAUDE.md` should include a `## Vault Context` section explaining the context tags to Claude. When you add a new domain to `vault.toml`, update that file too — it's a two-file change.
+Project→domain assignment is **not** configured here — it's set during `vault index sync` and stored in `vault.db` (`projects.domain`). The context tag is derived by convention as `{domain}-context`.
+
+The global `~/.claude/CLAUDE.md` should include a `## {domain}-context` section explaining each domain's tag to Claude. Introducing a new domain means adding that section — it's the single source of truth for what a tag means.
 
 ## Stack
 

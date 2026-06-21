@@ -50,6 +50,9 @@ enum IndexCommand {
         /// Project name override (default: canonical path's last component).
         #[arg(long)]
         name: Option<String>,
+        /// Domain assignment override (skips the first-run domain prompt).
+        #[arg(long)]
+        domain: Option<String>,
         /// Walk + cache-lookup only. Skips TEI, classifier, and store writes.
         #[arg(long)]
         dry_run: bool,
@@ -76,9 +79,10 @@ fn main() {
             IndexCommand::Sync {
                 repo,
                 name,
+                domain,
                 dry_run,
             } => {
-                if let Err(e) = run_index_sync(repo, name, dry_run) {
+                if let Err(e) = run_index_sync(repo, name, domain, dry_run) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -90,12 +94,14 @@ fn main() {
 fn run_index_sync(
     repo: PathBuf,
     name: Option<String>,
+    domain: Option<String>,
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = config::Config::load()?;
     let opts = index::sync::SyncOptions {
         repo,
         explicit_name: name,
+        explicit_domain: domain,
         dry_run,
     };
     let report = index::sync::run_sync(opts, &config)?;

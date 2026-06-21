@@ -64,7 +64,7 @@ The router returns `{ skip: true }` for prompts that need no context — immedia
 | `src/embed/tei.rs` | nomic-embed-text-v1.5 embeddings via TEI HTTP (`localhost:8081`) |
 | `src/tei/launcher.rs` | `vault tei start\|stop\|status\|logs` — spawn TEI from `[embeddings].launcher_cmd` with env scrubbing; PID + log in `~/.vault/`; cross-platform detach |
 | `src/diagnose/mod.rs` | `vault diagnose "<prompt>"` — full retrieval trace for tuning α and token budget |
-| `src/config.rs` | `vault.toml` parsing — `Config`, `ConfigError`, context-tag resolution, router/classifier mode + timeout knobs |
+| `src/config.rs` | `vault.toml` parsing — `Config`, `ConfigError`, context-tag fallback (`default_context_tag`), router/classifier mode + timeout knobs |
 | `src/types.rs` | top-level shared enums — `Language`, `DocType` (orthogonal axes used across parse/classify/router) |
 | `src/util/` | `fs.rs` (0700/0600 hardening for `~/.vault/`), `json.rs` (balanced-brace extraction from model replies), `path.rs` (`~` expansion), `probe.rs` (200ms loopback TCP probe for auto-mode) |
 
@@ -93,8 +93,8 @@ Haiku impls set `cache_control: ephemeral` on the system block, but the marker i
 ### Runtime data
 
 ```
-~/.vault/vault.db      # SQLite store — projects, documents, chunks, FTS5, vec, retrieval_log; documents.content_hash is the classification/re-embed cache
-~/.vault/vault.toml    # domain assignments, context tags, router/classifier mode, tuning defaults (hand-authored; vault never writes it)
+~/.vault/vault.db      # SQLite store — projects (incl. projects.domain assignment), documents, chunks, FTS5, vec, retrieval_log; documents.content_hash is the classification/re-embed cache
+~/.vault/vault.toml    # context-tag fallback, router/classifier mode, tuning defaults, backend config (hand-authored; vault never writes it)
 ~/.vault/hook.log      # hook telemetry — one JSONL record per hook call (outcome, stage, latency, backend); rotated to hook.log.1 at 5MB
 ```
 
@@ -178,7 +178,7 @@ Tune via `vault diagnose "<prompt>" --alpha X --budget Y` after seeding real dat
 
 ## Context Tags
 
-Tags are domain-level (not project-level), configured in `vault.toml`. Adding a new domain requires a two-file change: `vault.toml` + `~/.claude/CLAUDE.md` (so Claude knows how to interpret the new tag).
+Tags are domain-level (not project-level). A project's domain is assigned during `vault index sync` and stored in `vault.db` (`projects.domain`); the hook derives the tag by convention as `{domain}-context`, falling back to `defaults.context_tag` when unassigned. Introducing a *new* domain requires adding a matching `## {domain}-context` section to `~/.claude/CLAUDE.md` (the single source of truth for what a tag means) — vault.toml is not involved.
 
 ## Security
 

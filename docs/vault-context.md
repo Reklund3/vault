@@ -135,8 +135,10 @@ Context tags operate at domain level, not project level:
 - `<software-context>` — all engineering projects
 - `<finance-context>` — bookkeeping, tax
 - `<personal-context>` — everything else
-Projects are assigned to domains in `~/.vault/vault.toml`. Tags tell Claude what
-*kind* of knowledge it's receiving. Projects are identified by headers inside the block.
+Projects are assigned to domains during `vault index sync`, stored in `vault.db`
+(`projects.domain`); the tag is derived by convention as `{domain}-context`. Tags
+tell Claude what *kind* of knowledge it's receiving. Projects are identified by
+headers inside the block.
 
 ### Hook registered globally
 ```json
@@ -205,7 +207,7 @@ not competing. MemPalace + Vault together cover both concerns cleanly.
 ```
 ~/.vault/
 ├── vault.db       — SQLite store (projects, documents, chunks, vectors, FTS5, retrieval_log, classification cache)
-└── vault.toml     — domains, context tags, MLX config, defaults (hand-authored; never written by vault)
+└── vault.toml     — context-tag fallback, MLX config, defaults (hand-authored; never written by vault)
 ```
 
 Nothing is written to indexed repos.
@@ -235,7 +237,7 @@ The block is grouped by project with labeled chunks (contract, plan, convention,
 meta). If no context block is present, none was relevant.
 ```
 
-**Note:** Adding a new domain to vault.toml requires updating this file too — two-file change.
+**Note:** Introducing a new domain requires adding a `## {domain}-context` section to this file (the tag's meaning is authored here; the assignment is set during sync and stored in vault.db).
 
 **<project>/CLAUDE.md** (per-project) — current work state only:
 ```markdown

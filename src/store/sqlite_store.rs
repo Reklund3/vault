@@ -130,6 +130,16 @@ impl Store for SqliteStore {
         Ok(None)
     }
 
+    fn set_project_domain(&mut self, project_id: i64, domain: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "UPDATE projects SET domain = ?1 WHERE id = ?2",
+                params![domain, project_id],
+            )
+            .map_err(backend_err)?;
+        Ok(())
+    }
+
     fn upsert_document(
         &mut self,
         doc: &Document,
@@ -551,6 +561,33 @@ mod tests {
             .resolve_domain(&["BUILD-SERVICE".to_string()])
             .unwrap();
         assert_eq!(domain, Some("software".to_string()));
+    }
+
+    #[test]
+    fn set_project_domain_persists_and_is_resolvable() {
+        let mut store = SqliteStore::open_in_memory(&Config::default()).unwrap();
+        let id = create_project(&store, "build-service");
+        store.set_project_domain(id, "software").unwrap();
+        assert_eq!(
+            store
+                .resolve_domain(&["build-service".to_string()])
+                .unwrap(),
+            Some("software".to_string())
+        );
+    }
+
+    #[test]
+    fn set_project_domain_overwrites_existing() {
+        let mut store = SqliteStore::open_in_memory(&Config::default()).unwrap();
+        let id = create_project(&store, "build-service");
+        store.set_project_domain(id, "software").unwrap();
+        store.set_project_domain(id, "finance").unwrap();
+        assert_eq!(
+            store
+                .resolve_domain(&["build-service".to_string()])
+                .unwrap(),
+            Some("finance".to_string())
+        );
     }
 
     #[test]

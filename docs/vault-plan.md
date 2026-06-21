@@ -696,8 +696,8 @@ vault/                           -- source repository
     └── types.rs                 -- DocType, Language (cross-cutting domain enums)
 
 ~/.vault/                        -- runtime data (never in source repo)
-├── vault.db                     -- SQLite store (chunks, embeddings, classification cache)
-└── vault.toml                   -- domains, defaults (hand-authored; never written by vault)
+├── vault.db                     -- SQLite store (chunks, embeddings, classification cache, domain assignments)
+└── vault.toml                   -- defaults, context-tag fallback, backend config (hand-authored; never written by vault)
 ```
 
 ### Store backend abstraction
@@ -741,12 +741,16 @@ in `~/.claude/settings.json` — no per-project installation needed.
 > **Note:** Confirm exact hook key against Claude Code docs before wiring the binary.
 > Wrong key = silent failure with no context injection and no error.
 
-`vault.toml` controls domain groupings, context tags, and vault-wide defaults.
+`vault.toml` holds vault-wide defaults, the context-tag fallback, and backend
+config. It is **read-only** from vault's perspective — hand-authored, never written.
 
-The context tag operates at the **domain level**, not the project level. All projects
-within a domain share the same tag — the tag signals what kind of knowledge Claude is
-receiving, not which specific project it came from. Projects are already identified by
-the grouping headers inside the context block.
+The context tag operates at the **domain level**, not the project level: all
+projects in a domain share one tag, signalling what *kind* of knowledge Claude is
+receiving. But the project→domain assignment is **not** configured here — it's
+interactive runtime state, stored in vault.db (`projects.domain`) and set during
+`vault index sync`. The tag is derived by convention as `{domain}-context`, so the
+only thing that must be hand-authored is the matching `## {domain}-context` framing
+in `~/.claude/CLAUDE.md` — the single source of truth for what a tag means.
 
 ```toml
 # vault.toml
@@ -758,17 +762,10 @@ alpha        = 0.6               # BM25/cosine weight — 0.0 = pure semantic, 1
 min_score    = 0.15
 timeout_ms   = 3000              # hook Gemma timeout before passthrough
 
-[domains.software]
-context_tag = "software-context"
-projects    = ["build-service", "mcp-server", "vault"]
-
-[domains.finance]
-context_tag = "finance-context"
-projects    = ["bookkeeping", "tax-notes"]
-
-[domains.personal]
-context_tag = "personal-context"
-projects    = ["homelab", "research"]
+# Domains are NOT configured here. Project→domain assignment is interactive
+# runtime state stored in vault.db (projects.domain), set during `vault index
+# sync`. The context tag is derived by convention as `{domain}-context`; the
+# matching `## {domain}-context` framing lives in ~/.claude/CLAUDE.md.
 
 [router]
 mode  = "auto"                           # "auto" | "gemma" | "haiku"
@@ -822,8 +819,12 @@ The assembled context block for a software session:
 ```
 
 Domain assignment happens during `vault index sync` — if a project is new, you are
-prompted to assign it to a domain. Adding a new project to an existing domain requires
-no new tag decision.
+prompted to assign it to a domain (or pass `--domain`). The assignment is stored in
+vault.db (`projects.domain`), so re-syncing an assigned project never re-prompts.
+Empty / non-interactive input leaves the project unassigned, and the hook falls back
+to `defaults.context_tag`. Adding a new project to an existing domain requires no new
+tag decision; a *brand-new* domain needs a matching `## {domain}-context` section in
+`~/.claude/CLAUDE.md` (the sync prints this reminder).
 
 ---
 
@@ -932,9 +933,10 @@ meta). If no context block is present, none was relevant.
 Keep everything else in this file minimal — it is loaded on every session regardless of
 domain or project.
 
-**Important:** adding a new domain to `vault.toml` requires a matching update here so
-Claude knows how to interpret the new context tag. It is a two-file change:
-`vault.toml` + `~/.claude/CLAUDE.md`.
+**Important:** introducing a new domain requires a matching `## {domain}-context`
+section here so Claude knows how to interpret the tag. The domain *assignment* itself
+is set during `vault index sync` and stored in vault.db — this file is the only place
+the tag's *meaning* is authored, so it's the single source of truth for the taxonomy.
 
 ### <project>/.claude/CLAUDE.md (per-project — injected when in that directory)
 
@@ -975,12 +977,12 @@ No session state lives in vault.db. The hook binary is read-only at runtime.
 | Vector dimensions | 768 | Locked at schema creation — `chunks_vec FLOAT[768]`. Changing the model means a full reindex |
 | Primary interface | Pre-send hook (vault hook) | All routing/retrieval before Claude sees prompt; zero Claude token cost |
 | Hook runtime access | Read-only | No session writes; vault.db only written during explicit index sync |
-| Context tag | Domain-level in vault.toml | Tag signals knowledge domain (software, finance, personal) not individual project; projects grouped inside the block by header |
+| Context tag | Domain-level; `{domain}-context` by convention | Tag signals knowledge domain (software, finance, personal) not individual project; per-project assignment in vault.db, tag meaning authored in ~/.claude/CLAUDE.md |
 | Routing model | Gemma 4 (27B MoE or 31B Dense) via mlx_lm.server | Local, free, handles natural language → structured query signals |
 | Router fallback | Anthropic Haiku via API | `auto` mode falls back when Gemma unreachable; per-call cost ~$0.0002 because the routing prompt is tiny (`cache_control: ephemeral` is set but inert below Haiku's ~4096-token minimum); preserves hook on machines without MLX |
 | Routing strategy | Every send with skip escape hatch | Router decides relevance; short prompts return immediately |
 | Hook timeout | 3 seconds | Silent passthrough on timeout — never block the session |
-| Context injection | Prepend as `<{context_tag}>` block | Tag driven by domain assignment in vault.toml |
+| Context injection | Prepend as `<{context_tag}>` block | Tag driven by the project's domain assignment in vault.db (`{domain}-context`), else `defaults.context_tag` |
 | Token estimation | tiktoken cl100k_base | Accurate counts matter at 10k budget ceiling |
 | Token budget | 10k initial | Validate and tune via vault diagnose before hardcoding |
 | Alpha (BM25/cosine weight) | 0.6 / 0.4 initial | Validate and tune via vault diagnose before hardcoding |
@@ -1045,7 +1047,7 @@ should be checked against that document.
     stops being a safety net, trust boundaries grow, filesystem
     permissions stop applying)
 [ ] MCP server subcommand — add if on-demand retrieval needed alongside hook
-[ ] Keep ~/.claude/CLAUDE.md domain list in sync with vault.toml domains — two-file change when adding a new domain
+[ ] Add a `## {domain}-context` section to ~/.claude/CLAUDE.md when introducing a new domain (assignment itself is set during sync, stored in vault.db)
 ```
 
 ---
@@ -1104,8 +1106,9 @@ Step 11 retrieve/hybrid.rs  — DONE (commit 455303d). `merge()` is the shared s
 Step 12 retrieve/budget.rs  — token budget selection
 Step 13 hook/mod.rs         — stdin/stdout protocol, full pipeline wired
 Step 14 first-run UX        — new-project prompts during vault index sync (project name, domain
-                              assignment) + the vault.toml write-back they need. Classification is a
-                              black box — no confirm/override prompt (decision 2026-06-21).
+                              assignment); both persist to vault.db, so no vault.toml write-back is
+                              needed. Classification is a black box — no confirm/override prompt
+                              (decision 2026-06-21).
                               Orchestrator (Steps 1–13) done; the interactive layer remains.
                               Full task breakdown below, after this step list.
 ```
@@ -1118,7 +1121,8 @@ than after the full hook pipeline is running.
 ### Step 14 — First-Run UX: Work Breakdown
 
 The sync *orchestration* is built (Steps 1–13). Step 14 is the interactive
-first-run layer plus the `vault.toml` write-back it stands on. Target behavior
+first-run layer. Persistence is entirely in vault.db (project name +
+`projects.domain`), so no `vault.toml` write-back is needed. Target behavior
 is specified under **"`vault index sync` first-run behavior (new project)"**
 earlier in this doc.
 
@@ -1133,10 +1137,10 @@ and the `IndexSyncDryRun` smoke command; content-hash skip of unchanged files
 
 | # | Task | Notes |
 |---|------|-------|
-| 1 | ~~Atomic `vault.toml` write-back on `Config`~~ | **DROPPED 2026-06-17 (B6 decision).** The classification cache moves to **vault.db** (the `documents` row already holds `doc_type` + `content_hash`, keyed portably on `project_id` + relative path), so no `vault.toml` writer is built — vault.toml stays read-only. If #3/#4 later persist project/domain assignments to vault.toml, they use a *format-preserving* `toml_edit` edit (comments + `dims` untouched), not a whole-struct re-serialize. |
+| 1 | ~~Atomic `vault.toml` write-back on `Config`~~ | **DROPPED 2026-06-17 (B6 decision).** The classification cache moves to **vault.db** (the `documents` row already holds `doc_type` + `content_hash`, keyed portably on `project_id` + relative path), so no `vault.toml` writer is built — vault.toml stays read-only. Project name and domain assignment both persist to **vault.db** (`projects.name` / `projects.domain`), not vault.toml, so the `toml_edit` writer is never needed at all. |
 | 2 | ~~Wire the real `vault index sync` command~~ | **DONE (9192cfc).** `vault index sync <repo> [--name] [--dry-run]` wired in `main.rs`; dry-run folded in as a flag; readable output via `format_report`. |
-| 3 | ~~Project-name first-run prompt~~ + persist | **PROMPT DONE 2026-06-18.** `run_sync` offers the directory-derived default when `--name` is absent (`prompt_for_project_name`, BufRead/Write injection mirroring `prompt_for_haiku_cost`; empty line / EOF → derived default; dry-run never prompts). The chosen name persists to the DB via `get_or_create_project`. *Still open:* writing the confirmed name into vault.toml so a later sync skips the prompt — deferred until the format-preserving `toml_edit` write path lands with #4 (today an interactive sync re-prompts unless `--name` is passed). |
-| 4 | Domain-assignment prompt + persist | Offer software / finance / personal / new. A *new* domain also persists its block AND must surface the two-file reminder to update `~/.claude/CLAUDE.md` (so Claude can read the new `<…-context>` tag). Persist via format-preserving `toml_edit`. |
+| 3 | ~~Project-name first-run prompt~~ + persist | **PROMPT DONE 2026-06-18.** `run_sync` offers the directory-derived default when `--name` is absent (`prompt_for_project_name`, BufRead/Write injection mirroring `prompt_for_haiku_cost`; empty line / EOF → derived default; dry-run never prompts). The chosen name persists to the DB via `get_or_create_project`. *Minor follow-up:* an interactive re-sync still re-prompts for the name unless `--name` is passed (the prompt doesn't yet skip when a project already exists for this repo path). The vault.toml "remember the name" idea is dropped — the name lives in vault.db, no `toml_edit` involved. |
+| 4 | ~~Domain-assignment prompt + persist~~ | **DONE 2026-06-21 (DB-first, no vault.toml).** `projects.domain` column in the base schema; `Store::resolve_domain` + `set_project_domain`; the hook derives `{domain}-context` via `resolve_tag` with a `defaults.context_tag` fallback. `run_sync` prompts on first sync (`prompt_for_domain`; `--domain` to bypass; empty / EOF → unassigned), persists via `set_project_domain`, prints the `## {domain}-context` CLAUDE.md reminder, and surfaces the domain in `format_report`. `Config.domains` / `resolve_context_tag` removed; the `[domains.*]` config surface is gone. Tag is pure convention for v1 (configurable override deferred until a real case appears). |
 | 5 | ~~Classification confirm/override + cache write-back~~ → Surface classifications in the sync report | **RESCOPED 2026-06-21 to black box (see "Classification is a black box").** No interactive confirm/override: a per-file override would make `doc_type` curated state and desync the denormalized `chunks.doc_type`/`chunks.language` columns that retrieval filters on (a documents-only write would leave stale chunk labels *and* stale chunk boundaries). Classification stays pure derived state; corrections happen at the rule level (few-shots / `ext_fallback` / optional `vault.toml` glob map), never per-file. This task shrinks to **making the `SyncReport` classification counts legible** in `format_report` — mostly already tracked — and folds into #6. |
 | 6 | Reconcile docs + green CI | Update README, this doc, and CLAUDE.md to match; `cargo fmt` + `clippy -D warnings` clean; open the `init`→`main` PR so Linux CI runs `cargo test` (sidesteps the local Windows Application Control block). Needs #2–#5. |
 | 7 | ~~Hook error observability~~ | **DONE (2026-06-12).** Outcome enum (injected / skip / failed+stage), one metadata-only JSONL record per call to `~/.vault/hook.log` (0600, 5MB rotation), stderr breadcrumb on failure, exit-0 fail-open preserved. Resolves the P1 observability sub-finding in `docs/plan-review-2026-06-11.md`; suite green locally (285/0). |

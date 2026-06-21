@@ -69,6 +69,16 @@ pub trait Store {
         Ok(None)
     }
 
+    /// Assign `domain` to a project row, overwriting any existing assignment.
+    /// Used by the first-run domain prompt in `vault index sync`.
+    ///
+    /// **Provided default is a no-op** (`Ok(())`) so test doubles and the
+    /// Postgres placeholder need not implement it; backends that persist
+    /// `projects.domain` override it.
+    fn set_project_domain(&mut self, _project_id: i64, _domain: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     fn prune_orphans(
         &mut self,
         project_id: i64,
