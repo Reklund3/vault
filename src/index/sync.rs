@@ -68,10 +68,7 @@ pub enum SyncError {
 /// remote services are touched — see `dry_run_report`.
 pub fn run_sync(opts: SyncOptions, config: &Config) -> Result<SyncReport, SyncError> {
     let canonical = std::fs::canonicalize(&opts.repo).map_err(SyncError::Io)?;
-    let project_name = opts
-        .explicit_name
-        .clone()
-        .unwrap_or_else(|| derive_project_name(&canonical));
+    let derived_name = derive_project_name(&canonical);
 
     let walked = walk_repo(
         &canonical,
@@ -82,8 +79,20 @@ pub fn run_sync(opts: SyncOptions, config: &Config) -> Result<SyncReport, SyncEr
     .map_err(SyncError::Walk)?;
 
     if opts.dry_run {
+        // Dry-run is a non-interactive preview — never prompt; use the explicit
+        // or derived name silently.
+        let project_name = opts.explicit_name.clone().unwrap_or(derived_name);
         return Ok(dry_run_report(&walked, config, project_name));
     }
+
+    // First-run name confirmation: with no `--name`, offer the directory-derived
+    // default for the user to accept (empty line / EOF) or override. The chosen
+    // name is persisted by `get_or_create_project` below; vault.toml is never
+    // written.
+    let project_name = match opts.explicit_name.clone() {
+        Some(name) => name,
+        None => prompt_for_project_name(&derived_name, std::io::stdin().lock(), std::io::stderr())?,
+    };
 
     let embedder = TeiEmbedder::from_config(config).map_err(SyncError::TeiUnreachable)?;
     embedder
@@ -468,6 +477,27 @@ fn prompt_for_haiku_cost<R: BufRead, W: Write>(
         Ok(())
     } else {
         Err(SyncError::DeclinedHaikuCost)
+    }
+}
+
+/// Prompt for the project name, defaulting to the directory-derived name on an
+/// empty line or EOF (piped / CI). Mirrors `prompt_for_haiku_cost`'s injected
+/// reader/writer so it tests without a real terminal. Only called when `--name`
+/// was not passed; the chosen name is persisted by `get_or_create_project`.
+fn prompt_for_project_name<R: BufRead, W: Write>(
+    derived: &str,
+    mut stdin: R,
+    mut stderr: W,
+) -> Result<String, SyncError> {
+    let _ = writeln!(stderr, "Project name? [{derived}] ");
+    let _ = stderr.flush();
+    let mut line = String::new();
+    let read = stdin.read_line(&mut line).map_err(SyncError::Io)?;
+    let trimmed = line.trim();
+    if read > 0 && !trimmed.is_empty() {
+        Ok(trimmed.to_string())
+    } else {
+        Ok(derived.to_string())
     }
 }
 
@@ -976,6 +1006,40 @@ mod tests {
         let mut err = Vec::new();
         let r = prompt_for_haiku_cost(10, &input[..], &mut err);
         assert!(matches!(r, Err(SyncError::DeclinedHaikuCost)));
+    }
+
+    #[test]
+    fn project_name_prompt_uses_input_when_provided() {
+        let input = b"my-service\n".to_vec();
+        let mut err = Vec::new();
+        let name = prompt_for_project_name("derived", &input[..], &mut err).expect("name");
+        assert_eq!(name, "my-service");
+        // The derived default is surfaced in the prompt text.
+        assert!(String::from_utf8_lossy(&err).contains("[derived]"));
+    }
+
+    #[test]
+    fn project_name_prompt_defaults_on_empty_line() {
+        let input = b"\n".to_vec();
+        let mut err = Vec::new();
+        let name = prompt_for_project_name("derived", &input[..], &mut err).expect("name");
+        assert_eq!(name, "derived");
+    }
+
+    #[test]
+    fn project_name_prompt_defaults_on_eof() {
+        let input: &[u8] = b"";
+        let mut err = Vec::new();
+        let name = prompt_for_project_name("derived", input, &mut err).expect("name");
+        assert_eq!(name, "derived");
+    }
+
+    #[test]
+    fn project_name_prompt_trims_surrounding_whitespace() {
+        let input = b"  spaced-name  \n".to_vec();
+        let mut err = Vec::new();
+        let name = prompt_for_project_name("derived", &input[..], &mut err).expect("name");
+        assert_eq!(name, "spaced-name");
     }
 
     // ---------- format_report ----------

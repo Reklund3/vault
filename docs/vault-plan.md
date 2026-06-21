@@ -1102,24 +1102,28 @@ and the `IndexSyncDryRun` smoke command; content-hash skip of unchanged files
 |---|------|-------|
 | 1 | ~~Atomic `vault.toml` write-back on `Config`~~ | **DROPPED 2026-06-17 (B6 decision).** The classification cache moves to **vault.db** (the `documents` row already holds `doc_type` + `content_hash`, keyed portably on `project_id` + relative path), so no `vault.toml` writer is built — vault.toml stays read-only. If #3/#4 later persist project/domain assignments to vault.toml, they use a *format-preserving* `toml_edit` edit (comments + `dims` untouched), not a whole-struct re-serialize. |
 | 2 | ~~Wire the real `vault index sync` command~~ | **DONE (9192cfc).** `vault index sync <repo> [--name] [--dry-run]` wired in `main.rs`; dry-run folded in as a flag; readable output via `format_report`. |
-| 3 | Project-name first-run prompt + persist | Prompt when the project isn't in vault.toml (default = derived name). Follow `prompt_for_haiku_cost` (BufRead/Write injection); EOF → derived default. Persist via a format-preserving `toml_edit` edit (not the dropped #1 whole-file writer). |
+| 3 | ~~Project-name first-run prompt~~ + persist | **PROMPT DONE 2026-06-18.** `run_sync` offers the directory-derived default when `--name` is absent (`prompt_for_project_name`, BufRead/Write injection mirroring `prompt_for_haiku_cost`; empty line / EOF → derived default; dry-run never prompts). The chosen name persists to the DB via `get_or_create_project`. *Still open:* writing the confirmed name into vault.toml so a later sync skips the prompt — deferred until the format-preserving `toml_edit` write path lands with #4 (today an interactive sync re-prompts unless `--name` is passed). |
 | 4 | Domain-assignment prompt + persist | Offer software / finance / personal / new. A *new* domain also persists its block AND must surface the two-file reminder to update `~/.claude/CLAUDE.md` (so Claude can read the new `<…-context>` tag). Persist via format-preserving `toml_edit`. |
 | 5 | Classification confirm/override + cache write-back | Show classifier labels, let the user confirm/override before chunks are written; the override persists as the `documents.doc_type` written by `upsert_document`, so a later unchanged-hash sync reuses it (no vault.toml). Sticky overrides *across content edits* are an open sub-decision here. |
 | 6 | Reconcile docs + green CI | Update README, this doc, and CLAUDE.md to match; `cargo fmt` + `clippy -D warnings` clean; open the `init`→`main` PR so Linux CI runs `cargo test` (sidesteps the local Windows Application Control block). Needs #2–#5. |
 | 7 | ~~Hook error observability~~ | **DONE (2026-06-12).** Outcome enum (injected / skip / failed+stage), one metadata-only JSONL record per call to `~/.vault/hook.log` (0600, 5MB rotation), stderr breadcrumb on failure, exit-0 fail-open preserved. Resolves the P1 observability sub-finding in `docs/plan-review-2026-06-11.md`; suite green locally (285/0). |
 
-Dependency graph:
+Dependency graph (revised post-B6, 2026-06-18 — #1 dropped):
 
 ```
-#1 ─┬─> #3 ─┐
-    ├─> #4 ─┤
-    └─> #5 ─┼─> #6
-#2 ────────┤
-#7 ────────┘
+#3 prompt ✓ ────────────────────────────────────────────┐
+toml_edit ─┬─> #4 ──────────────────────────────────────┤
+           └─> #3 "remember name in vault.toml" tail ────┼─> #6
+#5 (independent — persists via documents.doc_type) ──────┤
+#2 ✓   #7 ✓ ─────────────────────────────────────────────┘
 ```
 
-Recommended order: **#1 first** — it unlocks the three prompts (#3–#5), which
-are the only functional work left before the #6 docs/CI pass.
+Recommended order: #1 is dropped (B6), so there is no shared blocker left, and
+#3's prompt has landed (DB-persisted). **#5 next** — it needs no `toml_edit`
+(it writes through `documents.doc_type`), only a per-file-vs-batch UX call. Then
+the format-preserving `toml_edit` write path, done once with **#4**, which also
+finishes #3's "remember the name" tail. Then **#6** (docs + the `init`→`main` PR
+so Linux CI runs the suite).
 
 ---
 
