@@ -763,7 +763,6 @@ context_tag  = "vault-context"   # fallback if project has no domain assignment
 token_budget = 10000
 alpha        = 0.6               # BM25/cosine weight — 0.0 = pure semantic, 1.0 = pure keyword
 min_score    = 0.15
-timeout      = 3                 # required; currently unused — the real hook timeout is [router].timeout_secs
 
 # Domains are NOT configured here. Project→domain assignment is interactive
 # runtime state stored in vault.db (projects.domain), set during `vault index
@@ -773,12 +772,12 @@ timeout      = 3                 # required; currently unused — the real hook 
 [router]
 mode         = "auto"                    # "auto" | "gemma" | "haiku"
 model        = "haiku"                   # alias — vault resolves to current latest Haiku
-timeout_secs = 3                         # hot-path router timeout before passthrough (optional; defaults to 3)
+timeout      = 3                         # hot-path router timeout (seconds) before passthrough (optional; defaults to 3)
 
 [classifier]
 mode         = "auto"                    # same selection rules as [router]
 model        = "haiku"
-timeout_secs = 300                       # sync-time, not hot path — generous for slow local models (REQUIRED when this block is present)
+timeout      = 300                       # sync-time classifier timeout (seconds); optional, defaults to 300
 
 [mlx]
 endpoint      = "http://localhost:8080"  # mlx_lm.server (used in gemma or auto+reachable)

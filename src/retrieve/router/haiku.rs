@@ -11,7 +11,7 @@ use crate::retrieve::router::{
 
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-// Timeout is configurable via [router].timeout_secs (default 3s per CLAUDE.md).
+// Timeout is configurable via [router].timeout (default 3s per CLAUDE.md).
 // The hook caller silences failures (passthrough), so the router's only job is
 // to fail inside whatever budget the user configured.
 /// Five small arrays + the skip shortcut; 256 covers either shape comfortably.
@@ -252,7 +252,7 @@ mod tests {
     }
 
     /// 30s for live tests: production sets the budget via
-    /// `[router].timeout_secs` in `vault.toml`. Haiku usually replies in <2s so
+    /// `[router].timeout` in `vault.toml`. Haiku usually replies in <2s so
     /// this is mostly headroom for network jitter.
     const LIVE_TIMEOUT: Duration = Duration::from_secs(30);
 

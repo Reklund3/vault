@@ -80,7 +80,7 @@ model = "haiku"     # alias — vault resolves to the current latest Haiku model
 [classifier]
 mode  = "auto"
 model = "haiku"
-timeout_secs = 300   # required when this block is present
+timeout = 300        # in seconds; optional, defaults to 300
 ```
 
 - **`auto`** (default) — probe `localhost:8080` once at startup with a 200ms timeout. If reachable, use Gemma; otherwise fall back to Haiku. Decision is cached for the process lifetime; no per-call probing.

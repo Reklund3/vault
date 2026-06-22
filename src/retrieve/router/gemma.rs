@@ -10,7 +10,7 @@ use crate::retrieve::router::{
     ROUTER_SYSTEM, Router, RouterError, build_user_prompt, parse_response,
 };
 
-// Timeout is configurable via [router].timeout_secs (default 3s per CLAUDE.md).
+// Timeout is configurable via [router].timeout (default 3s per CLAUDE.md).
 // The hook caller silences failures (passthrough), so the router's only job is
 // to fail inside whatever budget the user configured.
 /// Five small arrays + the skip shortcut would fit in ~256 tokens, but Gemma 4
@@ -226,7 +226,7 @@ mod tests {
     }
 
     /// 30s for live tests: production sets the budget via
-    /// `[router].timeout_secs` in `vault.toml`. The live test fixes a generous
+    /// `[router].timeout` in `vault.toml`. The live test fixes a generous
     /// number explicitly so it doesn't depend on the user's config file.
     const LIVE_TIMEOUT: Duration = Duration::from_secs(180);
 

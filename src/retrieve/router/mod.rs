@@ -399,12 +399,11 @@ context_tag = "vault-context"
 token_budget = 10000
 alpha = 0.6
 min_score = 0.15
-timeout = 3
 
 [router]
 mode = "{mode}"
 model = "haiku"
-timeout_secs = 3
+timeout = 3
 
 [mlx]
 endpoint = "http://127.0.0.1:1"

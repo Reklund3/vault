@@ -26,33 +26,40 @@ struct Defaults {
     token_budget: u16,
     alpha: f32,
     min_score: f32,
-    #[allow(dead_code)]
-    timeout: u8,
 }
 
+// `#[serde(default)]` on the struct lets a present `[router]`/`[classifier]`
+// block omit any field — the missing ones come from the `Default` impl below,
+// so no per-field default functions are needed.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
 struct Router {
     mode: String,
     model: String,
-    /// HTTP timeout for one router call. Defaults to 3s per CLAUDE.md's
-    /// hot-path budget; raise it in `vault.toml` when running a slow local
-    /// model that can't meet the default.
-    #[serde(default = "default_router_timeout_secs")]
-    timeout_secs: u32,
+    /// HTTP timeout in seconds for one router call. Hot path — defaults to 3;
+    /// raise it in `vault.toml` for a slow local model that can't meet that.
+    timeout: u32,
 }
 
-fn default_router_timeout_secs() -> u32 {
-    3
+impl Default for Router {
+    fn default() -> Self {
+        Self {
+            mode: "auto".to_string(),
+            model: "haiku".to_string(),
+            timeout: 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
 struct Classifier {
     mode: String,
     model: String,
-    /// HTTP timeout for one classifier call. Sync time, not hot path, so a
-    /// generous value is fine — large local models (e.g. Gemma 4 31b bf16) can
-    /// need 30–90s per call once warm, and longer on cold-load.
-    timeout_secs: u32,
+    /// HTTP timeout in seconds for one classifier call. Sync time, not hot path,
+    /// so generous is fine — large local models (e.g. Gemma 4 31b bf16) can need
+    /// 30–90s per call once warm. Defaults to 300.
+    timeout: u32,
 }
 
 impl Default for Classifier {
@@ -60,7 +67,7 @@ impl Default for Classifier {
         Self {
             mode: "auto".to_string(),
             model: "haiku".to_string(),
-            timeout_secs: 300,
+            timeout: 300,
         }
     }
 }
@@ -170,7 +177,7 @@ impl Config {
     }
 
     pub fn classifier_timeout(&self) -> Duration {
-        Duration::from_secs(self.classifier.timeout_secs as u64)
+        Duration::from_secs(self.classifier.timeout as u64)
     }
 
     pub fn router_mode(&self) -> &str {
@@ -182,7 +189,7 @@ impl Config {
     }
 
     pub fn router_timeout(&self) -> Duration {
-        Duration::from_secs(self.router.timeout_secs as u64)
+        Duration::from_secs(self.router.timeout as u64)
     }
 
     pub fn mlx_endpoint(&self) -> &str {
@@ -244,13 +251,8 @@ impl Default for Config {
                 token_budget: 10000,
                 alpha: 0.6,
                 min_score: 0.15,
-                timeout: 3,
             },
-            router: Router {
-                mode: "auto".to_string(),
-                model: "haiku".to_string(),
-                timeout_secs: default_router_timeout_secs(),
-            },
+            router: Router::default(),
             classifier: Classifier::default(),
             mlx: Mlx {
                 endpoint: "http://localhost:8080".to_string(),
@@ -346,5 +348,72 @@ dims = 768
 "#;
         let cfg: Config = toml::from_str(toml_text).expect("parse");
         assert!(cfg.indexer_exclude_patterns().is_empty());
+    }
+
+    #[test]
+    fn router_classifier_blocks_omitting_timeout_use_struct_defaults() {
+        // A present [router]/[classifier] block may omit `timeout` — the struct's
+        // `#[serde(default)]` fills it from the Default impl (3 / 300) instead of
+        // hard-erroring (the live vault.toml foot-gun this closes).
+        let toml_text = r#"
+[defaults]
+context_tag = "vault-context"
+token_budget = 10000
+alpha = 0.6
+min_score = 0.15
+
+[router]
+mode = "auto"
+model = "haiku"
+
+[classifier]
+mode = "auto"
+model = "haiku"
+
+[mlx]
+endpoint = "http://localhost:8080"
+router_model = "test"
+
+[embeddings]
+endpoint = "http://localhost:8081"
+model = "nomic-ai/nomic-embed-text-v1.5"
+dims = 768
+"#;
+        let cfg: Config = toml::from_str(toml_text).expect("parse");
+        assert_eq!(cfg.router_timeout(), Duration::from_secs(3));
+        assert_eq!(cfg.classifier_timeout(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn explicit_timeout_overrides_the_default() {
+        let toml_text = r#"
+[defaults]
+context_tag = "vault-context"
+token_budget = 10000
+alpha = 0.6
+min_score = 0.15
+
+[router]
+mode = "auto"
+model = "haiku"
+timeout = 5
+
+[classifier]
+mode = "auto"
+model = "haiku"
+timeout = 120
+
+[mlx]
+endpoint = "http://localhost:8080"
+router_model = "test"
+
+[embeddings]
+endpoint = "http://localhost:8081"
+model = "nomic-ai/nomic-embed-text-v1.5"
+dims = 768
+"#;
+        let cfg: Config = toml::from_str(toml_text).expect("parse");
+        assert_eq!(cfg.router_timeout(), Duration::from_secs(5));
+        assert_eq!(cfg.classifier_timeout(), Duration::from_secs(120));
     }
 }

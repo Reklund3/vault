@@ -81,17 +81,16 @@ context_tag  = "vault-context"  # fallback when a project has no domain assignme
 token_budget = 10000
 alpha        = 0.6              # BM25/cosine weight
 min_score    = 0.15
-timeout      = 3                # required; the real hook timeout is [router].timeout_secs
 
 [router]
 mode         = "auto"   # "auto" | "gemma" | "haiku"
 model        = "haiku"  # vault resolves to the current latest Haiku model
-timeout_secs = 3        # optional; defaults to 3
+timeout      = 3        # in seconds; optional, defaults to 3
 
 [classifier]
 mode         = "auto"   # same selection rules as [router]
 model        = "haiku"
-timeout_secs = 300      # required when this block is present
+timeout      = 300      # in seconds; optional, defaults to 300
 ```
 
 Project→domain assignment is **not** configured here — it's set during `vault index sync` and stored in `vault.db` (`projects.domain`). The context tag is derived by convention as `{domain}-context`.
