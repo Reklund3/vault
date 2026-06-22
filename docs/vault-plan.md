@@ -175,6 +175,8 @@ CREATE TABLE projects (
   id         INTEGER PRIMARY KEY,
   name       TEXT NOT NULL UNIQUE,
   repo_path  TEXT,
+  domain     TEXT,             -- NULL = unassigned; hook derives tag as {domain}-context,
+                               -- else falls back to defaults.context_tag. Written by sync.
   created_at INTEGER NOT NULL
 );
 
@@ -200,7 +202,7 @@ CREATE TABLE chunks (
   label        TEXT NOT NULL,              -- "message BuildRequest [build-service]"
   content      TEXT NOT NULL,
   content_hash TEXT NOT NULL,              -- sha256 of chunk body; skip re-embed when label survives unchanged
-  token_est    INTEGER NOT NULL,           -- tiktoken cl100k_base accurate count
+  token_est    INTEGER NOT NULL,           -- chars/4 heuristic (estimate_tokens), not a real tokenizer
   chunk_index  INTEGER NOT NULL,
   created_at   INTEGER NOT NULL,
   UNIQUE(document_id, label)               -- stable identity for sync diff/prune
@@ -229,7 +231,34 @@ CREATE TABLE retrieval_log (
   tokens_injected  INTEGER NOT NULL,
   created_at       INTEGER NOT NULL
 );
+
+-- Embedding-stack lock. Records the model + dim that produced every chunks_vec
+-- row, so a later model swap is detected instead of silently mixing vector
+-- spaces. Keys: 'embedding_model', 'embedding_dim'.
+CREATE TABLE meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 ```
+
+### Migrations & the embedding lock
+
+The schema is versioned through SQLite's built-in `PRAGMA user_version`, not a
+migrations table. `schema::migrate` reads `user_version`; when it is `< 1` it
+applies the whole DDL above as `SCHEMA_V1` (every statement is
+`CREATE … IF NOT EXISTS`) and stamps `user_version = 1`. There is no v2 ladder
+yet — the project is pre-deployment, so new columns (e.g. `projects.domain`)
+are folded into the base schema rather than added as incremental steps.
+
+`chunks_vec FLOAT[768]` is fixed at table creation, so the embedding stack is
+locked the first time a DB is opened. `verify_or_init_embedding(model, dim)`
+enforces this: on a fresh DB it writes `embedding_model` / `embedding_dim` into
+`meta`; on every later open it compares the caller's configured values against
+the stored ones and returns `IncompatibleEmbedding` on mismatch. It also
+refuses any configured `dim` that differs from the schema-locked 768 up front,
+so a 1024-in-config / 768-in-schema mismatch fails fast at startup instead of
+producing vec0 errors later. Changing the embedding model therefore means a
+full reindex, by construction.
 
 ### FTS5 Sync Triggers
 
@@ -541,31 +570,54 @@ make Claude Code feel broken.
 
 ### Step 2 — Hybrid Query
 
-Both queries filtered by project_id, doc_type, and language from the query plan.
-Language filter is applied only when the query plan specifies languages — omitted
-when the list is empty to avoid over-filtering.
+The two arms (`bm25_search`, `cosine_search` on the `Store` trait) share one
+filter builder, `build_filter_clause`, and every filter is **skip-if-empty** —
+a clause is appended only when the query plan's corresponding list is non-empty,
+so an absent signal means "don't filter on this axis" rather than "match
+nothing". The order is always projects, then doc_types, then languages, and the
+bind params (`filter_bind_params`) are produced in that same order so the clause
+and its parameters can never drift.
+
+Three details the SQL below makes concrete:
+
+- **Projects resolve by name, not id.** The router emits project *names*, so the
+  filter is a subselect — `c.project_id IN (SELECT id FROM projects WHERE name
+  COLLATE NOCASE IN (...))`. `COLLATE NOCASE` makes "Vault" match a stored
+  "vault" (P2 path 1: without it, a case-mismatched name silently voids every
+  chunk).
+- **The BM25 arm is skipped entirely when there are no keyword tokens.**
+  `build_match_query` builds the MATCH string from `type_names` + `topics`; if
+  both are empty it returns `None` and `bm25_search` returns no rows, so the
+  merge runs **cosine-only**. The cosine arm has no MATCH and always runs.
+- **MATCH construction.** Each `type_name` and `topic` is escaped as a quoted
+  FTS5 string (wrapped in `"`, internal `"` doubled) and the tokens are joined
+  with ` OR ` — so the keyword arm is a disjunction over the named entities.
 
 ```sql
--- FTS5: BM25 keyword match
+-- FTS5: BM25 keyword match. Runs ONLY when type_names+topics is non-empty.
+-- ?1 = MATCH string, e.g.  "BuildRequest" OR "auth"
 SELECT c.id, c.label, c.content, c.token_est, c.project_id, c.doc_type,
        -rank AS bm25_score
 FROM chunks_fts
 JOIN chunks c ON c.id = chunks_fts.rowid
-WHERE chunks_fts MATCH ?
-  AND c.project_id IN (...)           -- from query plan: projects
-  AND c.doc_type IN (...)             -- from query plan: doc_types
-  AND (? OR c.language IN (...))      -- from query plan: languages (skipped if empty)
+WHERE chunks_fts MATCH ?1
+  -- each line below appended ONLY if its plan list is non-empty:
+  AND c.project_id IN (SELECT id FROM projects WHERE name COLLATE NOCASE IN (...))
+  AND c.doc_type IN (...)
+  AND c.language IN (...)
 ORDER BY rank LIMIT 50;
 
--- Vec: cosine similarity
+-- Vec: cosine similarity. Always runs. ?1 = query embedding JSON.
 SELECT c.id, c.label, c.content, c.token_est, c.project_id, c.doc_type,
-       1.0 - vec_distance_cosine(v.embedding, ?) AS cos_sim
+       1.0 - vec_distance_cosine(v.embedding, ?1) AS cos_sim
 FROM chunks_vec v
 JOIN chunks c ON c.id = v.chunk_id
-WHERE c.project_id IN (...)
+WHERE 1=1
+  -- same three skip-if-empty clauses as the BM25 arm:
+  AND c.project_id IN (SELECT id FROM projects WHERE name COLLATE NOCASE IN (...))
   AND c.doc_type IN (...)
-  AND (? OR c.language IN (...))
-ORDER BY vec_distance_cosine(v.embedding, ?) LIMIT 50;
+  AND c.language IN (...)
+ORDER BY vec_distance_cosine(v.embedding, ?1) LIMIT 50;
 ```
 
 ### Step 3 — Score Merge + Budget Selection
@@ -600,8 +652,10 @@ without a migration.
 
 ### Step 4 — Context Assembly
 
-The context tag wraps the injected block. It is determined by the project's domain
-assignment in vault.toml (e.g. `<software-context>`, `<finance-context>`, `<personal-context>`).
+The context tag wraps the injected block. It is derived by convention from the
+project's domain assignment in `vault.db` (`projects.domain`) as `{domain}-context`
+(e.g. `<software-context>`, `<finance-context>`, `<personal-context>`), falling
+back to `defaults.context_tag` when no matched project has a domain.
 
 Chunk labels strip leading `#` characters at index time so markdown heading markers
 do not appear inside the context block.
@@ -658,64 +712,104 @@ Single binary, modes dispatched by subcommand:
 vault/                           -- source repository
 ├── Cargo.toml
 └── src/
-    ├── main.rs                  -- subcommand dispatch
+    ├── main.rs                  -- subcommand dispatch (hook | index | diagnose | tei)
+    ├── config.rs                -- vault.toml parsing: Config, ConfigError, default_context_tag,
+    │                            --   router/classifier mode + timeout knobs
+    ├── types.rs                 -- cross-cutting domain enums: DocType, Language
     ├── hook/
-    │   └── mod.rs               -- stdin→stdout hook protocol
-    ├── mcp/
-    │   └── mod.rs               -- MCP stdio protocol (optional future)
+    │   ├── mod.rs               -- stdin→stdout hook protocol, full pipeline, outcome taxonomy
+    │   └── log.rs               -- metadata-only JSONL telemetry → ~/.vault/hook.log (5MB rotation)
     ├── store/
     │   ├── mod.rs               -- re-exports Store, StoreError, SqliteStore, types
     │   ├── traits.rs            -- Store trait + StoreError (backend-neutral)
     │   ├── types.rs             -- Document, Chunk, ChunkWithEmbedding, Hit, RetrievalLogEntry
-    │   ├── schema.rs            -- SQLite DDL, sqlite-vec auto-extension, migration runner
-    │   ├── sqlite_store.rs      -- SqliteStore impl: upsert/prune/hybrid_search/log (Steps 2+3+11)
-    │   └── postgresql_store.rs  -- stub for future distributed backend
+    │   ├── schema.rs            -- SQLite DDL, sqlite-vec auto-extension, user_version migration,
+    │   │                        --   verify_or_init_embedding (meta lock)
+    │   ├── sqlite_store.rs      -- live backend: upsert/prune + bm25_search/cosine_search (Steps 2+3)
+    │   └── postgresql_store.rs  -- todo!() placeholder, not exported, not wired up
     ├── parse/
     │   ├── mod.rs               -- Parser trait + select_parser ((doc_type, language) → parser; ext fallback)
     │   ├── proto.rs
     │   ├── go_source.rs
     │   ├── rust_source.rs
     │   ├── openapi.rs           -- paths × methods + schemas (yaml-rust2)
-    │   └── markdown.rs          -- per `##` block (convention/meta)
+    │   └── markdown.rs          -- per `##` block (convention/meta; plan stays whole-file)
     ├── embed/
-    │   └── tei.rs               -- nomic-embed-text-v1.5 via TEI HTTP (localhost:8081)
+    │   ├── mod.rs               -- Embedder trait + selection
+    │   ├── tei.rs               -- nomic-embed-text-v1.5 via TEI HTTP (localhost:8081)
+    │   └── stub.rs              -- deterministic test embedder (no network)
     ├── retrieve/
     │   ├── mod.rs               -- QueryPlan, RouterOutput
     │   ├── router/
     │   │   ├── mod.rs           -- Router trait + auto/gemma/haiku selection
     │   │   ├── gemma.rs         -- Gemma impl (mlx_lm.server HTTP)
-    │   │   └── haiku.rs         -- Haiku impl (Anthropic API, prompt caching)
-    │   └── budget.rs            -- token-aware chunk selection
-    │
-    │   -- NOTE: score merge lives in store/sqlite_store.rs::hybrid_search.
-    │   -- The Store trait's hybrid_search returns merged Hits with component
-    │   -- scores preserved, so callers (vault diagnose, hook) consume one
-    │   -- ranked list. retrieve/hybrid.rs from earlier drafts is absorbed.
+    │   │   ├── haiku.rs         -- Haiku impl (Anthropic API; cache_control set, inert at size)
+    │   │   └── stub.rs          -- canned-plan test router
+    │   ├── hybrid.rs            -- shared BM25+cosine score merge (Step 11) — consumed by the
+    │   │                        --   Store trait's provided hybrid_search so all backends rank identically
+    │   └── budget.rs            -- token-aware chunk selection (Step 12)
     ├── index/
+    │   ├── mod.rs
+    │   ├── walk.rs              -- repo walker: globset exclusions, symlink refusal, canonical-root bound
+    │   ├── secrets.rs           -- index-time secret pre-scan (RegexSet) — drops matching chunks
+    │   ├── sync.rs              -- `vault index sync` pipeline: classify→parse→embed→upsert; SyncReport
     │   └── classify/
     │       ├── mod.rs           -- Classifier trait + auto/gemma/haiku selection
     │       ├── gemma.rs         -- Gemma classifier
-    │       └── haiku.rs         -- Haiku classifier (cost-prompt on first session use)
-    └── types.rs                 -- DocType, Language (cross-cutting domain enums)
+    │       ├── haiku.rs         -- Haiku classifier (cost-prompt on first session use)
+    │       └── stub.rs          -- canned-label test classifier
+    ├── diagnose/
+    │   └── mod.rs               -- `vault diagnose "<prompt>"` — full retrieval trace (Step 4)
+    ├── tei/
+    │   ├── mod.rs
+    │   └── launcher.rs          -- `vault tei start|stop|status|logs`; PID+log in ~/.vault/
+    └── util/
+        ├── mod.rs
+        ├── fs.rs                -- 0700/0600 hardening for ~/.vault/
+        ├── json.rs             -- balanced-brace extraction from model replies
+        ├── path.rs             -- `~` expansion
+        └── probe.rs            -- 200ms loopback TCP probe for auto-mode
 
 ~/.vault/                        -- runtime data (never in source repo)
-├── vault.db                     -- SQLite store (chunks, embeddings, classification cache, domain assignments)
-└── vault.toml                   -- defaults, context-tag fallback, backend config (hand-authored; never written by vault)
+├── vault.db                     -- SQLite store (projects incl. domain, documents, chunks,
+│                                --   embeddings, FTS5, retrieval_log; documents.content_hash = cache)
+├── vault.toml                   -- defaults, context-tag fallback, backend config (hand-authored; never written by vault)
+├── hook.log                     -- hook telemetry, rotated to hook.log.1 at 5MB
+└── tei.pid / tei.log            -- TEI launcher runtime files
 ```
 
 ### Store backend abstraction
 
 `Store` is a trait, not a concrete struct. `SqliteStore` is the v1 implementation;
-`PostgresStore` is a future placeholder for distributed deployments. This deviates
-from earlier drafts that split SQLite logic across `writer.rs` and `query.rs` —
-both now live as methods on `SqliteStore`. The trait surface is:
+`PostgresStore` is a `todo!()` placeholder for a future distributed backend (not
+exported, not wired up). Retrieval is exposed as the two **primitives**
+`bm25_search` and `cosine_search`, not a single search method: the score merge
+lives in `retrieve::hybrid` and is invoked by a **provided** `hybrid_search`
+default on the trait, so every backend ranks identically and the blend tunes in
+one place. (Earlier drafts that split SQLite logic across `writer.rs` /
+`query.rs`, or that absorbed the merge into `sqlite_store`, are superseded.) The
+trait surface is:
 
 ```rust
 pub trait Store {
     fn migrate(&mut self) -> Result<(), StoreError>;
+    fn get_or_create_project(&mut self, name: &str, repo_path: &str) -> Result<i64, StoreError>;
     fn upsert_document(&mut self, doc: &Document, chunks: &[ChunkWithEmbedding]) -> Result<(), StoreError>;
+    fn get_document_content_hash(&self, project_id: i64, source_path: &str) -> Result<Option<String>, StoreError>;
     fn prune_orphans(&mut self, project_id: i64, kept_paths: &[String]) -> Result<usize, StoreError>;
-    fn hybrid_search(&self, plan: &QueryPlan, embedding: &[f32]) -> Result<Vec<Hit>, StoreError>;
+
+    // Domain assignment (sync writes it; hook reads it). Provided defaults:
+    // resolve → Ok(None), set → Ok(()). Real backends override.
+    fn resolve_domain(&self, project_names: &[String]) -> Result<Option<String>, StoreError> { Ok(None) }
+    fn set_project_domain(&mut self, project_id: i64, domain: &str) -> Result<(), StoreError> { Ok(()) }
+
+    // Retrieval primitives — backends implement these two; the merge is shared.
+    fn bm25_search(&self, plan: &QueryPlan, top_k: usize) -> Result<Vec<Hit>, StoreError>;
+    fn cosine_search(&self, plan: &QueryPlan, embedding: &[f32], top_k: usize) -> Result<Vec<Hit>, StoreError>;
+
+    // Provided: runs both primitives and blends via retrieve::hybrid::merge.
+    fn hybrid_search(&self, plan: &QueryPlan, embedding: &[f32], alpha: f32) -> Result<Vec<Hit>, StoreError> { /* default */ }
+
     fn log_retrieval(&mut self, entry: &RetrievalLogEntry) -> Result<(), StoreError>;
 }
 ```
@@ -1074,12 +1168,15 @@ Step 2  store/sqlite_store::upsert_document  — replaces writer.rs from earlier
                               its chunks + embeddings transactionally; manual chunks_vec
                               cleanup since virtual tables have no FK cascade.
                               Pair: prune_orphans for sync-time deletion reconciliation.
-Step 3  store/sqlite_store::hybrid_search    — replaces query.rs from earlier drafts.
+Step 3  store/sqlite_store::{bm25_search,cosine_search}  — the two retrieval
+                              primitives (replaces query.rs from earlier drafts).
                               FTS5 MATCH (escaped, parameter-bound) + sqlite-vec
-                              vec_distance_cosine; merged by chunk_id, BM25 normalized
-                              against the result-set max, blended at alpha=0.6.
-                              Budget trim moved to Step 12 (retrieve/budget.rs) so the
-                              store stays scoring-pure and the budget layer can tune
+                              vec_distance_cosine. The blend itself is NOT here: the
+                              trait's provided hybrid_search calls retrieve::hybrid::merge
+                              (Step 11), so it merges by chunk_id with BM25 normalized
+                              against the result-set max at alpha=0.6 identically for every
+                              backend. Budget trim is Step 12 (retrieve/budget.rs) so the
+                              store stays scoring-pure and the budget layer tunes
                               independently.
 Step 4  vault diagnose      — CLI command to test retrieval manually with real data
                               validates schema and scoring before parsers exist
