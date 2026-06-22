@@ -373,11 +373,11 @@ Users append project-specific patterns; the defaults are not removable in v1.
 After parsing and before storing, every chunk is scanned for common secret
 patterns. Matches are dropped with a counted warning, never indexed.
 
-Patterns include: AWS access keys (`AKIA[0-9A-Z]{16}`), GitHub tokens
-(`ghp_*`, `github_pat_*`), Anthropic / OpenAI / generic `sk-*` tokens, JWT
-shapes, PEM headers (`-----BEGIN ... PRIVATE KEY-----`), and Stripe live
-keys. The list is conservative — it's a safety net for accidents, not a
-boundary against deliberate exfiltration.
+Patterns include: AWS access keys (`AKIA…`), GitHub tokens
+(`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`), Anthropic (`sk-ant-…`) and OpenAI /
+generic `sk-…` tokens, JWT shapes, and PEM private-key headers
+(`-----BEGIN … PRIVATE KEY-----`). The list is conservative — it's a safety
+net for accidents, not a boundary against deliberate exfiltration.
 
 ### Classification fallback chain
 
@@ -540,7 +540,7 @@ off-localhost storage it becomes a hard prerequisite.
 
 ### Step 1 — Router Query Plan
 
-Selected impl: Gemma 4 (27B MoE or 31B Dense) via mlx_lm.server HTTP (local, zero API
+Selected impl: Gemma 4 31B (bf16) via mlx_lm.server HTTP (local, zero API
 cost) **or** Anthropic Haiku via API (fallback). The Router trait abstracts both — the
 same system prompt and JSON schema apply to either backend.
 
@@ -875,7 +875,7 @@ timeout      = 300                       # sync-time classifier timeout (seconds
 
 [mlx]
 endpoint      = "http://localhost:8080"  # mlx_lm.server (used in gemma or auto+reachable)
-router_model  = "gemma4-27b-moe"         # confirm exact tag from mlx_lm
+router_model  = "gemma-4-31b-bf16"       # the loaded mlx_lm model (serves router + classifier)
 
 [embeddings]
 endpoint = "http://localhost:8081"       # HuggingFace text-embeddings-inference
@@ -1077,12 +1077,12 @@ No session state lives in vault.db. The hook binary is read-only at runtime.
 | Primary interface | Pre-send hook (vault hook) | All routing/retrieval before Claude sees prompt; zero Claude token cost |
 | Hook runtime access | Read-only | No session writes; vault.db only written during explicit index sync |
 | Context tag | Domain-level; `{domain}-context` by convention | Tag signals knowledge domain (software, finance, personal) not individual project; per-project assignment in vault.db, tag meaning authored in ~/.claude/CLAUDE.md |
-| Routing model | Gemma 4 (27B MoE or 31B Dense) via mlx_lm.server | Local, free, handles natural language → structured query signals |
+| Routing model | Gemma 4 31B (bf16) via mlx_lm.server — tag `gemma-4-31b-bf16` | Local, free, handles natural language → structured query signals |
 | Router fallback | Anthropic Haiku via API | `auto` mode falls back when Gemma unreachable; per-call cost ~$0.0002 because the routing prompt is tiny (`cache_control: ephemeral` is set but inert below Haiku's ~4096-token minimum); preserves hook on machines without MLX |
 | Routing strategy | Every send with skip escape hatch | Router decides relevance; short prompts return immediately |
 | Hook timeout | 3 seconds | Silent passthrough on timeout — never block the session |
 | Context injection | Prepend as `<{context_tag}>` block | Tag driven by the project's domain assignment in vault.db (`{domain}-context`), else `defaults.context_tag` |
-| Token estimation | tiktoken cl100k_base | Accurate counts matter at 10k budget ceiling |
+| Token estimation | chars/4 heuristic (`estimate_tokens`) | Cheap, dependency-free; cl100k never matched Claude's tokenizer. Revisit with a real tokenizer if budgeting needs precision |
 | Token budget | 10k initial | Validate and tune via vault diagnose before hardcoding |
 | Alpha (BM25/cosine weight) | 0.6 / 0.4 initial | Validate and tune via vault diagnose before hardcoding |
 | Context block ordering | Score-descending within project grouping | Validate via vault diagnose before hardcoding |
@@ -1105,7 +1105,6 @@ No session state lives in vault.db. The hook binary is read-only at runtime.
 
 | Decision | Status | Notes |
 |----------|--------|-------|
-| Gemma 4 MLX model tag | Unconfirmed | Verify exact mlx_lm model name |
 | Helm chunk strategy | Deferred | Defer to implementation phase |
 | Scala deterministic chunking | Deferred to v1+ | Scalameta (AST, JVM dep) vs accepted file-level granularity |
 
@@ -1126,7 +1125,7 @@ should be checked against that document.
 ## Tracking Items
 
 ```
-[ ] Gemma 4 MLX model tag — confirm exact mlx_lm model name
+[x] Gemma 4 MLX model tag — confirmed: gemma-4-31b-bf16 (mlx_lm.server)
 [ ] TEI install + service — confirm reachable at localhost:8081 with nomic-embed-text-v1.5
     curl http://localhost:8081/embeddings -H "Content-Type: application/json" \
     -d '{"input": "search_document: test"}' | python3 -m json.tool | jq '.data[0].embedding | length'
