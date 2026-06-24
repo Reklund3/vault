@@ -20,10 +20,12 @@ cargo run -- <subcommand>    # e.g. cargo run -- diagnose "what does BuildReques
 
 ## Architecture
 
-Three execution modes from one binary, dispatched by subcommand in `main.rs`:
+Execution modes from one binary, dispatched by subcommand in `main.rs`:
+- **`vault configure`** — first-run setup; provisions `~/.vault/` (0700), seeds a `vault.toml` template **only when absent** (0600), prints the Claude Code hook entry to add, and reports backend readiness. Idempotent. Never edits `~/.claude/settings.json` (print-only); `--force` re-seeds an existing toml.
 - **`vault hook`** — pre-send hook (registered globally in `~/.claude/settings.json`); reads prompt JSON from stdin, emits only the `<{domain}-context>` block to stdout (Claude Code appends it to the prompt)
 - **`vault index sync <repo>`** — explicit manual indexing; the classifier (Gemma local or Haiku fallback) labels files automatically (black box — no confirm/override), chunks written to SQLite
 - **`vault diagnose "<prompt>"`** — full retrieval trace for tuning alpha and token budget
+- **`vault tei start|stop|status|logs`** — manage the local TEI embeddings server
 
 ### Request Flow (hook mode)
 
@@ -95,7 +97,7 @@ Haiku impls set `cache_control: ephemeral` on the system block, but the marker i
 
 ```
 ~/.vault/vault.db      # SQLite store — projects (incl. projects.domain assignment), documents, chunks, FTS5, vec, retrieval_log; documents.content_hash is the classification/re-embed cache
-~/.vault/vault.toml    # context-tag fallback, router/classifier mode, tuning defaults, backend config (hand-authored; vault never writes it)
+~/.vault/vault.toml    # context-tag fallback, router/classifier mode, tuning defaults, backend config (hand-authored; vault writes it only via `vault configure` when absent — never otherwise)
 ~/.vault/hook.log      # hook telemetry — one JSONL record per hook call (outcome, stage, latency, backend); rotated to hook.log.1 at 5MB
 ```
 
@@ -170,12 +172,14 @@ Tune `alpha` via `vault diagnose "<prompt>" --alpha X` after seeding real data; 
 // ~/.claude/settings.json
 {
   "hooks": {
-    "UserPromptSubmit": [{ "command": "/absolute/path/to/vault hook" }]
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "/absolute/path/to/vault hook" } ] }
+    ]
   }
 }
 ```
 
-`UserPromptSubmit` is the event Claude Code fires before sending the user's prompt to the model. Stdout from the hook is **appended** to the prompt context (not a replacement) — that's why `vault hook` emits only the `<vault-context>...</vault-context>` block and never the user's prompt. Exit 0 with empty stdout = silent passthrough. The per-call timeout for this event is 30s.
+`UserPromptSubmit` entries are matcher groups, each holding a nested `hooks` array of `{ "type": "command", "command": ... }` handlers — the flat `[{ "command": ... }]` shorthand does **not** load. `vault configure` prints this exact shape with the absolute path filled in. `UserPromptSubmit` is the event Claude Code fires before sending the user's prompt to the model. Stdout from the hook is **appended** to the prompt context (not a replacement) — that's why `vault hook` emits only the `<vault-context>...</vault-context>` block and never the user's prompt. Exit 0 with empty stdout = silent passthrough. The per-call timeout for this event is 30s.
 
 ## Context Tags
 

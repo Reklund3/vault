@@ -1,4 +1,5 @@
 mod config;
+mod configure;
 mod diagnose;
 mod embed;
 mod hook;
@@ -23,6 +24,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// First-run setup: provision ~/.vault/, seed a vault.toml template (only if
+    /// absent), print the Claude Code hook entry to add, and report readiness.
+    /// Idempotent and safe to re-run.
+    Configure {
+        /// Re-seed ~/.vault/vault.toml from the template even if one exists
+        /// (overwrites a hand-authored file).
+        #[arg(long)]
+        force: bool,
+    },
     /// Test retrieval against the configured DB and print ranked hits with component scores.
     Diagnose(diagnose::Args),
     /// Pre-prompt hook for Claude Code (UserPromptSubmit). Reads JSON on stdin,
@@ -62,6 +72,12 @@ enum IndexCommand {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
+        Command::Configure { force } => {
+            if let Err(e) = configure::run(configure::ConfigureOptions { force }) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         Command::Diagnose(args) => {
             if let Err(e) = diagnose::run(args) {
                 eprintln!("error: {e}");

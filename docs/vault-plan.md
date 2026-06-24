@@ -712,7 +712,10 @@ Single binary, modes dispatched by subcommand:
 vault/                           -- source repository
 ├── Cargo.toml
 └── src/
-    ├── main.rs                  -- subcommand dispatch (hook | index | diagnose | tei)
+    ├── main.rs                  -- subcommand dispatch (configure | hook | index | diagnose | tei)
+    ├── configure/               -- `vault configure`: provision ~/.vault, seed vault.toml, print hook entry, readiness
+    │   ├── mod.rs
+    │   └── vault.toml.template  -- embedded default config (include_str!)
     ├── config.rs                -- vault.toml parsing: Config, ConfigError, default_context_tag,
     │                            --   router/classifier mode + timeout knobs
     ├── types.rs                 -- cross-cutting domain enums: DocType, Language
@@ -830,13 +833,18 @@ in `~/.claude/settings.json` — no per-project installation needed.
 // ~/.claude/settings.json
 {
   "hooks": {
-    "UserPromptSubmit": [{ "command": "/absolute/path/to/vault hook" }]
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "/absolute/path/to/vault hook" } ] }
+    ]
   }
 }
 ```
 
-> **Note:** Confirm exact hook key against Claude Code docs before wiring the binary.
-> Wrong key = silent failure with no context injection and no error.
+> **Note:** Schema confirmed against Claude Code docs (code.claude.com/docs/en/hooks):
+> each `UserPromptSubmit` element is a matcher group with a nested `hooks` array of
+> `{ "type": "command", "command": ... }` handlers. The flat `[{ "command": ... }]`
+> shorthand does **not** load — silent failure, no context injection, no error.
+> `vault configure` emits this exact shape with the absolute path filled in.
 
 `vault.toml` holds vault-wide defaults, the context-tag fallback, and backend
 config. It is **read-only** from vault's perspective — hand-authored, never written.
@@ -929,6 +937,11 @@ tag decision; a *brand-new* domain needs a matching `## {domain}-context` sectio
 ## CLI
 
 ```bash
+# First-run setup — provision ~/.vault/, seed vault.toml (only if absent), print the
+# settings.json hook entry to add, and report backend readiness. Idempotent; print-only
+# (never edits settings.json). --force re-seeds an existing vault.toml.
+vault configure [--force]
+
 # Hook — invoked by Claude Code automatically, not run manually
 # Register once in ~/.claude/settings.json (see Global Config)
 # vault hook reads prompt JSON from stdin, writes only the context block to stdout (Claude Code appends it)
