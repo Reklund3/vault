@@ -1,0 +1,35 @@
+# vault.toml — hand-authored config for the vault binary.
+# Seeded by `vault configure` when absent; edit freely. vault only writes this
+# file when it does not already exist (or with `vault configure --force`).
+
+[defaults]
+context_tag  = "vault-context"   # fallback tag if a project has no domain assignment
+token_budget = 10000             # max tokens of context injected per prompt
+alpha        = 0.6               # BM25/cosine weight — 0.0 = pure semantic, 1.0 = pure keyword
+min_score    = 0.15              # drop hits scoring below this
+
+[router]
+mode    = "auto"                 # "auto" | "gemma" | "haiku"
+model   = "haiku"                # alias — vault resolves to the current latest Haiku
+timeout = 3                      # hot-path seconds before silent passthrough; raise for a slow local model
+
+[classifier]
+mode    = "auto"                 # same selection rules as [router]
+model   = "haiku"
+timeout = 300                    # sync time, not hot path; large local models can need 30–90s/call
+
+[mlx]
+endpoint     = "http://localhost:8080"   # mlx_lm.server (used in gemma or auto+reachable)
+router_model = "REPLACE_ME"              # your mlx_lm model name or path, e.g. "gemma-4-31b-bf16"
+
+[embeddings]
+endpoint = "http://localhost:8081"       # HuggingFace text-embeddings-inference (TEI)
+model    = "nomic-ai/nomic-embed-text-v1.5"
+dims     = 768                           # locked at schema creation — chunks_vec FLOAT[768]
+
+[indexer.exclude]
+# Appended to the built-in defaults (.env*, *.pem, .ssh/**, .aws/**,
+# node_modules/**, target/**, .git/**, …), which cannot be removed in v1.
+patterns = [
+  # project-specific extra globs go here
+]

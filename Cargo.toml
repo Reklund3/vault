@@ -4,3 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+sqlite-vec = "0.1.9"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+toml = "1.1.2+spec-1.1.0"
+thiserror = "2.0.18"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+globset = "0.4"
+walkdir = "2"
+regex = "1"
+yaml-rust2 = "0.10"
