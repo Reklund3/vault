@@ -134,7 +134,7 @@ pub fn run_sync(opts: SyncOptions, config: &Config) -> Result<SyncReport, SyncEr
     // defaults.context_tag). Assignment lives in vault.db; the context tag is
     // derived by convention as `{domain}-context`, never stored.
     let domain = match store
-        .resolve_domain(&[project_name.clone()])
+        .resolve_domain(std::slice::from_ref(&project_name))
         .map_err(SyncError::Store)?
     {
         Some(existing) => Some(existing),
