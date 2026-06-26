@@ -226,6 +226,11 @@ mod tests {
         let cfg: Config = toml::from_str(VAULT_TOML_TEMPLATE).expect("template parses");
         assert_eq!(cfg.token_budget(), 10000);
         assert_eq!(cfg.router_timeout(), std::time::Duration::from_secs(3));
+        // The seeded template defaults to the local-first Haiku fallback so a
+        // fresh install behaves exactly as before the openai backend existed;
+        // the openai fields are commented out until the user opts in.
+        assert_eq!(cfg.router_remote(), "haiku");
+        assert_eq!(cfg.classifier_remote(), "haiku");
     }
 
     #[test]

@@ -122,18 +122,25 @@ Defenses, in order of importance:
 
 ## Secrets and credentials
 
-- `ANTHROPIC_API_KEY` is read from the **environment only**. Never from
-  `vault.toml`, never from any file on disk that vault writes. If `mode =
-  "haiku"` (or `auto` with Gemma unreachable) and the key is missing,
-  `vault hook` honors the fail-open contract: router construction returns
-  `MissingApiKey`, the hook treats it as any other failure — empty stdout,
-  **exit 0** — and Claude Code sees no error and never blocks. The miss is
-  still observable locally: a metadata-only record in `~/.vault/hook.log` plus
-  a one-line stderr breadcrumb (which Claude Code shows only in debug mode).
-  The missing key surfaces *loudly* where it should — in the interactive
-  `vault diagnose` and `vault index sync` commands, which build the same
-  Haiku backend off the fail-open hot path and report the error directly.
-- Vault never logs, echoes, or includes the key in `vault diagnose` output.
+- **Provider API keys are read from the environment only** — `ANTHROPIC_API_KEY`
+  for the Haiku backend, and for the OpenAI-compatible backend the variable
+  *named* by `[router]/[classifier].api_key_env` (default `GEMINI_API_KEY`).
+  `vault.toml` may carry that variable's **name** but never the key itself, and
+  vault never reads a key from `vault.toml` or any file it writes. If the
+  configured backend's key is missing (`mode = "haiku"`/`"openai"`, or `auto`
+  with Gemma unreachable falling back to that `remote`), `vault hook` honors the
+  fail-open contract: backend construction returns `MissingApiKey { env_var }`,
+  the hook treats it as any other failure — empty stdout, **exit 0** — and Claude
+  Code sees no error and never blocks. The miss is still observable locally: a
+  metadata-only record in `~/.vault/hook.log` plus a one-line stderr breadcrumb
+  (which Claude Code shows only in debug mode). The missing key surfaces *loudly*
+  where it should — in the interactive `vault diagnose` and `vault index sync`
+  commands, which build the same remote backend off the fail-open hot path and
+  report the error directly.
+- Vault never logs, echoes, or includes the key in `vault diagnose` output. The
+  remote backend structs (`HaikuRouter`, `OpenAiCompatRouter`, and the classifier
+  equivalents) intentionally do not derive `Debug` so a key can't leak through a
+  debug print.
 - `vault.toml` may contain repo paths and domain assignments but no secrets.
 - **When vault spawns a child process** (the `vault tei start` launcher for
   TEI — implemented in `src/tei/launcher.rs`), the spawn calls `env_clear()`

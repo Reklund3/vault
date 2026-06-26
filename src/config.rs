@@ -39,6 +39,21 @@ struct Router {
     /// HTTP timeout in seconds for one router call. Hot path — defaults to 3;
     /// raise it in `vault.toml` for a slow local model that can't meet that.
     timeout: u32,
+    /// Which remote backend `auto` falls back to when the local mlx server is
+    /// unreachable: `"haiku"` (default, back-compat) or `"openai"` (the generic
+    /// OpenAI-compatible backend below — e.g. Gemini via a static key).
+    remote: String,
+    /// OpenAI-compatible chat-completions base URL for the `openai` backend.
+    /// Defaults to the AI Studio Gemini endpoint. Set to
+    /// `https://aiplatform.googleapis.com/v1` for Vertex express.
+    base_url: String,
+    /// Name of the environment variable holding the API key for the `openai`
+    /// backend. The key itself is NEVER stored here — only the var name. Read at
+    /// construction via `std::env::var`.
+    api_key_env: String,
+    /// Auth header style for the `openai` backend: `"bearer"` (AI Studio Gemini)
+    /// or `"x-goog-api-key"` (Vertex express).
+    auth_header: String,
 }
 
 impl Default for Router {
@@ -47,6 +62,10 @@ impl Default for Router {
             mode: "auto".to_string(),
             model: "haiku".to_string(),
             timeout: 3,
+            remote: "haiku".to_string(),
+            base_url: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
+            api_key_env: "GEMINI_API_KEY".to_string(),
+            auth_header: "bearer".to_string(),
         }
     }
 }
@@ -60,6 +79,16 @@ struct Classifier {
     /// so generous is fine — large local models (e.g. Gemma 4 31b bf16) can need
     /// 30–90s per call once warm. Defaults to 300.
     timeout: u32,
+    /// Remote fallback for `auto`: `"haiku"` (default) or `"openai"`. Mirrors
+    /// `[router].remote`.
+    remote: String,
+    /// OpenAI-compatible base URL for the `openai` backend. See `[router].base_url`.
+    base_url: String,
+    /// Name of the env var holding the `openai` backend's API key (var name only,
+    /// never the key). See `[router].api_key_env`.
+    api_key_env: String,
+    /// Auth header style for the `openai` backend: `"bearer"` or `"x-goog-api-key"`.
+    auth_header: String,
 }
 
 impl Default for Classifier {
@@ -68,6 +97,10 @@ impl Default for Classifier {
             mode: "auto".to_string(),
             model: "haiku".to_string(),
             timeout: 300,
+            remote: "haiku".to_string(),
+            base_url: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
+            api_key_env: "GEMINI_API_KEY".to_string(),
+            auth_header: "bearer".to_string(),
         }
     }
 }
@@ -180,6 +213,22 @@ impl Config {
         Duration::from_secs(self.classifier.timeout as u64)
     }
 
+    pub fn classifier_remote(&self) -> &str {
+        &self.classifier.remote
+    }
+
+    pub fn classifier_base_url(&self) -> &str {
+        &self.classifier.base_url
+    }
+
+    pub fn classifier_api_key_env(&self) -> &str {
+        &self.classifier.api_key_env
+    }
+
+    pub fn classifier_auth_header(&self) -> &str {
+        &self.classifier.auth_header
+    }
+
     pub fn router_mode(&self) -> &str {
         &self.router.mode
     }
@@ -190,6 +239,22 @@ impl Config {
 
     pub fn router_timeout(&self) -> Duration {
         Duration::from_secs(self.router.timeout as u64)
+    }
+
+    pub fn router_remote(&self) -> &str {
+        &self.router.remote
+    }
+
+    pub fn router_base_url(&self) -> &str {
+        &self.router.base_url
+    }
+
+    pub fn router_api_key_env(&self) -> &str {
+        &self.router.api_key_env
+    }
+
+    pub fn router_auth_header(&self) -> &str {
+        &self.router.auth_header
     }
 
     pub fn mlx_endpoint(&self) -> &str {
@@ -382,6 +447,85 @@ dims = 768
         let cfg: Config = toml::from_str(toml_text).expect("parse");
         assert_eq!(cfg.router_timeout(), Duration::from_secs(3));
         assert_eq!(cfg.classifier_timeout(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn openai_backend_fields_default_when_omitted() {
+        // Existing vault.toml files predate the openai backend; omitting the new
+        // fields must yield the back-compat defaults (remote=haiku) so behavior
+        // is unchanged.
+        let toml_text = r#"
+[defaults]
+context_tag = "vault-context"
+token_budget = 10000
+alpha = 0.6
+min_score = 0.15
+
+[router]
+mode = "auto"
+model = "haiku"
+
+[classifier]
+mode = "auto"
+model = "haiku"
+
+[mlx]
+endpoint = "http://localhost:8080"
+router_model = "test"
+
+[embeddings]
+endpoint = "http://localhost:8081"
+model = "nomic-ai/nomic-embed-text-v1.5"
+dims = 768
+"#;
+        let cfg: Config = toml::from_str(toml_text).expect("parse");
+        assert_eq!(cfg.router_remote(), "haiku");
+        assert_eq!(cfg.router_auth_header(), "bearer");
+        assert_eq!(cfg.router_api_key_env(), "GEMINI_API_KEY");
+        assert_eq!(
+            cfg.router_base_url(),
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        );
+        assert_eq!(cfg.classifier_remote(), "haiku");
+    }
+
+    #[test]
+    fn openai_backend_fields_parse_from_toml() {
+        let toml_text = r#"
+[defaults]
+context_tag = "vault-context"
+token_budget = 10000
+alpha = 0.6
+min_score = 0.15
+
+[router]
+mode = "auto"
+model = "gemini-3.5-flash"
+remote = "openai"
+base_url = "https://aiplatform.googleapis.com/v1"
+api_key_env = "VERTEX_API_KEY"
+auth_header = "x-goog-api-key"
+
+[classifier]
+mode = "auto"
+model = "gemini-3.5-flash"
+remote = "openai"
+
+[mlx]
+endpoint = "http://localhost:8080"
+router_model = "test"
+
+[embeddings]
+endpoint = "http://localhost:8081"
+model = "nomic-ai/nomic-embed-text-v1.5"
+dims = 768
+"#;
+        let cfg: Config = toml::from_str(toml_text).expect("parse");
+        assert_eq!(cfg.router_remote(), "openai");
+        assert_eq!(cfg.router_base_url(), "https://aiplatform.googleapis.com/v1");
+        assert_eq!(cfg.router_api_key_env(), "VERTEX_API_KEY");
+        assert_eq!(cfg.router_auth_header(), "x-goog-api-key");
+        assert_eq!(cfg.classifier_remote(), "openai");
     }
 
     #[test]

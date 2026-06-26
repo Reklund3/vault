@@ -51,15 +51,17 @@ The router returns `{ skip: true }` for prompts that need no context — immedia
 | `src/store/sqlite_store.rs` | the live (SQLite-only) backend — upsert + sync-time prune (file/document/chunk diff, reconciles deletions every sync) **and** FTS5 + sqlite-vec hybrid retrieval, score merge, budget trim |
 | `src/store/postgresql_store.rs` | `PostgresStore` — `todo!()` placeholder for a future distributed backend (pgvector/tsvector); declared but not exported, not wired up |
 | `src/store/types.rs` | shared store types: `Document`, `Chunk`, `Hit`, `RetrievalLogEntry` |
-| `src/retrieve/router/mod.rs` | Router trait + auto/gemma/haiku mode selection |
+| `src/retrieve/router/mod.rs` | Router trait + auto/gemma/haiku/openai mode selection (auto's remote fallback set by `[router].remote`) |
 | `src/retrieve/router/gemma.rs` | Local Gemma impl (mlx_lm.server HTTP) |
 | `src/retrieve/router/haiku.rs` | Anthropic Haiku impl (sets `cache_control`; inert at current prompt size) |
+| `src/retrieve/router/openai_compat.rs` | Generic OpenAI-compatible impl (Gemini AI Studio / Vertex express / any `/chat/completions`); static key from `api_key_env`, Bearer or `x-goog-api-key` auth |
 | `src/retrieve/hybrid.rs` | BM25 + cosine score merge |
 | `src/retrieve/budget.rs` | token-aware chunk selection |
 | `src/parse/` | per-language parsers (proto, go, rust, openapi, markdown); `select_parser` dispatches on `(doc_type, language)` — `plan` and unrecognized types fall back to a single whole-file chunk |
-| `src/index/classify/mod.rs` | Classifier trait + auto/gemma/haiku selection |
+| `src/index/classify/mod.rs` | Classifier trait + auto/gemma/haiku/openai selection (mirrors the router) |
 | `src/index/classify/gemma.rs` | Local Gemma classifier |
 | `src/index/classify/haiku.rs` | Anthropic Haiku classifier (cost prompt on first use) |
+| `src/index/classify/openai_compat.rs` | Generic OpenAI-compatible classifier (mirrors `router/openai_compat.rs`; generic billing-confirm prompt) |
 | `src/index/walk.rs` | repo walker — globset exclusions, symlink refusal, canonical-root bound (enforces the indexer security rules) |
 | `src/index/sync.rs` | `vault index sync` pipeline — classify → parse (whole-file fallback) → embed → upsert; `SyncReport` |
 | `src/index/secrets.rs` | index-time secret pre-scan (`RegexSet`) — drops chunks matching AWS/GitHub/Anthropic/OpenAI/JWT/PEM patterns before storage |
@@ -76,22 +78,30 @@ Both the runtime router (hook mode) and the index-time classifier follow the sam
 
 ```toml
 [router]
-mode  = "auto"      # "auto" | "gemma" | "haiku"
+mode  = "auto"      # "auto" | "gemma" | "haiku" | "openai" (alias "gemini")
 model = "haiku"     # alias — vault resolves to the current latest Haiku model
+remote = "haiku"    # which backend `auto` falls back to: "haiku" (default) | "openai"
+
+# Only consulted by the openai backend (mode/remote = "openai"):
+base_url    = "https://generativelanguage.googleapis.com/v1beta/openai"  # AI Studio Gemini
+api_key_env = "GEMINI_API_KEY"   # name of the env var holding the key (never the key itself)
+auth_header = "bearer"           # "bearer" (AI Studio) | "x-goog-api-key" (Vertex express)
 
 [classifier]
 mode  = "auto"
 model = "haiku"
 timeout = 300        # in seconds; optional, defaults to 300
+# remote / base_url / api_key_env / auth_header mirror [router].
 ```
 
-- **`auto`** (default) — probe `localhost:8080` once at startup with a 200ms timeout. If reachable, use Gemma; otherwise fall back to Haiku. Decision is cached for the process lifetime; no per-call probing.
+- **`auto`** (default) — probe `localhost:8080` once at startup with a 200ms timeout. If reachable, use Gemma; otherwise fall back to `remote` (`haiku` by default, `openai` if set). Decision is cached for the process lifetime; no per-call probing. Local Gemma stays primary so the zero-token-cost guarantee holds whenever it's up.
 - **`gemma`** — force local Gemma. Silent passthrough if unavailable (preserves the zero-token-cost guarantee).
 - **`haiku`** — force remote Haiku. Requires `ANTHROPIC_API_KEY`.
+- **`openai`** (alias **`gemini`**) — force the generic OpenAI-compatible backend (Google AI Studio Gemini, Vertex express, or any `/chat/completions` provider). Requires the key in `api_key_env` (default `GEMINI_API_KEY`); `model` is sent verbatim (set it to e.g. `gemini-3.5-flash`, not the `haiku` alias). For Vertex express set `base_url = "https://aiplatform.googleapis.com/v1"` and `auth_header = "x-goog-api-key"`. This is the recommended remote now that Anthropic endpoints are locked down.
 
 Haiku impls set `cache_control: ephemeral` on the system block, but the marker is **inert today**: prompt caching only engages once the cached prefix reaches Haiku's ~4096-token minimum, and `ROUTER_SYSTEM` (schema + instruction) is only a few hundred tokens — so no cache entry is ever created (`cache_creation_input_tokens: 0`, no error). Per-call cost is ~$0.0002 because the prompt is *tiny*, not because caching is working. The marker is forward-looking: if the system block ever grows past ~4096 tokens (e.g. added few-shot examples), caching kicks in and the byte-identical-between-backends requirement on `ROUTER_SYSTEM` starts mattering.
 
-`vault index sync` shows a one-time cost estimate the first time a session falls back to Haiku for classification — e.g. *"Gemma not detected. Use Haiku for classification? Estimated cost: ~$0.03 for 200 files. [y/N]"*.
+`vault index sync` shows a one-time cost prompt the first time a session falls back to a remote backend for classification. Haiku quotes an estimate (e.g. *"Gemma not detected. Use Haiku for classification? Estimated cost: ~$0.03 for 200 files. [y/N]"*); the openai backend confirms generically without a figure (no pricing table) — *"Gemma not detected. Use the configured remote API (openai) for classification? N files — provider billing applies. [y/N]"*.
 
 ### Runtime data
 
@@ -191,7 +201,7 @@ Vault is on the hot path of every Claude Code prompt. Full design constraints, t
 
 - **Indexed content is untrusted data, not instructions.** The global `~/.claude/CLAUDE.md` framing handles this for Claude; vault never sanitizes chunk text. Don't change that without revisiting the trust model.
 - **SQL parameter binding everywhere.** Router output (`projects`, `type_names`, `topics`, `doc_types`, `languages`) is untrusted-shaped — bind it via rusqlite's named/positional params. Never `format!` into SQL.
-- **`ANTHROPIC_API_KEY` is environment-only.** Never read it from `vault.toml` or any file vault writes. Never log or echo it; redact in `vault diagnose`.
+- **Provider API keys are environment-only.** This covers `ANTHROPIC_API_KEY` and the openai backend's key (named by `[router]/[classifier].api_key_env`, e.g. `GEMINI_API_KEY`). `vault.toml` stores only the env-var *name*, never the secret. Never read a key from `vault.toml` or any file vault writes; never log or echo it; redact in `vault diagnose`. The remote router/classifier structs don't derive `Debug` so a key can't leak through a debug print.
 - **Loopback only.** Vault talks to `127.0.0.1:8080` (mlx_lm.server) and `127.0.0.1:8081` (TEI). Treating localhost as authoritative is a documented assumption, not a guarantee.
 - **`~/.vault/` is `0700`, files inside `0600`.** Indexed content is plaintext and may be proprietary.
 - **Indexer never follows symlinks** and is bounded to the canonical repo root. Default exclusion list (`.env`, `*.pem`, `.ssh/**`, etc.) is non-removable in v1.

@@ -217,6 +217,7 @@ fn backend_label(b: ResolvedBackend) -> &'static str {
     match b {
         ResolvedBackend::Gemma => "Gemma",
         ResolvedBackend::Haiku => "Haiku",
+        ResolvedBackend::OpenAiCompat => "OpenAI-compatible",
     }
 }
 

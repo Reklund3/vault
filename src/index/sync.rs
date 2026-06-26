@@ -52,8 +52,8 @@ pub struct SyncReport {
 pub enum SyncError {
     #[error("project name collision for {name:?}: {message}")]
     ProjectNameCollision { name: String, message: String },
-    #[error("declined Haiku cost — sync aborted")]
-    DeclinedHaikuCost,
+    #[error("declined remote classification cost — sync aborted")]
+    DeclinedRemoteCost,
     #[error(
         "TEI embeddings server unreachable ({0}).\n\
          Start it with `vault tei start` (or check `vault tei status`), then re-run sync."
@@ -109,8 +109,18 @@ pub fn run_sync(opts: SyncOptions, config: &Config) -> Result<SyncReport, SyncEr
 
     let mode = config.classifier_mode();
     let backend = resolve_backend(config);
-    if mode == "auto" && backend == ResolvedBackend::Haiku && !walked.is_empty() {
-        prompt_for_haiku_cost(walked.len(), std::io::stdin().lock(), std::io::stderr())?;
+    if mode == "auto" && !walked.is_empty() {
+        match backend {
+            ResolvedBackend::Haiku => {
+                prompt_for_haiku_cost(walked.len(), std::io::stdin().lock(), std::io::stderr())?;
+            }
+            // The OpenAI-compatible backend bills per provider; we don't carry a
+            // pricing table, so confirm generically rather than quote a figure.
+            ResolvedBackend::OpenAiCompat => {
+                prompt_for_remote_cost(walked.len(), std::io::stdin().lock(), std::io::stderr())?;
+            }
+            ResolvedBackend::Gemma => {}
+        }
     }
 
     let classifier = build_classifier(config).map_err(SyncError::BuildClassifier)?;
@@ -553,7 +563,32 @@ fn prompt_for_haiku_cost<R: BufRead, W: Write>(
     if read > 0 && (trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes")) {
         Ok(())
     } else {
-        Err(SyncError::DeclinedHaikuCost)
+        Err(SyncError::DeclinedRemoteCost)
+    }
+}
+
+/// Confirmation for the OpenAI-compatible remote classifier on auto→remote
+/// fallback. No dollar figure (provider pricing varies and isn't tabled here);
+/// the user confirms that paid remote calls are acceptable. Same fail-closed
+/// EOF semantics as `prompt_for_haiku_cost`.
+fn prompt_for_remote_cost<R: BufRead, W: Write>(
+    file_count: usize,
+    mut stdin: R,
+    mut stderr: W,
+) -> Result<(), SyncError> {
+    let _ = writeln!(
+        stderr,
+        "Gemma not detected. Use the configured remote API (openai) for classification? \
+         {file_count} files — provider billing applies. [y/N] "
+    );
+    let _ = stderr.flush();
+    let mut line = String::new();
+    let read = stdin.read_line(&mut line).map_err(SyncError::Io)?;
+    let trimmed = line.trim();
+    if read > 0 && (trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes")) {
+        Ok(())
+    } else {
+        Err(SyncError::DeclinedRemoteCost)
     }
 }
 
@@ -1103,7 +1138,7 @@ mod tests {
         let input: &[u8] = b"";
         let mut err = Vec::new();
         let r = prompt_for_haiku_cost(10, input, &mut err);
-        assert!(matches!(r, Err(SyncError::DeclinedHaikuCost)));
+        assert!(matches!(r, Err(SyncError::DeclinedRemoteCost)));
     }
 
     #[test]
@@ -1111,7 +1146,18 @@ mod tests {
         let input = b"n\n".to_vec();
         let mut err = Vec::new();
         let r = prompt_for_haiku_cost(10, &input[..], &mut err);
-        assert!(matches!(r, Err(SyncError::DeclinedHaikuCost)));
+        assert!(matches!(r, Err(SyncError::DeclinedRemoteCost)));
+    }
+
+    #[test]
+    fn remote_cost_prompt_accepts_y_and_declines_eof() {
+        let mut err = Vec::new();
+        prompt_for_remote_cost(5, &b"y\n"[..], &mut err).expect("y accepted");
+
+        let empty: &[u8] = b"";
+        let mut err2 = Vec::new();
+        let r = prompt_for_remote_cost(5, empty, &mut err2);
+        assert!(matches!(r, Err(SyncError::DeclinedRemoteCost)));
     }
 
     #[test]
