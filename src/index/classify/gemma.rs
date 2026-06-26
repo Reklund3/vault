@@ -10,9 +10,9 @@ use crate::index::classify::{
     parse_response,
 };
 
-/// A valid JSON reply is ~30 tokens, but Gemma 4 (and other thinking models)
-/// burn hundreds of tokens on internal reasoning before emitting the answer.
-/// 1024 gives the model room to think and still leave space for the JSON.
+/// A valid JSON reply is ~30 tokens. With thinking disabled (see
+/// `ChatRequest::chat_template_kwargs`) the model no longer burns hundreds of
+/// tokens reasoning first, so 1024 is generous headroom, not a think budget.
 const MAX_TOKENS: u32 = 1024;
 
 pub(crate) struct GemmaClassifier {
@@ -51,6 +51,9 @@ impl Classifier for GemmaClassifier {
             model: &self.model,
             temperature: 0.0,
             max_tokens: MAX_TOKENS,
+            chat_template_kwargs: ChatTemplateKwargs {
+                enable_thinking: false,
+            },
             messages: vec![
                 ChatMessage {
                     role: "system",
@@ -113,6 +116,18 @@ struct ChatRequest<'a> {
     messages: Vec<ChatMessage<'a>>,
     temperature: f32,
     max_tokens: u32,
+    /// mlx_lm.server forwards this to the tokenizer's `apply_chat_template`.
+    /// Gemma 4 auto-enables a thinking template; turning it off cuts per-file
+    /// classify latency ~7x since we only need the structured JSON, never the
+    /// chain-of-thought. NOTE: `chat_template_kwargs` is mlx/vLLM specific,
+    /// **not** standard OpenAI — when this client generalizes to OpenAI/Gemini
+    /// (issue #2) this field must not be sent blindly.
+    chat_template_kwargs: ChatTemplateKwargs,
+}
+
+#[derive(Serialize)]
+struct ChatTemplateKwargs {
+    enable_thinking: bool,
 }
 
 #[derive(Serialize)]

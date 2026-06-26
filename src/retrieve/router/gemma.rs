@@ -13,10 +13,9 @@ use crate::retrieve::router::{
 // Timeout is configurable via [router].timeout (default 3s per CLAUDE.md).
 // The hook caller silences failures (passthrough), so the router's only job is
 // to fail inside whatever budget the user configured.
-/// Five small arrays + the skip shortcut would fit in ~256 tokens, but Gemma 4
-/// (and other thinking models) burn hundreds of tokens on internal reasoning
-/// before emitting the answer. 1024 gives room to think and still leave space
-/// for the JSON. The 3s hard cap remains the binding constraint on this path.
+/// The reply is a handful of small arrays (or the skip shortcut) — ~40 tokens
+/// with thinking disabled (see `ChatRequest::chat_template_kwargs`). 1024 is
+/// generous headroom; it does not need to accommodate chain-of-thought anymore.
 const MAX_TOKENS: u32 = 1024;
 
 pub(crate) struct GemmaRouter {
@@ -59,6 +58,9 @@ impl Router for GemmaRouter {
             model: &self.model,
             temperature: 0.0,
             max_tokens: MAX_TOKENS,
+            chat_template_kwargs: ChatTemplateKwargs {
+                enable_thinking: false,
+            },
             messages: vec![
                 ChatMessage {
                     role: "system",
@@ -121,6 +123,18 @@ struct ChatRequest<'a> {
     messages: Vec<ChatMessage<'a>>,
     temperature: f32,
     max_tokens: u32,
+    /// mlx_lm.server forwards this to the tokenizer's `apply_chat_template`.
+    /// Gemma 4 auto-enables a thinking template; turning it off cuts router
+    /// latency ~7x (51s→7s observed) since we only need the structured JSON,
+    /// never the chain-of-thought. NOTE: `chat_template_kwargs` is mlx/vLLM
+    /// specific, **not** standard OpenAI — when this client generalizes to
+    /// OpenAI/Gemini (issue #2) this field must not be sent blindly.
+    chat_template_kwargs: ChatTemplateKwargs,
+}
+
+#[derive(Serialize)]
+struct ChatTemplateKwargs {
+    enable_thinking: bool,
 }
 
 #[derive(Serialize)]
