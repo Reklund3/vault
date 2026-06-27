@@ -379,14 +379,19 @@ fn process_file(
         }
     }
 
-    // If every chunk tripped the secret scan there's nothing useful to store —
-    // a chunkless document row is harmless (never retrievable) but noise. Record
-    // the skip so the report still reflects what happened.
+    // Nothing to store. Two distinct causes, reported distinctly so the user can
+    // tell them apart: either the parser produced no chunks at all (the file
+    // isn't being parsed into anything indexable — e.g. a binary entrypoint with
+    // no exported symbols, or a re-export module), or it produced chunks that
+    // were all dropped by the secret scan. Conflating these as "secrets" hides
+    // files that silently contribute nothing to the index.
     if chunks_with_emb.is_empty() {
-        report.files_skipped.push((
-            w.relative_path.clone(),
-            "all chunks dropped as secrets".to_string(),
-        ));
+        let reason = if before == 0 {
+            "produced no chunks — nothing indexable parsed".to_string()
+        } else {
+            "all chunks dropped as secrets".to_string()
+        };
+        report.files_skipped.push((w.relative_path.clone(), reason));
         return Ok(());
     }
 
@@ -967,6 +972,48 @@ mod tests {
         // recorded in files_skipped instead of leaving a chunkless doc row.
         assert!(store.upserts.borrow().is_empty());
         assert_eq!(report.files_skipped.len(), 1);
+        assert_eq!(
+            report.files_skipped[0].1, "all chunks dropped as secrets",
+            "a real secret drop keeps the secret reason"
+        );
+    }
+
+    // 5b. Parser produces zero chunks: reported as unparsed, not as a secret drop,
+    // so the user can spot files that silently contribute nothing to the index.
+    #[test]
+    fn file_with_no_indexable_chunks_is_reported_as_unparsed() {
+        let tmp = Tmp::new("no-chunks");
+        // .rs with no exported (pub) symbols → rust parser yields zero chunks.
+        tmp.write("empty.rs", b"// only a comment, no exported symbols\n");
+        let canonical = tmp.canonical();
+
+        let config = Config::default();
+        let mut store = StubStore::new();
+        let embedder = StubEmbedder::from_config(&config);
+        let classifier = ExtClassifier;
+
+        let walked = walk_repo(&canonical, &WalkOptions::default()).unwrap();
+        let report = sync_with(
+            1,
+            "p".to_string(),
+            &walked,
+            &mut store,
+            &embedder,
+            &classifier,
+        )
+        .unwrap();
+
+        assert!(store.upserts.borrow().is_empty());
+        assert_eq!(
+            report.chunks_dropped_secret, 0,
+            "no secret was involved — must not be attributed to the secret scan"
+        );
+        assert_eq!(report.files_skipped.len(), 1);
+        assert_eq!(report.files_skipped[0].0, "empty.rs");
+        assert_eq!(
+            report.files_skipped[0].1,
+            "produced no chunks — nothing indexable parsed"
+        );
     }
 
     // 6. Dry-run: stubs / classifier / embedder never touched; correct counters.
