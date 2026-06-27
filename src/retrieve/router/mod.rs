@@ -50,7 +50,9 @@ Respond with JSON only, no other text.
 
 Schema:
 {
-  projects:   [],   // project or service names mentioned or implied
+  projects:   [],   // EXACT indexed project/service/repo names only (e.g. "vault",
+                    // "build-service"). Omit unless the prompt names a real project;
+                    // never invent one from a descriptive phrase like "the vault router".
   type_names: [],   // specific named types: proto messages, Go types, API schemas,
                     // account categories, report names, or any named entity
   topics:     [],   // conceptual topics: auth, events, tax, invoicing, grpc, helm, etc
