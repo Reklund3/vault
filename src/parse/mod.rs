@@ -82,6 +82,102 @@ pub fn select_parser(
     }
 }
 
+/// Token ceiling for a single fallback chunk. Whole-file fallback (`plan` docs
+/// and any file no structural parser claims) is split into windows no larger
+/// than this so a big file can't blow past the embedder's input limit and abort
+/// the whole document (the failure mode behind finding 5B). Kept well under
+/// nomic-embed-text-v1.5's 8192-token context — the char/4 `estimate_tokens`
+/// underestimates dense code, so the margin absorbs that slack — and small
+/// enough to keep retrieval granularity reasonable.
+pub(crate) const MAX_FALLBACK_CHUNK_TOKENS: u32 = 1500;
+
+/// Split whole-file fallback content into ordered, embeddable windows.
+///
+/// Returns `(chunks, oversize_lines_truncated)`. Behavior:
+/// - Content already under [`MAX_FALLBACK_CHUNK_TOKENS`] yields exactly one
+///   chunk labeled `filename` at `chunk_index` 0 — byte-identical to the prior
+///   single-chunk fallback, so small files are unaffected.
+/// - Larger content is greedily packed by whole lines (terminators preserved
+///   via `split_inclusive`, so concatenating the chunks reproduces the source)
+///   until the next line would exceed the ceiling, then a new window starts.
+/// - A single line longer than the ceiling (minified JSON/JS, a one-line log,
+///   a base64 blob) can't be line-packed. It's **truncated** to the ceiling,
+///   not char-split into many windows: truncation keeps the head intact for the
+///   downstream per-chunk secret scan and never stores the tail, so a secret
+///   can't be bisected across two windows where neither half trips the scan.
+///   The lost tail is a single dense blob with near-zero retrieval value; each
+///   such line is counted so the sync report can surface it.
+///
+/// Labels are disambiguated (`filename`, `filename#2`, …) to satisfy
+/// `UNIQUE(document_id, label)` — the structural parsers do this inside
+/// `parse()`, but the fallback path never ran a parser, so it must do it here.
+pub(crate) fn whole_file_chunks(
+    content: &str,
+    language: Language,
+    filename: &str,
+) -> (Vec<Chunk>, usize) {
+    let make = |body: &str, idx: u32| Chunk {
+        language,
+        label: filename.to_string(),
+        content: body.to_string(),
+        content_hash: sha256_hex(body.as_bytes()),
+        token_est: estimate_tokens(body),
+        chunk_index: idx,
+    };
+
+    // Fast path: fits in one chunk → identical to the historical fallback.
+    if estimate_tokens(content) <= MAX_FALLBACK_CHUNK_TOKENS {
+        return (vec![make(content, 0)], 0);
+    }
+
+    let max_chars = MAX_FALLBACK_CHUNK_TOKENS as usize * 4;
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut window = String::new();
+    let mut window_chars = 0usize;
+    let mut idx: u32 = 0;
+    let mut truncated_lines = 0usize;
+
+    let flush =
+        |window: &mut String, window_chars: &mut usize, idx: &mut u32, chunks: &mut Vec<Chunk>| {
+            if !window.is_empty() {
+                chunks.push(make(window, *idx));
+                *idx += 1;
+                window.clear();
+                *window_chars = 0;
+            }
+        };
+
+    for line in content.split_inclusive('\n') {
+        let line_chars = line.chars().count();
+
+        // Pathological single line over the ceiling: flush what we have, then
+        // emit the truncated head as its own chunk. char_indices keeps the cut
+        // on a UTF-8 boundary.
+        if line_chars > max_chars {
+            flush(&mut window, &mut window_chars, &mut idx, &mut chunks);
+            let head = match line.char_indices().nth(max_chars) {
+                Some((byte_idx, _)) => &line[..byte_idx],
+                None => line,
+            };
+            chunks.push(make(head, idx));
+            idx += 1;
+            truncated_lines += 1;
+            continue;
+        }
+
+        // Adding this line would overflow the current window → seal it first.
+        if window_chars > 0 && window_chars + line_chars > max_chars {
+            flush(&mut window, &mut window_chars, &mut idx, &mut chunks);
+        }
+        window.push_str(line);
+        window_chars += line_chars;
+    }
+    flush(&mut window, &mut window_chars, &mut idx, &mut chunks);
+
+    disambiguate_labels(&mut chunks);
+    (chunks, truncated_lines)
+}
+
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(digest.len() * 2);
@@ -181,6 +277,67 @@ mod tests {
                 .language(),
             Language::Rust
         );
+    }
+
+    #[test]
+    fn small_file_is_one_whole_chunk() {
+        // Under the ceiling → identical to the historical single-chunk fallback:
+        // one chunk, bare filename label, chunk_index 0, hash of the full body.
+        let body = "fn main() {}\n";
+        let (chunks, truncated) = whole_file_chunks(body, Language::Rust, "main.rs");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(truncated, 0);
+        assert_eq!(chunks[0].label, "main.rs");
+        assert_eq!(chunks[0].chunk_index, 0);
+        assert_eq!(chunks[0].content, body);
+        assert_eq!(chunks[0].content_hash, sha256_hex(body.as_bytes()));
+    }
+
+    #[test]
+    fn large_file_windows_into_ordered_chunks() {
+        // ~100 chars/line × 400 lines ≈ 40k chars ≈ 10k tokens → several windows.
+        let line = format!("{}\n", "x".repeat(98));
+        let body: String = line.repeat(400);
+        let (chunks, truncated) = whole_file_chunks(&body, Language::Unknown, "big.txt");
+
+        assert!(chunks.len() > 1, "expected multiple windows");
+        assert_eq!(truncated, 0);
+
+        // chunk_index is monotonic from 0.
+        for (i, c) in chunks.iter().enumerate() {
+            assert_eq!(c.chunk_index, i as u32);
+            // Every window fits under the ceiling (the whole point).
+            assert!(
+                c.token_est <= MAX_FALLBACK_CHUNK_TOKENS,
+                "chunk {i} token_est {} exceeds ceiling",
+                c.token_est
+            );
+            // Per-window hash, not the file's.
+            assert_eq!(c.content_hash, sha256_hex(c.content.as_bytes()));
+        }
+
+        // Labels disambiguated: first bare, rest suffixed.
+        assert_eq!(chunks[0].label, "big.txt");
+        assert_eq!(chunks[1].label, "big.txt#2");
+
+        // Line-aligned packing is lossless: concatenation reproduces the source.
+        let reassembled: String = chunks.iter().map(|c| c.content.as_str()).collect();
+        assert_eq!(reassembled, body);
+    }
+
+    #[test]
+    fn oversize_single_line_is_truncated_head_only() {
+        // One line, no newline, well over the char ceiling → can't be line-packed.
+        let ceiling_chars = MAX_FALLBACK_CHUNK_TOKENS as usize * 4;
+        let line = "a".repeat(ceiling_chars + 5000);
+        let (chunks, truncated) = whole_file_chunks(&line, Language::Unknown, "blob.min.js");
+
+        assert_eq!(truncated, 1);
+        assert_eq!(chunks.len(), 1);
+        // Head kept, tail dropped — shorter than the original, within the ceiling.
+        assert!(chunks[0].content.chars().count() <= ceiling_chars);
+        assert!(chunks[0].content.len() < line.len());
+        assert!(chunks[0].token_est <= MAX_FALLBACK_CHUNK_TOKENS);
     }
 
     #[test]
