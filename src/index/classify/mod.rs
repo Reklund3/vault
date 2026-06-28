@@ -177,9 +177,7 @@ pub fn build_classifier(config: &Config) -> Result<Box<dyn Classifier>, Classify
     match resolve_backend(config) {
         ResolvedBackend::Gemma => Ok(Box::new(GemmaClassifier::from_config(config)?)),
         ResolvedBackend::Haiku => Ok(Box::new(HaikuClassifier::from_config(config)?)),
-        ResolvedBackend::OpenAiCompat => {
-            Ok(Box::new(OpenAiCompatClassifier::from_config(config)?))
-        }
+        ResolvedBackend::OpenAiCompat => Ok(Box::new(OpenAiCompatClassifier::from_config(config)?)),
     }
 }
 

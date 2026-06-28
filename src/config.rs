@@ -522,7 +522,10 @@ dims = 768
 "#;
         let cfg: Config = toml::from_str(toml_text).expect("parse");
         assert_eq!(cfg.router_remote(), "openai");
-        assert_eq!(cfg.router_base_url(), "https://aiplatform.googleapis.com/v1");
+        assert_eq!(
+            cfg.router_base_url(),
+            "https://aiplatform.googleapis.com/v1"
+        );
         assert_eq!(cfg.router_api_key_env(), "VERTEX_API_KEY");
         assert_eq!(cfg.router_auth_header(), "x-goog-api-key");
         assert_eq!(cfg.classifier_remote(), "openai");

@@ -903,7 +903,11 @@ mod tests {
                     content_hash: "h".into(),
                 },
                 &[ChunkWithEmbedding {
-                    chunk: proto_chunk("BuildRequest", "message BuildRequest { string id = 1; }", 0),
+                    chunk: proto_chunk(
+                        "BuildRequest",
+                        "message BuildRequest { string id = 1; }",
+                        0,
+                    ),
                     embedding: unit_embedding(0),
                 }],
             )
@@ -1092,7 +1096,11 @@ mod tests {
                     content_hash: "hp".into(),
                 },
                 &[ChunkWithEmbedding {
-                    chunk: proto_chunk("ProtoWidget", "message ProtoWidget { string widget = 1; }", 0),
+                    chunk: proto_chunk(
+                        "ProtoWidget",
+                        "message ProtoWidget { string widget = 1; }",
+                        0,
+                    ),
                     embedding: unit_embedding(1),
                 }],
             )

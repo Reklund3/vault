@@ -247,7 +247,10 @@ mod tests {
                 "expected Misconfigured for {alias}"
             );
         }
-        assert_eq!(require_model("gemini-3.5-flash").unwrap(), "gemini-3.5-flash");
+        assert_eq!(
+            require_model("gemini-3.5-flash").unwrap(),
+            "gemini-3.5-flash"
+        );
     }
 
     #[test]

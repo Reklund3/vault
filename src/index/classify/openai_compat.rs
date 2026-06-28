@@ -205,7 +205,10 @@ mod tests {
             require_model("haiku"),
             Err(ClassifyError::Misconfigured(_))
         ));
-        assert_eq!(require_model("gemini-3.5-flash").unwrap(), "gemini-3.5-flash");
+        assert_eq!(
+            require_model("gemini-3.5-flash").unwrap(),
+            "gemini-3.5-flash"
+        );
     }
 
     #[test]

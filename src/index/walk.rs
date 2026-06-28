@@ -335,7 +335,10 @@ mod tests {
     fn respects_root_gitignore_directory_and_anchored_patterns() {
         let tmp = Tmp::new("gitignore");
         // The exact shape that started this: an ignored IDE dir leaking in.
-        tmp.write(".gitignore", b"# JetBrains\n.idea\n\n/target\n.claude/settings.local.json\n");
+        tmp.write(
+            ".gitignore",
+            b"# JetBrains\n.idea\n\n/target\n.claude/settings.local.json\n",
+        );
         tmp.write(".idea/workspace.xml", b"<x/>");
         tmp.write(".idea/misc.xml", b"<x/>");
         tmp.write("target/debug/out.txt", b"x");
@@ -364,7 +367,10 @@ mod tests {
         tmp.write("keep.log", b"x");
         tmp.write("main.rs", b"fn main() {}");
         let out = walk_repo(&tmp.root, &WalkOptions::default()).unwrap();
-        assert_eq!(rels(&out), vec![".gitignore".to_string(), "main.rs".to_string()]);
+        assert_eq!(
+            rels(&out),
+            vec![".gitignore".to_string(), "main.rs".to_string()]
+        );
     }
 
     #[test]
@@ -376,7 +382,10 @@ mod tests {
         tmp.write("badname", b"x");
         tmp.write("keep.rs", b"fn main() {}");
         let out = walk_repo(&tmp.root, &WalkOptions::default()).unwrap();
-        assert_eq!(rels(&out), vec![".gitignore".to_string(), "keep.rs".to_string()]);
+        assert_eq!(
+            rels(&out),
+            vec![".gitignore".to_string(), "keep.rs".to_string()]
+        );
     }
 
     #[test]
@@ -397,7 +406,10 @@ mod tests {
         tmp.write("cert.pem", b"-----BEGIN");
         tmp.write("keep.rs", b"//");
         let out = walk_repo(&tmp.root, &WalkOptions::default()).unwrap();
-        assert_eq!(rels(&out), vec![".gitignore".to_string(), "keep.rs".to_string()]);
+        assert_eq!(
+            rels(&out),
+            vec![".gitignore".to_string(), "keep.rs".to_string()]
+        );
     }
 
     #[test]
