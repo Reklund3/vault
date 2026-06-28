@@ -9,6 +9,7 @@ use crate::store::schema;
 use crate::store::traits::{Store, StoreError};
 use crate::store::types::{ChunkWithEmbedding, Document, Hit, RetrievalLogEntry};
 use crate::types::DocType;
+use crate::util::fs::{harden_dir, harden_file};
 
 pub struct SqliteStore {
     conn: Connection,
@@ -17,7 +18,19 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub fn open(path: &Path, config: &Config) -> Result<Self, StoreError> {
+        // Self-provision and lock down `~/.vault/` before SQLite touches the
+        // file. `vault configure` already hardens the dir, but `sync`/`hook`/
+        // `diagnose` can be the first thing a user runs — all three reach the
+        // store through here. Without this, a missing `~/.vault/` fails the open
+        // outright, and the freshly created `vault.db` (plaintext indexed source)
+        // inherits the default umask, leaving it readable by other local users.
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|e| StoreError::Backend(e.to_string()))?;
+            harden_dir(parent);
+        }
         let conn = schema::open(path)?;
+        // File now exists (SQLite created it on open) — clamp it to 0600.
+        harden_file(path);
         let mut store = SqliteStore {
             conn,
             embedding_dim: config.embedding_dim(),
@@ -542,6 +555,39 @@ mod tests {
         let mut v = vec![0.0; dim];
         v[idx] = 1.0;
         v
+    }
+
+    #[test]
+    fn open_provisions_missing_dir_and_hardens_db() {
+        // The "first run before `vault configure`" case: the parent dir does not
+        // exist yet. open() must create it (not fail) and lock down both the dir
+        // and the freshly created db file.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("vault-open-test-{}-{nanos}", std::process::id()));
+        let parent = base.join("vault");
+        let db = parent.join("vault.db");
+        assert!(!parent.exists(), "precondition: parent must not exist yet");
+
+        let store = SqliteStore::open(&db, &Config::default()).expect("open provisions the dir");
+        drop(store);
+
+        assert!(parent.is_dir(), "parent dir must be created");
+        assert!(db.is_file(), "db file must be created");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+            let db_mode = std::fs::metadata(&db).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700, "dir must be 0700");
+            assert_eq!(db_mode, 0o600, "db must be 0600");
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn create_project(store: &SqliteStore, name: &str) -> i64 {
