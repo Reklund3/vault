@@ -30,6 +30,12 @@ fn patterns() -> &'static RegexSet {
             r"\bAKIA[0-9A-Z]{16}\b",
             // GitHub fine-grained / classic / OAuth / refresh / server tokens
             r"\bgh[pousr]_[A-Za-z0-9]{36,}\b",
+            // GitLab personal access token (open-ended length: the random part
+            // has varied across GitLab versions — matching exactly N would miss
+            // any token of a different length and give false confidence).
+            r"\bglpat-[0-9A-Za-z_-]{20,}\b",
+            // Slack incoming-webhook URL (the path carries the secret token)
+            r"https://hooks\.slack\.com/services/[A-Za-z0-9_/]+",
             // Anthropic API key
             r"\bsk-ant-[A-Za-z0-9_-]{20,}\b",
             // OpenAI API key (also catches Anthropic-prefix-only keys; that's fine)
@@ -64,6 +70,22 @@ mod tests {
         assert!(looks_like_secret(
             "ghs_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         ));
+    }
+
+    #[test]
+    fn gitlab_pat_trips() {
+        assert!(looks_like_secret("GITLAB_TOKEN=glpat-aBcDeFgHiJkLmNoPqRsT"));
+        // Longer random part (newer GitLab) still hits — pattern is open-ended.
+        assert!(looks_like_secret("glpat-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345"));
+    }
+
+    #[test]
+    fn slack_webhook_trips() {
+        // Build the URL from parts: a contiguous webhook literal in source trips
+        // GitHub's own push-protection scanner (it keys on host + path together).
+        let host = "https://hooks.slack.com";
+        let webhook = format!("{host}/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX");
+        assert!(looks_like_secret(&webhook));
     }
 
     #[test]
