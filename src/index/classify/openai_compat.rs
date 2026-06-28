@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use reqwest::Url;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
@@ -10,18 +9,40 @@ use crate::index::classify::{
     parse_response,
 };
 
-/// A valid JSON reply is ~30 tokens. With thinking disabled (see
-/// `ChatRequest::chat_template_kwargs`) the model no longer burns hundreds of
-/// tokens reasoning first, so 1024 is generous headroom, not a think budget.
+/// A valid JSON reply is ~30 tokens. Gemini Flash does not emit chain-of-thought
+/// by default, so 1024 is generous headroom.
 const MAX_TOKENS: u32 = 1024;
 
-pub(crate) struct GemmaClassifier {
-    endpoint: Url,
+/// Generic OpenAI-compatible chat-completions classifier — the index-time mirror
+/// of `OpenAiCompatRouter`. The API key is held only in memory and only ever sent
+/// in the auth header; only its env-var *name* lives in `vault.toml`. `Debug` is
+/// intentionally not derived so the key can't leak through a debug print.
+pub(crate) struct OpenAiCompatClassifier {
+    url: String,
     model: String,
+    api_key: String,
+    auth: AuthHeader,
     http: Client,
 }
 
-impl GemmaClassifier {
+/// Auth header style: `Bearer` (AI Studio Gemini) or `XGoogApiKey` (Vertex
+/// express). Resolved from `[classifier].auth_header` at construction.
+#[derive(Clone, Copy)]
+enum AuthHeader {
+    Bearer,
+    XGoogApiKey,
+}
+
+impl AuthHeader {
+    fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "x-goog-api-key" => AuthHeader::XGoogApiKey,
+            _ => AuthHeader::Bearer,
+        }
+    }
+}
+
+impl OpenAiCompatClassifier {
     pub(crate) fn from_config(config: &Config) -> Result<Self, ClassifyError> {
         Self::from_config_with_timeout(config, config.classifier_timeout())
     }
@@ -30,30 +51,30 @@ impl GemmaClassifier {
         config: &Config,
         timeout: Duration,
     ) -> Result<Self, ClassifyError> {
-        let endpoint = Url::parse(config.mlx_endpoint())
-            .map_err(|e| ClassifyError::Transport(format!("bad mlx endpoint: {e}")))?;
+        let env_var = config.classifier_api_key_env();
+        let api_key = require_api_key(std::env::var(env_var).ok(), env_var)?;
+        let model = require_model(config.classifier_model())?;
         let http = Client::builder()
             .timeout(timeout)
             .build()
             .map_err(|e| ClassifyError::Transport(e.to_string()))?;
         Ok(Self {
-            endpoint,
-            model: config.mlx_model().to_string(),
+            url: chat_completions_url(config.classifier_base_url()),
+            model,
+            api_key,
+            auth: AuthHeader::parse(config.classifier_auth_header()),
             http,
         })
     }
 }
 
-impl Classifier for GemmaClassifier {
+impl Classifier for OpenAiCompatClassifier {
     fn classify(&self, input: &ClassifyInput) -> Result<Classification, ClassifyError> {
         let user = build_user_prompt(input);
         let request = ChatRequest {
             model: &self.model,
             temperature: 0.0,
             max_tokens: MAX_TOKENS,
-            chat_template_kwargs: ChatTemplateKwargs {
-                enable_thinking: false,
-            },
             messages: vec![
                 ChatMessage {
                     role: "system",
@@ -66,14 +87,13 @@ impl Classifier for GemmaClassifier {
             ],
         };
 
-        let url = self
-            .endpoint
-            .join("/v1/chat/completions")
-            .map_err(|e| ClassifyError::Transport(e.to_string()))?;
+        let req = self.http.post(&self.url);
+        let req = match self.auth {
+            AuthHeader::Bearer => req.header("Authorization", format!("Bearer {}", self.api_key)),
+            AuthHeader::XGoogApiKey => req.header("x-goog-api-key", &self.api_key),
+        };
 
-        let resp = self
-            .http
-            .post(url)
+        let resp = req
             .json(&request)
             .send()
             .map_err(|e| ClassifyError::Transport(e.to_string()))?;
@@ -94,10 +114,6 @@ impl Classifier for GemmaClassifier {
             .ok_or_else(|| ClassifyError::BadResponse("empty choices".to_string()))?
             .message;
 
-        // Prefer the final `content` channel; fall back to `reasoning` when the
-        // model emits everything as thinking (e.g. Gemma 4 with the thinking
-        // template auto-enabled). `parse_response` extracts the first balanced
-        // JSON object from whichever field carries the payload.
         let text = message
             .content
             .filter(|s| !s.is_empty())
@@ -110,24 +126,40 @@ impl Classifier for GemmaClassifier {
     }
 }
 
+/// Build the chat-completions URL by string concat, NOT `Url::join` — the base
+/// URL carries a path that a leading-slash join would silently drop. See the
+/// router-side note in `retrieve/router/openai_compat.rs`.
+fn chat_completions_url(base_url: &str) -> String {
+    format!("{}/chat/completions", base_url.trim_end_matches('/'))
+}
+
+fn require_api_key(value: Option<String>, env_var: &str) -> Result<String, ClassifyError> {
+    match value {
+        Some(key) if !key.trim().is_empty() => Ok(key),
+        _ => Err(ClassifyError::MissingApiKey {
+            env_var: env_var.to_string(),
+        }),
+    }
+}
+
+/// `model` is sent verbatim; an Anthropic alias under the openai backend is a
+/// misconfiguration. Reject it with guidance rather than POST a bogus model id.
+fn require_model(model: &str) -> Result<String, ClassifyError> {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "haiku" | "sonnet" | "opus" => Err(ClassifyError::Misconfigured(format!(
+            "[classifier].model = {model:?} is an Anthropic alias but the openai backend is \
+             selected; set it to a provider model id (e.g. \"gemini-3.5-flash\")"
+        ))),
+        _ => Ok(model.to_string()),
+    }
+}
+
 #[derive(Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage<'a>>,
     temperature: f32,
     max_tokens: u32,
-    /// mlx_lm.server forwards this to the tokenizer's `apply_chat_template`.
-    /// Gemma 4 auto-enables a thinking template; turning it off cuts per-file
-    /// classify latency ~7x since we only need the structured JSON, never the
-    /// chain-of-thought. NOTE: `chat_template_kwargs` is mlx/vLLM specific,
-    /// **not** standard OpenAI — when this client generalizes to OpenAI/Gemini
-    /// (issue #2) this field must not be sent blindly.
-    chat_template_kwargs: ChatTemplateKwargs,
-}
-
-#[derive(Serialize)]
-struct ChatTemplateKwargs {
-    enable_thinking: bool,
 }
 
 #[derive(Serialize)]
@@ -150,9 +182,6 @@ struct ChatChoice {
 struct ChatChoiceMessage {
     #[serde(default)]
     content: Option<String>,
-    /// Some mlx_lm.server / Gemma 4 builds emit chain-of-thought output as a
-    /// separate `reasoning` field instead of (or alongside) `content`. We treat
-    /// it as a fallback payload — the JSON extractor handles either source.
     #[serde(default)]
     reasoning: Option<String>,
 }
@@ -163,9 +192,27 @@ mod tests {
     use crate::types::{DocType, Language};
 
     #[test]
+    fn chat_completions_url_preserves_base_path() {
+        assert_eq!(
+            chat_completions_url("https://generativelanguage.googleapis.com/v1beta/openai"),
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        );
+    }
+
+    #[test]
+    fn require_model_rejects_anthropic_aliases() {
+        assert!(matches!(
+            require_model("haiku"),
+            Err(ClassifyError::Misconfigured(_))
+        ));
+        assert_eq!(
+            require_model("gemini-3.5-flash").unwrap(),
+            "gemini-3.5-flash"
+        );
+    }
+
+    #[test]
     fn deserializes_openai_response_and_classifies() {
-        // Shape mlx_lm.server returns: OpenAI chat-completions with the JSON
-        // classification as the assistant message content.
         let raw = r#"{
             "choices": [
                 {"message": {"role": "assistant",
@@ -184,41 +231,5 @@ mod tests {
         let c = parse_response(&content).expect("parse");
         assert_eq!(c.doc_type, DocType::Contract);
         assert_eq!(c.language, Language::Proto);
-    }
-
-    #[test]
-    fn deserializes_reasoning_only_response() {
-        // Some Gemma 4 builds (or any thinking model behind mlx) emit the JSON
-        // inside a `reasoning` field with no `content`. The classifier extracts
-        // it via the reasoning fallback.
-        let raw = r#"{
-            "choices": [
-                {"message": {"role": "assistant",
-                             "reasoning": "Looking at the proto syntax… {\"doc_type\": \"contract\", \"language\": \"proto\"}"}}
-            ]
-        }"#;
-        let body: ChatResponse = serde_json::from_str(raw).expect("deserialize");
-        let msg = body.choices.into_iter().next().unwrap().message;
-        let text = msg
-            .content
-            .filter(|s| !s.is_empty())
-            .or(msg.reasoning)
-            .unwrap();
-        let c = parse_response(&text).expect("parse");
-        assert_eq!(c.doc_type, DocType::Contract);
-    }
-
-    #[test]
-    #[ignore = "requires live mlx_lm.server at http://localhost:8080"]
-    fn live_gemma_classify() {
-        let config = Config::default();
-        let classifier = GemmaClassifier::from_config(&config).expect("client");
-        let input = ClassifyInput {
-            filename: "build.proto".to_string(),
-            extension: "proto".to_string(),
-            head: "syntax = \"proto3\";\nmessage BuildRequest { string id = 1; }".to_string(),
-        };
-        let c = classifier.classify(&input).expect("classify");
-        assert_eq!(c.doc_type, DocType::Contract);
     }
 }

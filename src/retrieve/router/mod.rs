@@ -8,11 +8,13 @@ use crate::util::probe::mlx_reachable;
 
 mod gemma;
 mod haiku;
+mod openai_compat;
 #[cfg(test)]
 mod stub;
 
 pub(crate) use gemma::GemmaRouter;
 pub(crate) use haiku::HaikuRouter;
+pub(crate) use openai_compat::OpenAiCompatRouter;
 #[cfg(test)]
 pub(crate) use stub::StubRouter;
 
@@ -22,8 +24,10 @@ pub enum RouterError {
     Transport(String),
     #[error("bad response: {0}")]
     BadResponse(String),
-    #[error("ANTHROPIC_API_KEY not set (required for the haiku router)")]
-    MissingApiKey,
+    #[error("{env_var} not set (required for the configured remote router)")]
+    MissingApiKey { env_var: String },
+    #[error("misconfigured router: {0}")]
+    Misconfigured(String),
 }
 
 pub trait Router {
@@ -46,7 +50,9 @@ Respond with JSON only, no other text.
 
 Schema:
 {
-  projects:   [],   // project or service names mentioned or implied
+  projects:   [],   // EXACT indexed project/service/repo names only (e.g. "vault",
+                    // "build-service"). Omit unless the prompt names a real project;
+                    // never invent one from a descriptive phrase like "the vault router".
   type_names: [],   // specific named types: proto messages, Go types, API schemas,
                     // account categories, report names, or any named entity
   topics:     [],   // conceptual topics: auth, events, tax, invoicing, grpc, helm, etc
@@ -138,14 +144,21 @@ pub(crate) fn parse_response(text: &str) -> Result<RouterOutput, RouterError> {
 pub enum ResolvedBackend {
     Gemma,
     Haiku,
+    OpenAiCompat,
 }
 
-/// Resolve the router backend from `[router].mode`:
-/// - `gemma` / `haiku` force that backend.
+/// Resolve the router backend from `[router].mode` and `[router].remote`:
+/// - `gemma` / `haiku` / `openai` (alias `gemini`) force that backend.
 /// - `auto` (default, and any unrecognized value) probes the local mlx server;
-///   reachable → Gemma, otherwise → Haiku.
+///   reachable → Gemma, otherwise the configured `[router].remote` (`haiku`
+///   default, `openai` for the OpenAI-compatible backend). Local stays primary so
+///   the zero-token-cost guarantee holds whenever Gemma is up.
 pub fn resolve_backend(config: &Config) -> ResolvedBackend {
-    resolve(config.router_mode(), config.mlx_endpoint())
+    resolve(
+        config.router_mode(),
+        config.mlx_endpoint(),
+        config.router_remote(),
+    )
 }
 
 /// Construct the configured router as a trait object. Mirrors the
@@ -155,20 +168,32 @@ pub fn build_router(config: &Config) -> Result<Box<dyn Router>, RouterError> {
     match resolve_backend(config) {
         ResolvedBackend::Gemma => Ok(Box::new(GemmaRouter::from_config(config)?)),
         ResolvedBackend::Haiku => Ok(Box::new(HaikuRouter::from_config(config)?)),
+        ResolvedBackend::OpenAiCompat => Ok(Box::new(OpenAiCompatRouter::from_config(config)?)),
     }
 }
 
-fn resolve(mode: &str, mlx_endpoint: &str) -> ResolvedBackend {
+fn resolve(mode: &str, mlx_endpoint: &str, remote: &str) -> ResolvedBackend {
     match mode {
         "gemma" => ResolvedBackend::Gemma,
         "haiku" => ResolvedBackend::Haiku,
+        "openai" | "gemini" => ResolvedBackend::OpenAiCompat,
         _ => {
             if mlx_reachable(mlx_endpoint) {
                 ResolvedBackend::Gemma
             } else {
-                ResolvedBackend::Haiku
+                remote_backend(remote)
             }
         }
+    }
+}
+
+/// The remote backend `auto` falls back to when the local mlx server is down.
+/// `haiku` (default) preserves the prior behavior; `openai` selects the generic
+/// OpenAI-compatible backend.
+fn remote_backend(remote: &str) -> ResolvedBackend {
+    match remote {
+        "openai" | "gemini" => ResolvedBackend::OpenAiCompat,
+        _ => ResolvedBackend::Haiku,
     }
 }
 
@@ -360,24 +385,41 @@ mod tests {
     #[test]
     fn resolve_forces_explicit_modes_without_probing() {
         assert_eq!(
-            resolve("gemma", "http://127.0.0.1:1"),
+            resolve("gemma", "http://127.0.0.1:1", "haiku"),
             ResolvedBackend::Gemma
         );
         assert_eq!(
-            resolve("haiku", "http://localhost:8080"),
+            resolve("haiku", "http://localhost:8080", "haiku"),
             ResolvedBackend::Haiku
+        );
+        // Explicit openai/gemini force the OpenAI-compatible backend regardless
+        // of mlx reachability or the remote knob.
+        assert_eq!(
+            resolve("openai", "http://localhost:8080", "haiku"),
+            ResolvedBackend::OpenAiCompat
+        );
+        assert_eq!(
+            resolve("gemini", "http://127.0.0.1:1", "haiku"),
+            ResolvedBackend::OpenAiCompat
         );
     }
 
     #[test]
-    fn resolve_auto_falls_back_to_haiku_when_unreachable() {
+    fn resolve_auto_falls_back_to_configured_remote_when_unreachable() {
+        // Default remote is haiku — preserves prior behavior.
         assert_eq!(
-            resolve("auto", "http://127.0.0.1:1"),
+            resolve("auto", "http://127.0.0.1:1", "haiku"),
             ResolvedBackend::Haiku
         );
         assert_eq!(
-            resolve("nonsense", "http://127.0.0.1:1"),
+            resolve("nonsense", "http://127.0.0.1:1", "haiku"),
             ResolvedBackend::Haiku
+        );
+        // remote = openai makes auto fall back to the OpenAI-compatible backend
+        // when Gemma is down (the user's Gemini workflow).
+        assert_eq!(
+            resolve("auto", "http://127.0.0.1:1", "openai"),
+            ResolvedBackend::OpenAiCompat
         );
     }
 
@@ -444,9 +486,30 @@ dims = 768
             Ok(_) => panic!("expected MissingApiKey, got Ok(router)"),
             Err(e) => e,
         };
-        assert!(matches!(err, RouterError::MissingApiKey));
+        assert!(matches!(err, RouterError::MissingApiKey { .. }));
         if let Some(v) = prior {
             unsafe { std::env::set_var("ANTHROPIC_API_KEY", v) };
+        }
+    }
+
+    #[test]
+    fn build_router_openai_mode_without_key_names_the_env_var() {
+        // Forcing `openai` mode requires the configured key env var (default
+        // GEMINI_API_KEY); the absence surfaces as MissingApiKey naming it.
+        let prior = std::env::var("GEMINI_API_KEY").ok();
+        // SAFETY: same single-threaded env convention as the other tests here.
+        unsafe { std::env::remove_var("GEMINI_API_KEY") };
+        let cfg = config_with_mode("openai");
+        let err = match build_router(&cfg) {
+            Ok(_) => panic!("expected MissingApiKey, got Ok(router)"),
+            Err(e) => e,
+        };
+        match err {
+            RouterError::MissingApiKey { env_var } => assert_eq!(env_var, "GEMINI_API_KEY"),
+            other => panic!("expected MissingApiKey, got {other:?}"),
+        }
+        if let Some(v) = prior {
+            unsafe { std::env::set_var("GEMINI_API_KEY", v) };
         }
     }
 

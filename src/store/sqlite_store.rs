@@ -46,6 +46,30 @@ impl SqliteStore {
         )?;
         Ok(store)
     }
+
+    /// Resolve router-supplied project names to the ids that actually exist in
+    /// the store, matched case-insensitively (ASCII). Names with no matching
+    /// project are silently dropped; an empty `names` (or all-unknown names)
+    /// yields an empty vec, which `build_filter_clause` reads as "no project
+    /// filter — search across all projects". Names are bound as parameters, not
+    /// formatted into SQL.
+    fn existing_project_ids(&self, names: &[String]) -> Result<Vec<i64>, StoreError> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT id FROM projects WHERE name COLLATE NOCASE IN ({})",
+            placeholders(names.len())
+        );
+        let params: Vec<&dyn ToSql> = names.iter().map(|n| n as &dyn ToSql).collect();
+        let mut stmt = self.conn.prepare(&sql).map_err(backend_err)?;
+        let ids = stmt
+            .query_map(params.as_slice(), |r| r.get::<_, i64>(0))
+            .map_err(backend_err)?
+            .collect::<Result<Vec<i64>, _>>()
+            .map_err(backend_err)?;
+        Ok(ids)
+    }
 }
 
 impl Store for SqliteStore {
@@ -278,10 +302,15 @@ impl Store for SqliteStore {
             return Ok(Vec::new());
         };
 
+        // Resolve the router's project names to the subset that actually exists
+        // (case-insensitive). The filter is applied only when this is non-empty,
+        // so both "router named no project" and "router named only unknown
+        // projects" collapse to the same no-filter path — see existing_project_ids.
+        let project_ids = self.existing_project_ids(&plan.projects)?;
         let doc_type_strs: Vec<&'static str> = plan.doc_types.iter().map(|d| d.as_str()).collect();
         let language_strs: Vec<&'static str> = plan.languages.iter().map(|l| l.as_str()).collect();
-        let filter_sql = build_filter_clause(plan);
-        let filter = filter_bind_params(plan, &doc_type_strs, &language_strs);
+        let filter_sql = build_filter_clause(&project_ids, plan);
+        let filter = filter_bind_params(&project_ids, &doc_type_strs, &language_strs);
 
         let sql = format!(
             "SELECT c.id, c.label, c.content, c.token_est, c.project_id, c.doc_type,
@@ -321,10 +350,15 @@ impl Store for SqliteStore {
             )));
         }
 
+        // Resolve the router's project names to the subset that actually exists
+        // (case-insensitive). The filter is applied only when this is non-empty,
+        // so both "router named no project" and "router named only unknown
+        // projects" collapse to the same no-filter path — see existing_project_ids.
+        let project_ids = self.existing_project_ids(&plan.projects)?;
         let doc_type_strs: Vec<&'static str> = plan.doc_types.iter().map(|d| d.as_str()).collect();
         let language_strs: Vec<&'static str> = plan.languages.iter().map(|l| l.as_str()).collect();
-        let filter_sql = build_filter_clause(plan);
-        let filter = filter_bind_params(plan, &doc_type_strs, &language_strs);
+        let filter_sql = build_filter_clause(&project_ids, plan);
+        let filter = filter_bind_params(&project_ids, &doc_type_strs, &language_strs);
         let emb_json = embedding_to_json(embedding);
 
         let sql = format!(
@@ -411,18 +445,18 @@ fn build_match_query(plan: &QueryPlan) -> Option<String> {
 }
 
 /// Build the positional bind params matching `build_filter_clause`'s `?`
-/// placeholders, in the same order: projects, then doc_types, then languages.
-/// Borrows the plan and the caller's interned label slices, so all three must
-/// outlive the query. Shared by `bm25_search` and `cosine_search` so the clause
-/// and its params can never drift out of sync.
+/// placeholders, in the same order: project ids, then doc_types, then languages.
+/// Borrows the caller's resolved id slice and interned label slices, so all
+/// three must outlive the query. Shared by `bm25_search` and `cosine_search` so
+/// the clause and its params can never drift out of sync.
 fn filter_bind_params<'a>(
-    plan: &'a QueryPlan,
+    project_ids: &'a [i64],
     doc_type_strs: &'a [&'static str],
     language_strs: &'a [&'static str],
 ) -> Vec<&'a dyn ToSql> {
     let mut p: Vec<&dyn ToSql> = Vec::new();
-    for s in &plan.projects {
-        p.push(s);
+    for id in project_ids {
+        p.push(id);
     }
     for s in doc_type_strs {
         p.push(s);
@@ -433,17 +467,22 @@ fn filter_bind_params<'a>(
     p
 }
 
-fn build_filter_clause(plan: &QueryPlan) -> String {
+/// Builds the `AND ...` filter suffix. `project_ids` are pre-resolved to ids
+/// that exist in the store (see `existing_project_ids`), so the project clause
+/// is a plain `IN (<ids>)` — casing is handled at resolution time, not here.
+/// An empty `project_ids` emits no project clause: that is the deliberate
+/// graceful-degradation path. When the router names projects but none of them
+/// exist (e.g. it emitted a prompt phrase instead of an indexed project name),
+/// the resolved set is empty and retrieval searches **across all projects**
+/// rather than filtering everything out — strictly better than the silent total
+/// context loss it used to cause (the same failure the `COLLATE NOCASE` fix
+/// addressed for casing; this closes the wider phantom-name gap).
+fn build_filter_clause(project_ids: &[i64], plan: &QueryPlan) -> String {
     let mut s = String::new();
-    if !plan.projects.is_empty() {
-        // `COLLATE NOCASE` on the stored `name` makes the router-supplied list
-        // match case-insensitively (ASCII), mirroring the `eq_ignore_ascii_case`
-        // used for domain-tag resolution. Without it a router emitting "Vault"
-        // against a stored "vault" filters out every chunk — silent total
-        // context loss (P2 path 1, docs/plan-review-2026-06-11.md).
+    if !project_ids.is_empty() {
         s.push_str(&format!(
-            " AND c.project_id IN (SELECT id FROM projects WHERE name COLLATE NOCASE IN ({}))",
-            placeholders(plan.projects.len())
+            " AND c.project_id IN ({})",
+            placeholders(project_ids.len())
         ));
     }
     if !plan.doc_types.is_empty() {
@@ -843,6 +882,245 @@ mod tests {
             "case-mismatched project name must still match"
         );
         assert_eq!(hits[0].label, "BuildRequest");
+    }
+
+    #[test]
+    fn hybrid_search_unknown_project_name_searches_all_not_nothing() {
+        // Regression: the router (Gemma or Gemini, observed on both) can emit a
+        // prompt phrase into `projects` that matches no indexed project. That
+        // used to filter out every chunk — silent total context loss. It must
+        // now degrade to searching across all projects.
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+        let project_id = create_project(&store, "vault");
+        store
+            .upsert_document(
+                &Document {
+                    project_id,
+                    doc_type: DocType::Contract,
+                    source_path: "build.proto".into(),
+                    title: "build.proto".into(),
+                    content_hash: "h".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: proto_chunk(
+                        "BuildRequest",
+                        "message BuildRequest { string id = 1; }",
+                        0,
+                    ),
+                    embedding: unit_embedding(0),
+                }],
+            )
+            .unwrap();
+
+        let plan = QueryPlan {
+            projects: vec!["vault project router".into()], // phantom — no such project
+            type_names: vec!["BuildRequest".into()],
+            topics: vec![],
+            doc_types: vec![],
+            languages: vec![],
+        };
+        let hits = store
+            .hybrid_search(&plan, &unit_embedding(0), config.alpha())
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "unknown project name must degrade to search-all, not filter everything out"
+        );
+        assert_eq!(hits[0].label, "BuildRequest");
+    }
+
+    #[test]
+    fn hybrid_search_known_project_filter_excludes_other_projects() {
+        // The degradation must be surgical: a project that DOES exist still
+        // filters, excluding chunks from other projects. Partial matches
+        // (one known name + one phantom) behave like the known name alone.
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+        let alpha = create_project(&store, "alpha");
+        let beta = create_project(&store, "beta");
+        store
+            .upsert_document(
+                &Document {
+                    project_id: alpha,
+                    doc_type: DocType::Contract,
+                    source_path: "a.proto".into(),
+                    title: "a".into(),
+                    content_hash: "ha".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: proto_chunk("AlphaFoo", "message AlphaFoo { string Widget = 1; }", 0),
+                    embedding: unit_embedding(0),
+                }],
+            )
+            .unwrap();
+        store
+            .upsert_document(
+                &Document {
+                    project_id: beta,
+                    doc_type: DocType::Contract,
+                    source_path: "b.proto".into(),
+                    title: "b".into(),
+                    content_hash: "hb".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: proto_chunk("BetaFoo", "message BetaFoo { string Widget = 1; }", 0),
+                    embedding: unit_embedding(1),
+                }],
+            )
+            .unwrap();
+
+        // Exact filter: only alpha's chunk comes back.
+        let exact = QueryPlan {
+            projects: vec!["alpha".into()],
+            type_names: vec!["Widget".into()],
+            topics: vec![],
+            doc_types: vec![],
+            languages: vec![],
+        };
+        let hits = store
+            .hybrid_search(&exact, &unit_embedding(0), config.alpha())
+            .unwrap();
+        assert!(!hits.is_empty(), "expected alpha's chunk");
+        assert!(
+            hits.iter().all(|h| h.project_id == alpha),
+            "a real project filter must exclude other projects' chunks"
+        );
+
+        // Partial: known + phantom resolves to the known one, same exclusion.
+        let partial = QueryPlan {
+            projects: vec!["alpha".into(), "ghost".into()],
+            ..exact.clone()
+        };
+        let hits = store
+            .hybrid_search(&partial, &unit_embedding(0), config.alpha())
+            .unwrap();
+        assert!(
+            !hits.is_empty() && hits.iter().all(|h| h.project_id == alpha),
+            "partial match must filter to the known project only"
+        );
+    }
+
+    fn lang_chunk(language: Language, label: &str, content: &str, idx: u32) -> Chunk {
+        Chunk {
+            language,
+            label: label.to_string(),
+            content: content.to_string(),
+            content_hash: format!("hash-{label}"),
+            token_est: 10,
+            chunk_index: idx,
+        }
+    }
+
+    #[test]
+    fn hybrid_search_zero_match_language_filter_degrades_to_search() {
+        // The proto trap: the router emits languages=["proto"] for "how does
+        // vault parse proto files?", but vault's own proto-parsing code lives in
+        // a rust-classified chunk — there are zero proto-language chunks. The
+        // languages/doc_types values are enum-valid (from_raw drops garbage), so
+        // the only failure is a valid value matching zero chunks. That must
+        // degrade to an unfiltered search rather than silent total context loss.
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+        let project_id = create_project(&store, "vault");
+        store
+            .upsert_document(
+                &Document {
+                    project_id,
+                    doc_type: DocType::Convention,
+                    source_path: "src/parse/proto.rs".into(),
+                    title: "proto.rs".into(),
+                    content_hash: "h".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: lang_chunk(
+                        Language::Rust,
+                        "parse_proto",
+                        "fn parse_proto chunks each message service and enum",
+                        0,
+                    ),
+                    embedding: unit_embedding(0),
+                }],
+            )
+            .unwrap();
+
+        let plan = QueryPlan {
+            projects: vec![],
+            type_names: vec![],
+            topics: vec![],
+            doc_types: vec![DocType::Contract], // zero contract chunks
+            languages: vec![Language::Proto],   // zero proto chunks
+        };
+        let hits = store
+            .hybrid_search(&plan, &unit_embedding(0), config.alpha())
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "a filter matching zero chunks must retry unfiltered, not return nothing"
+        );
+        assert_eq!(hits[0].label, "parse_proto");
+    }
+
+    #[test]
+    fn hybrid_search_matching_language_filter_does_not_broaden() {
+        // Negative control: a language filter that DOES match must filter, not
+        // broaden. The retry only fires on an empty result, so a non-empty
+        // filtered pass is returned verbatim — proto chunks stay excluded.
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+        let project_id = create_project(&store, "vault");
+        store
+            .upsert_document(
+                &Document {
+                    project_id,
+                    doc_type: DocType::Convention,
+                    source_path: "src/lib.rs".into(),
+                    title: "lib.rs".into(),
+                    content_hash: "hr".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: lang_chunk(Language::Rust, "RustWidget", "fn widget rust impl", 0),
+                    embedding: unit_embedding(0),
+                }],
+            )
+            .unwrap();
+        store
+            .upsert_document(
+                &Document {
+                    project_id,
+                    doc_type: DocType::Contract,
+                    source_path: "api.proto".into(),
+                    title: "api.proto".into(),
+                    content_hash: "hp".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: proto_chunk(
+                        "ProtoWidget",
+                        "message ProtoWidget { string widget = 1; }",
+                        0,
+                    ),
+                    embedding: unit_embedding(1),
+                }],
+            )
+            .unwrap();
+
+        let plan = QueryPlan {
+            projects: vec![],
+            type_names: vec!["widget".into()],
+            topics: vec![],
+            doc_types: vec![],
+            languages: vec![Language::Rust],
+        };
+        let hits = store
+            .hybrid_search(&plan, &unit_embedding(0), config.alpha())
+            .unwrap();
+        assert!(!hits.is_empty(), "expected the rust chunk");
+        assert!(
+            hits.iter().all(|h| h.label == "RustWidget"),
+            "a matching language filter must exclude proto chunks, not broaden"
+        );
     }
 
     #[test]

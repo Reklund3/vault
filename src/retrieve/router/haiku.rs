@@ -105,7 +105,9 @@ impl Router for HaikuRouter {
 fn require_api_key(value: Option<String>) -> Result<String, RouterError> {
     match value {
         Some(key) if !key.trim().is_empty() => Ok(key),
-        _ => Err(RouterError::MissingApiKey),
+        _ => Err(RouterError::MissingApiKey {
+            env_var: "ANTHROPIC_API_KEY".to_string(),
+        }),
     }
 }
 
@@ -172,15 +174,15 @@ mod tests {
     fn require_api_key_rejects_missing_and_blank() {
         assert!(matches!(
             require_api_key(None),
-            Err(RouterError::MissingApiKey)
+            Err(RouterError::MissingApiKey { .. })
         ));
         assert!(matches!(
             require_api_key(Some(String::new())),
-            Err(RouterError::MissingApiKey)
+            Err(RouterError::MissingApiKey { .. })
         ));
         assert!(matches!(
             require_api_key(Some("   ".to_string())),
-            Err(RouterError::MissingApiKey)
+            Err(RouterError::MissingApiKey { .. })
         ));
         assert_eq!(
             require_api_key(Some("sk-test".to_string())).unwrap(),

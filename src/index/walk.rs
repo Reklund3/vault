@@ -90,7 +90,8 @@ pub fn walk_repo(root: &Path, opts: &WalkOptions) -> Result<Vec<Walked>, WalkErr
         return Err(WalkError::NotADirectory(canonical_root));
     }
 
-    let excludes = build_exclude_set(&opts.user_extra_excludes)?;
+    let gitignore = gitignore_globs_for_root(&canonical_root);
+    let excludes = build_exclude_set(&opts.user_extra_excludes, &gitignore)?;
 
     let mut out = Vec::new();
     for entry in WalkDir::new(&canonical_root)
@@ -135,7 +136,7 @@ pub fn walk_repo(root: &Path, opts: &WalkOptions) -> Result<Vec<Walked>, WalkErr
     Ok(out)
 }
 
-fn build_exclude_set(user_extras: &[String]) -> Result<GlobSet, WalkError> {
+fn build_exclude_set(user_extras: &[String], gitignore: &[String]) -> Result<GlobSet, WalkError> {
     let mut builder = GlobSetBuilder::new();
     for pat in BUILT_IN_EXCLUDES {
         let glob = Glob::new(pat).map_err(|e| WalkError::BadGlob {
@@ -151,10 +152,72 @@ fn build_exclude_set(user_extras: &[String]) -> Result<GlobSet, WalkError> {
         })?;
         builder.add(glob);
     }
+    // Globs derived from the repo's root `.gitignore` are best-effort, not a
+    // security boundary: a pattern we can't translate is skipped rather than
+    // failing the whole sync. The built-in list above is what actually protects
+    // secrets, and it always applies regardless of `.gitignore` contents.
+    for pat in gitignore {
+        match Glob::new(pat) {
+            Ok(glob) => {
+                builder.add(glob);
+            }
+            Err(_) => continue,
+        }
+    }
     builder.build().map_err(|e| WalkError::BadGlob {
         pattern: "<set>".to_string(),
         detail: e.to_string(),
     })
+}
+
+/// Read the repo's root `.gitignore` (if present) and translate it into globset
+/// patterns matched against the POSIX relative path. This is a deliberately
+/// scoped subset of git's ignore semantics: **root `.gitignore` only** — no
+/// nested per-directory `.gitignore`, no global `core.excludesfile`, no
+/// `.git/info/exclude`. Negation lines (`!pattern`) are **not** supported
+/// (globset has no ordered-override notion) and are skipped, so a `.gitignore`
+/// that re-includes a path via `!` will still see it excluded here. A missing or
+/// unreadable file yields no patterns (the walk proceeds on built-ins alone).
+fn gitignore_globs_for_root(root: &Path) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string(root.join(".gitignore")) else {
+        return Vec::new();
+    };
+    let mut globs = Vec::new();
+    for line in content.lines() {
+        globs.extend(gitignore_line_to_globs(line));
+    }
+    globs
+}
+
+/// Translate a single `.gitignore` line into zero or more globset patterns.
+/// Returns empty for blanks, comments, and negations.
+///
+/// A pattern that is leading-slash-anchored or contains an interior `/` is
+/// anchored to the repo root; a bare name (no `/`) matches at any depth, so it
+/// expands to both the anchored and `**/`-prefixed forms. Each pattern also
+/// emits a `/**` subtree form so an ignored directory excludes its contents
+/// (the walker only surfaces files, so the bare form alone wouldn't).
+fn gitignore_line_to_globs(raw: &str) -> Vec<String> {
+    let line = raw.trim();
+    if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+        return Vec::new();
+    }
+    let had_leading_slash = line.starts_with('/');
+    let core = line.trim_start_matches('/').trim_end_matches('/');
+    if core.is_empty() {
+        return Vec::new();
+    }
+    let anchored = had_leading_slash || core.contains('/');
+    if anchored {
+        vec![core.to_string(), format!("{core}/**")]
+    } else {
+        vec![
+            core.to_string(),
+            format!("{core}/**"),
+            format!("**/{core}"),
+            format!("**/{core}/**"),
+        ]
+    }
 }
 
 /// POSIX-style relative path of `file` against `root`. Returns `None` if
@@ -266,6 +329,87 @@ mod tests {
         tmp.write(".env", b"x");
         let out = walk_repo(&tmp.root, &opts).unwrap();
         assert!(!rels(&out).contains(&".env".to_string()));
+    }
+
+    #[test]
+    fn respects_root_gitignore_directory_and_anchored_patterns() {
+        let tmp = Tmp::new("gitignore");
+        // The exact shape that started this: an ignored IDE dir leaking in.
+        tmp.write(
+            ".gitignore",
+            b"# JetBrains\n.idea\n\n/target\n.claude/settings.local.json\n",
+        );
+        tmp.write(".idea/workspace.xml", b"<x/>");
+        tmp.write(".idea/misc.xml", b"<x/>");
+        tmp.write("target/debug/out.txt", b"x");
+        tmp.write(".claude/settings.local.json", b"{}");
+        tmp.write(".claude/skills/keep.md", b"# kept"); // not ignored — must survive
+        tmp.write("src/main.rs", b"fn main() {}");
+        let out = walk_repo(&tmp.root, &WalkOptions::default()).unwrap();
+        // `.gitignore` itself is not matched by any pattern, so it survives.
+        assert_eq!(
+            rels(&out),
+            vec![
+                ".claude/skills/keep.md".to_string(),
+                ".gitignore".to_string(),
+                "src/main.rs".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn gitignore_ignores_comments_blanks_and_negations() {
+        let tmp = Tmp::new("gitignore-edge");
+        // Negation is unsupported: `keep.log` stays excluded by `*.log`, not
+        // re-included. Comment and blank lines contribute nothing.
+        tmp.write(".gitignore", b"# a comment\n\n*.log\n!keep.log\n");
+        tmp.write("app.log", b"x");
+        tmp.write("keep.log", b"x");
+        tmp.write("main.rs", b"fn main() {}");
+        let out = walk_repo(&tmp.root, &WalkOptions::default()).unwrap();
+        assert_eq!(
+            rels(&out),
+            vec![".gitignore".to_string(), "main.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn malformed_gitignore_line_is_skipped_not_fatal() {
+        let tmp = Tmp::new("gitignore-bad");
+        // An unclosed character class is an invalid glob; it must be dropped
+        // silently rather than aborting the walk.
+        tmp.write(".gitignore", b"[\nbadname\n");
+        tmp.write("badname", b"x");
+        tmp.write("keep.rs", b"fn main() {}");
+        let out = walk_repo(&tmp.root, &WalkOptions::default()).unwrap();
+        assert_eq!(
+            rels(&out),
+            vec![".gitignore".to_string(), "keep.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_gitignore_walks_normally() {
+        let tmp = Tmp::new("gitignore-none");
+        tmp.write("a.rs", b"//");
+        tmp.write("b.go", b"//");
+        let out = walk_repo(&tmp.root, &WalkOptions::default()).unwrap();
+        assert_eq!(rels(&out), vec!["a.rs".to_string(), "b.go".to_string()]);
+    }
+
+    #[test]
+    fn built_in_excludes_apply_even_if_gitignore_omits_them() {
+        let tmp = Tmp::new("gitignore-floor");
+        // `.gitignore` says nothing about secrets; the built-in floor still drops them.
+        tmp.write(".gitignore", b"*.log\n");
+        tmp.write(".env", b"SECRET=x");
+        tmp.write("cert.pem", b"-----BEGIN");
+        tmp.write("keep.rs", b"//");
+        let out = walk_repo(&tmp.root, &WalkOptions::default()).unwrap();
+        assert_eq!(
+            rels(&out),
+            vec![".gitignore".to_string(), "keep.rs".to_string()]
+        );
     }
 
     #[test]

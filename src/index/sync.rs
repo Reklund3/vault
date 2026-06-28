@@ -52,8 +52,8 @@ pub struct SyncReport {
 pub enum SyncError {
     #[error("project name collision for {name:?}: {message}")]
     ProjectNameCollision { name: String, message: String },
-    #[error("declined Haiku cost — sync aborted")]
-    DeclinedHaikuCost,
+    #[error("declined remote classification cost — sync aborted")]
+    DeclinedRemoteCost,
     #[error(
         "TEI embeddings server unreachable ({0}).\n\
          Start it with `vault tei start` (or check `vault tei status`), then re-run sync."
@@ -109,8 +109,18 @@ pub fn run_sync(opts: SyncOptions, config: &Config) -> Result<SyncReport, SyncEr
 
     let mode = config.classifier_mode();
     let backend = resolve_backend(config);
-    if mode == "auto" && backend == ResolvedBackend::Haiku && !walked.is_empty() {
-        prompt_for_haiku_cost(walked.len(), std::io::stdin().lock(), std::io::stderr())?;
+    if mode == "auto" && !walked.is_empty() {
+        match backend {
+            ResolvedBackend::Haiku => {
+                prompt_for_haiku_cost(walked.len(), std::io::stdin().lock(), std::io::stderr())?;
+            }
+            // The OpenAI-compatible backend bills per provider; we don't carry a
+            // pricing table, so confirm generically rather than quote a figure.
+            ResolvedBackend::OpenAiCompat => {
+                prompt_for_remote_cost(walked.len(), std::io::stdin().lock(), std::io::stderr())?;
+            }
+            ResolvedBackend::Gemma => {}
+        }
     }
 
     let classifier = build_classifier(config).map_err(SyncError::BuildClassifier)?;
@@ -369,14 +379,19 @@ fn process_file(
         }
     }
 
-    // If every chunk tripped the secret scan there's nothing useful to store —
-    // a chunkless document row is harmless (never retrievable) but noise. Record
-    // the skip so the report still reflects what happened.
+    // Nothing to store. Two distinct causes, reported distinctly so the user can
+    // tell them apart: either the parser produced no chunks at all (the file
+    // isn't being parsed into anything indexable — e.g. a binary entrypoint with
+    // no exported symbols, or a re-export module), or it produced chunks that
+    // were all dropped by the secret scan. Conflating these as "secrets" hides
+    // files that silently contribute nothing to the index.
     if chunks_with_emb.is_empty() {
-        report.files_skipped.push((
-            w.relative_path.clone(),
-            "all chunks dropped as secrets".to_string(),
-        ));
+        let reason = if before == 0 {
+            "produced no chunks — nothing indexable parsed".to_string()
+        } else {
+            "all chunks dropped as secrets".to_string()
+        };
+        report.files_skipped.push((w.relative_path.clone(), reason));
         return Ok(());
     }
 
@@ -553,7 +568,32 @@ fn prompt_for_haiku_cost<R: BufRead, W: Write>(
     if read > 0 && (trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes")) {
         Ok(())
     } else {
-        Err(SyncError::DeclinedHaikuCost)
+        Err(SyncError::DeclinedRemoteCost)
+    }
+}
+
+/// Confirmation for the OpenAI-compatible remote classifier on auto→remote
+/// fallback. No dollar figure (provider pricing varies and isn't tabled here);
+/// the user confirms that paid remote calls are acceptable. Same fail-closed
+/// EOF semantics as `prompt_for_haiku_cost`.
+fn prompt_for_remote_cost<R: BufRead, W: Write>(
+    file_count: usize,
+    mut stdin: R,
+    mut stderr: W,
+) -> Result<(), SyncError> {
+    let _ = writeln!(
+        stderr,
+        "Gemma not detected. Use the configured remote API (openai) for classification? \
+         {file_count} files — provider billing applies. [y/N] "
+    );
+    let _ = stderr.flush();
+    let mut line = String::new();
+    let read = stdin.read_line(&mut line).map_err(SyncError::Io)?;
+    let trimmed = line.trim();
+    if read > 0 && (trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes")) {
+        Ok(())
+    } else {
+        Err(SyncError::DeclinedRemoteCost)
     }
 }
 
@@ -932,6 +972,48 @@ mod tests {
         // recorded in files_skipped instead of leaving a chunkless doc row.
         assert!(store.upserts.borrow().is_empty());
         assert_eq!(report.files_skipped.len(), 1);
+        assert_eq!(
+            report.files_skipped[0].1, "all chunks dropped as secrets",
+            "a real secret drop keeps the secret reason"
+        );
+    }
+
+    // 5b. Parser produces zero chunks: reported as unparsed, not as a secret drop,
+    // so the user can spot files that silently contribute nothing to the index.
+    #[test]
+    fn file_with_no_indexable_chunks_is_reported_as_unparsed() {
+        let tmp = Tmp::new("no-chunks");
+        // .rs with no exported (pub) symbols → rust parser yields zero chunks.
+        tmp.write("empty.rs", b"// only a comment, no exported symbols\n");
+        let canonical = tmp.canonical();
+
+        let config = Config::default();
+        let mut store = StubStore::new();
+        let embedder = StubEmbedder::from_config(&config);
+        let classifier = ExtClassifier;
+
+        let walked = walk_repo(&canonical, &WalkOptions::default()).unwrap();
+        let report = sync_with(
+            1,
+            "p".to_string(),
+            &walked,
+            &mut store,
+            &embedder,
+            &classifier,
+        )
+        .unwrap();
+
+        assert!(store.upserts.borrow().is_empty());
+        assert_eq!(
+            report.chunks_dropped_secret, 0,
+            "no secret was involved — must not be attributed to the secret scan"
+        );
+        assert_eq!(report.files_skipped.len(), 1);
+        assert_eq!(report.files_skipped[0].0, "empty.rs");
+        assert_eq!(
+            report.files_skipped[0].1,
+            "produced no chunks — nothing indexable parsed"
+        );
     }
 
     // 6. Dry-run: stubs / classifier / embedder never touched; correct counters.
@@ -1103,7 +1185,7 @@ mod tests {
         let input: &[u8] = b"";
         let mut err = Vec::new();
         let r = prompt_for_haiku_cost(10, input, &mut err);
-        assert!(matches!(r, Err(SyncError::DeclinedHaikuCost)));
+        assert!(matches!(r, Err(SyncError::DeclinedRemoteCost)));
     }
 
     #[test]
@@ -1111,7 +1193,18 @@ mod tests {
         let input = b"n\n".to_vec();
         let mut err = Vec::new();
         let r = prompt_for_haiku_cost(10, &input[..], &mut err);
-        assert!(matches!(r, Err(SyncError::DeclinedHaikuCost)));
+        assert!(matches!(r, Err(SyncError::DeclinedRemoteCost)));
+    }
+
+    #[test]
+    fn remote_cost_prompt_accepts_y_and_declines_eof() {
+        let mut err = Vec::new();
+        prompt_for_remote_cost(5, &b"y\n"[..], &mut err).expect("y accepted");
+
+        let empty: &[u8] = b"";
+        let mut err2 = Vec::new();
+        let r = prompt_for_remote_cost(5, empty, &mut err2);
+        assert!(matches!(r, Err(SyncError::DeclinedRemoteCost)));
     }
 
     #[test]

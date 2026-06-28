@@ -9,14 +9,23 @@ alpha        = 0.6               # BM25/cosine weight — 0.0 = pure semantic, 1
 min_score    = 0.15              # drop hits scoring below this
 
 [router]
-mode    = "auto"                 # "auto" | "gemma" | "haiku"
+mode    = "auto"                 # "auto" | "gemma" | "haiku" | "openai" (alias "gemini")
 model   = "haiku"                # alias — vault resolves to the current latest Haiku
 timeout = 3                      # hot-path seconds before silent passthrough; raise for a slow local model
+remote  = "haiku"                # which backend "auto" falls back to when local Gemma is down: "haiku" | "openai"
+# OpenAI-compatible backend (used when mode/remote = "openai"). The API key is
+# read from the *environment* (the var named below) — NEVER put the key here.
+# base_url    = "https://generativelanguage.googleapis.com/v1beta/openai"  # AI Studio Gemini; Vertex express: https://aiplatform.googleapis.com/v1
+# api_key_env = "GEMINI_API_KEY"   # name of the env var holding the key
+# auth_header = "bearer"           # "bearer" (AI Studio) | "x-goog-api-key" (Vertex express)
+# NOTE: with the openai backend, set `model` to a provider id (e.g. "gemini-3.5-flash"), not the "haiku" alias.
 
 [classifier]
 mode    = "auto"                 # same selection rules as [router]
 model   = "haiku"
 timeout = 300                    # sync time, not hot path; large local models can need 30–90s/call
+remote  = "haiku"                # "haiku" | "openai" — mirrors [router]
+# base_url / api_key_env / auth_header mirror [router] when remote/mode = "openai".
 
 [mlx]
 endpoint     = "http://localhost:8080"   # mlx_lm.server (used in gemma or auto+reachable)

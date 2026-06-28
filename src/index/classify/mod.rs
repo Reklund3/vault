@@ -7,11 +7,13 @@ use crate::util::probe::mlx_reachable;
 
 mod gemma;
 mod haiku;
+mod openai_compat;
 #[cfg(test)]
 mod stub;
 
 pub(crate) use gemma::GemmaClassifier;
 pub(crate) use haiku::{HaikuClassifier, cost_estimate};
+pub(crate) use openai_compat::OpenAiCompatClassifier;
 #[cfg(test)]
 pub(crate) use stub::StubClassifier;
 
@@ -55,8 +57,10 @@ pub enum ClassifyError {
     BadResponse(String),
     #[error("unparseable classification: {0}")]
     Unparseable(String),
-    #[error("ANTHROPIC_API_KEY not set (required for the haiku classifier)")]
-    MissingApiKey,
+    #[error("{env_var} not set (required for the configured remote classifier)")]
+    MissingApiKey { env_var: String },
+    #[error("misconfigured classifier: {0}")]
+    Misconfigured(String),
 }
 
 pub trait Classifier {
@@ -146,14 +150,21 @@ pub(crate) fn parse_response(text: &str) -> Result<Classification, ClassifyError
 pub enum ResolvedBackend {
     Gemma,
     Haiku,
+    OpenAiCompat,
 }
 
-/// Resolve the classifier backend from `[classifier].mode`:
-/// - `gemma` / `haiku` force that backend.
+/// Resolve the classifier backend from `[classifier].mode` and
+/// `[classifier].remote`:
+/// - `gemma` / `haiku` / `openai` (alias `gemini`) force that backend.
 /// - `auto` (default, and any unrecognized value) probes the local mlx server;
-///   reachable → Gemma, otherwise → Haiku.
+///   reachable → Gemma, otherwise the configured `[classifier].remote` (`haiku`
+///   default, `openai` for the OpenAI-compatible backend).
 pub fn resolve_backend(config: &Config) -> ResolvedBackend {
-    resolve(config.classifier_mode(), config.mlx_endpoint())
+    resolve(
+        config.classifier_mode(),
+        config.mlx_endpoint(),
+        config.classifier_remote(),
+    )
 }
 
 /// Construct the configured classifier as a trait object. Mirrors
@@ -166,20 +177,30 @@ pub fn build_classifier(config: &Config) -> Result<Box<dyn Classifier>, Classify
     match resolve_backend(config) {
         ResolvedBackend::Gemma => Ok(Box::new(GemmaClassifier::from_config(config)?)),
         ResolvedBackend::Haiku => Ok(Box::new(HaikuClassifier::from_config(config)?)),
+        ResolvedBackend::OpenAiCompat => Ok(Box::new(OpenAiCompatClassifier::from_config(config)?)),
     }
 }
 
-fn resolve(mode: &str, mlx_endpoint: &str) -> ResolvedBackend {
+fn resolve(mode: &str, mlx_endpoint: &str, remote: &str) -> ResolvedBackend {
     match mode {
         "gemma" => ResolvedBackend::Gemma,
         "haiku" => ResolvedBackend::Haiku,
+        "openai" | "gemini" => ResolvedBackend::OpenAiCompat,
         _ => {
             if mlx_reachable(mlx_endpoint) {
                 ResolvedBackend::Gemma
             } else {
-                ResolvedBackend::Haiku
+                remote_backend(remote)
             }
         }
+    }
+}
+
+/// The remote backend `auto` falls back to when the local mlx server is down.
+fn remote_backend(remote: &str) -> ResolvedBackend {
+    match remote {
+        "openai" | "gemini" => ResolvedBackend::OpenAiCompat,
+        _ => ResolvedBackend::Haiku,
     }
 }
 
@@ -217,26 +238,36 @@ mod tests {
     #[test]
     fn resolve_forces_explicit_modes_without_probing() {
         assert_eq!(
-            resolve("gemma", "http://127.0.0.1:1"),
+            resolve("gemma", "http://127.0.0.1:1", "haiku"),
             ResolvedBackend::Gemma
         );
         assert_eq!(
-            resolve("haiku", "http://localhost:8080"),
+            resolve("haiku", "http://localhost:8080", "haiku"),
             ResolvedBackend::Haiku
+        );
+        assert_eq!(
+            resolve("openai", "http://localhost:8080", "haiku"),
+            ResolvedBackend::OpenAiCompat
         );
     }
 
     #[test]
-    fn resolve_auto_falls_back_to_haiku_when_unreachable() {
+    fn resolve_auto_falls_back_to_configured_remote_when_unreachable() {
         // Port 1 is privileged and not served — the probe fails fast.
+        // Default remote (haiku) preserves prior behavior.
         assert_eq!(
-            resolve("auto", "http://127.0.0.1:1"),
+            resolve("auto", "http://127.0.0.1:1", "haiku"),
             ResolvedBackend::Haiku
         );
         // Unrecognized modes are treated as auto.
         assert_eq!(
-            resolve("nonsense", "http://127.0.0.1:1"),
+            resolve("nonsense", "http://127.0.0.1:1", "haiku"),
             ResolvedBackend::Haiku
+        );
+        // remote = openai falls back to the OpenAI-compatible backend.
+        assert_eq!(
+            resolve("auto", "http://127.0.0.1:1", "openai"),
+            ResolvedBackend::OpenAiCompat
         );
     }
 
@@ -295,7 +326,7 @@ dims = 768
             Ok(_) => panic!("expected MissingApiKey, got Ok(classifier)"),
             Err(e) => e,
         };
-        assert!(matches!(err, ClassifyError::MissingApiKey));
+        assert!(matches!(err, ClassifyError::MissingApiKey { .. }));
         if let Some(v) = prior {
             unsafe { std::env::set_var("ANTHROPIC_API_KEY", v) };
         }
