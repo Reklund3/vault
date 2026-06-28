@@ -57,7 +57,7 @@ The router returns `{ skip: true }` for prompts that need no context — immedia
 | `src/retrieve/router/openai_compat.rs` | Generic OpenAI-compatible impl (Gemini AI Studio / Vertex express / any `/chat/completions`); static key from `api_key_env`, Bearer or `x-goog-api-key` auth |
 | `src/retrieve/hybrid.rs` | BM25 + cosine score merge |
 | `src/retrieve/budget.rs` | token-aware chunk selection |
-| `src/parse/` | per-language parsers (proto, go, rust, openapi, markdown); `select_parser` dispatches on `(doc_type, language)` — `plan` and unrecognized types fall back to a single whole-file chunk |
+| `src/parse/` | per-language parsers (proto, go, rust, openapi, markdown); `select_parser` dispatches on `(doc_type, language)` — `plan` and unrecognized types fall back to `whole_file_chunks` (single chunk when small, line-windowed when over the embed ceiling) |
 | `src/index/classify/mod.rs` | Classifier trait + auto/gemma/haiku/openai selection (mirrors the router) |
 | `src/index/classify/gemma.rs` | Local Gemma classifier |
 | `src/index/classify/haiku.rs` | Anthropic Haiku classifier (cost prompt on first use) |
@@ -162,10 +162,12 @@ The remaining open knobs are empirical, not blocking:
 |----------|----------|----------|
 | contract | proto | per message/service/enum |
 | contract | openapi | per path+method, per schema component |
-| plan | any | whole file |
+| plan | any | whole file, unless over the embed ceiling → windowed (see below) |
 | convention | go/rust | per exported symbol + doc comment |
 | convention/meta | markdown | per `##` heading block |
 | convention | scala | whole file (v1) |
+
+Whole-file fallback (`plan` docs and any file no structural parser claims) is **windowed**: content under `MAX_FALLBACK_CHUNK_TOKENS` (1500, well under nomic's 8192-token context) stays a single chunk — identical to the historical behavior — while larger content is greedily packed by whole lines into ordered, embeddable chunks. This keeps a large file from exceeding the embedder's input limit and aborting the whole document. A single line longer than the ceiling (minified blob, one-line log) is truncated head-only rather than char-split, so the per-chunk secret scan can't be bisected. The sync report counts windowed files and truncated lines.
 
 ## Scoring & Tuning
 

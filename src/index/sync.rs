@@ -11,7 +11,7 @@ use crate::index::classify::{
 use crate::index::secrets;
 use crate::index::walk::{WalkError, WalkOptions, Walked, walk_repo};
 use crate::parse::{self, select_parser};
-use crate::store::{Chunk, ChunkWithEmbedding, Document, SqliteStore, Store, StoreError};
+use crate::store::{ChunkWithEmbedding, Document, SqliteStore, Store, StoreError};
 use crate::types::{DocType, Language};
 
 const HEAD_BYTES: usize = 1024;
@@ -36,6 +36,8 @@ pub struct SyncReport {
     pub files_skipped_remote_classify: usize, // head trip → ext fallback (0 in dry-run)
     pub files_parsed_via_parser: usize, // 0 in dry-run
     pub files_parsed_as_whole: usize, // 0 in dry-run
+    pub files_windowed: usize,   // whole-file fallback that split into >1 chunk
+    pub oversize_lines_truncated: usize, // single lines over the ceiling, truncated head-only
     // Label distribution: "doc_type/language" → count, over every file the
     // classifier (or ext fallback) labeled this run. Surfaces a systematic
     // misclassification (e.g. protos landing as plan/whole-file) — the
@@ -346,14 +348,17 @@ fn process_file(
             },
             None => {
                 report.files_parsed_as_whole += 1;
-                vec![Chunk {
-                    language: classification.language,
-                    label: filename.clone(),
-                    content: content_str.clone(),
-                    content_hash: parse::sha256_hex(content_str.as_bytes()),
-                    token_est: parse::estimate_tokens(&content_str),
-                    chunk_index: 0,
-                }]
+                // Whole-file fallback (plan docs + anything no parser claims) is
+                // windowed so a large file can't exceed the embedder input limit
+                // and abort the whole document (finding 5B). Small files still
+                // yield a single chunk, identical to the prior behavior.
+                let (fallback_chunks, truncated) =
+                    parse::whole_file_chunks(&content_str, classification.language, &filename);
+                if fallback_chunks.len() > 1 {
+                    report.files_windowed += 1;
+                }
+                report.oversize_lines_truncated += truncated;
+                fallback_chunks
             }
         };
 
@@ -507,6 +512,20 @@ pub fn format_report(report: &SyncReport) -> String {
             "  Parsed as whole-file:   {}",
             report.files_parsed_as_whole
         );
+        if report.files_windowed > 0 {
+            let _ = writeln!(
+                out,
+                "    of which windowed:    {} (split into multiple chunks)",
+                report.files_windowed
+            );
+        }
+        if report.oversize_lines_truncated > 0 {
+            let _ = writeln!(
+                out,
+                "    oversize lines cut:   {} (single line over the embed ceiling, head kept)",
+                report.oversize_lines_truncated
+            );
+        }
         if !report.classifications.is_empty() {
             let _ = writeln!(out);
             let _ = writeln!(out, "  Label breakdown (doc_type/language):");

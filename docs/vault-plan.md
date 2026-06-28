@@ -319,7 +319,7 @@ END;
 - Chunk per path+method combination, per `components/schemas` entry (plus Swagger 2 top-level `definitions`)
 
 **Markdown** (plans, conventions, meta):
-- Plans: whole file
+- Plans: whole file, unless over the embed ceiling (`MAX_FALLBACK_CHUNK_TOKENS`, 1500) → line-windowed into ordered chunks so large plans still embed (finding 5B). Oversized single lines are truncated head-only.
 - Conventions/meta: per `##` heading block (not `#` — top heading is document title)
 
 ---
