@@ -998,6 +998,123 @@ mod tests {
         );
     }
 
+    fn lang_chunk(language: Language, label: &str, content: &str, idx: u32) -> Chunk {
+        Chunk {
+            language,
+            label: label.to_string(),
+            content: content.to_string(),
+            content_hash: format!("hash-{label}"),
+            token_est: 10,
+            chunk_index: idx,
+        }
+    }
+
+    #[test]
+    fn hybrid_search_zero_match_language_filter_degrades_to_search() {
+        // The proto trap: the router emits languages=["proto"] for "how does
+        // vault parse proto files?", but vault's own proto-parsing code lives in
+        // a rust-classified chunk — there are zero proto-language chunks. The
+        // languages/doc_types values are enum-valid (from_raw drops garbage), so
+        // the only failure is a valid value matching zero chunks. That must
+        // degrade to an unfiltered search rather than silent total context loss.
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+        let project_id = create_project(&store, "vault");
+        store
+            .upsert_document(
+                &Document {
+                    project_id,
+                    doc_type: DocType::Convention,
+                    source_path: "src/parse/proto.rs".into(),
+                    title: "proto.rs".into(),
+                    content_hash: "h".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: lang_chunk(
+                        Language::Rust,
+                        "parse_proto",
+                        "fn parse_proto chunks each message service and enum",
+                        0,
+                    ),
+                    embedding: unit_embedding(0),
+                }],
+            )
+            .unwrap();
+
+        let plan = QueryPlan {
+            projects: vec![],
+            type_names: vec![],
+            topics: vec![],
+            doc_types: vec![DocType::Contract], // zero contract chunks
+            languages: vec![Language::Proto],   // zero proto chunks
+        };
+        let hits = store
+            .hybrid_search(&plan, &unit_embedding(0), config.alpha())
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "a filter matching zero chunks must retry unfiltered, not return nothing"
+        );
+        assert_eq!(hits[0].label, "parse_proto");
+    }
+
+    #[test]
+    fn hybrid_search_matching_language_filter_does_not_broaden() {
+        // Negative control: a language filter that DOES match must filter, not
+        // broaden. The retry only fires on an empty result, so a non-empty
+        // filtered pass is returned verbatim — proto chunks stay excluded.
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+        let project_id = create_project(&store, "vault");
+        store
+            .upsert_document(
+                &Document {
+                    project_id,
+                    doc_type: DocType::Convention,
+                    source_path: "src/lib.rs".into(),
+                    title: "lib.rs".into(),
+                    content_hash: "hr".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: lang_chunk(Language::Rust, "RustWidget", "fn widget rust impl", 0),
+                    embedding: unit_embedding(0),
+                }],
+            )
+            .unwrap();
+        store
+            .upsert_document(
+                &Document {
+                    project_id,
+                    doc_type: DocType::Contract,
+                    source_path: "api.proto".into(),
+                    title: "api.proto".into(),
+                    content_hash: "hp".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: proto_chunk("ProtoWidget", "message ProtoWidget { string widget = 1; }", 0),
+                    embedding: unit_embedding(1),
+                }],
+            )
+            .unwrap();
+
+        let plan = QueryPlan {
+            projects: vec![],
+            type_names: vec!["widget".into()],
+            topics: vec![],
+            doc_types: vec![],
+            languages: vec![Language::Rust],
+        };
+        let hits = store
+            .hybrid_search(&plan, &unit_embedding(0), config.alpha())
+            .unwrap();
+        assert!(!hits.is_empty(), "expected the rust chunk");
+        assert!(
+            hits.iter().all(|h| h.label == "RustWidget"),
+            "a matching language filter must exclude proto chunks, not broaden"
+        );
+    }
+
     #[test]
     fn prune_orphans_removes_missing_paths() {
         let mut store = SqliteStore::open_in_memory(&Config::default()).unwrap();

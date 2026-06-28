@@ -118,7 +118,35 @@ pub trait Store {
         use crate::retrieve::hybrid::{TOP_K, merge};
         let bm25 = self.bm25_search(plan, TOP_K)?;
         let cosine = self.cosine_search(plan, embedding, TOP_K)?;
-        Ok(merge(bm25, cosine, alpha, TOP_K))
+        let hits = merge(bm25, cosine, alpha, TOP_K);
+
+        // Filter-trap fallback for `languages`/`doc_types`. These are enum-valid
+        // by the time they reach here (QueryPlan::from_raw drops unrecognized
+        // values), so — unlike a phantom `projects` name, which is degraded at
+        // value-resolution time — the only way they go wrong is a *valid* value
+        // that matches zero chunks (e.g. languages=["proto"] against a Rust-only
+        // repo, where the answer lives in rust-classified chunks). That failure
+        // is result-level, not value-level: it's invisible until the filtered
+        // query returns nothing, and per-field existence checks would miss the
+        // case where each field has chunks but their AND-combination is empty.
+        // So we key off the actual result. If the filtered pass found nothing
+        // and we had one of these structural filters to relax, retry once with
+        // both dropped, reusing the same embedding — the retry is SQL-only, no
+        // re-embed (matters on the hook hot path). `projects` is left intact:
+        // it's already degraded by `existing_project_ids`, so this composes with
+        // that fix rather than duplicating it. Downstream `min_score` gating
+        // still applies to the relaxed hits, so a genuinely-empty corpus returns
+        // nothing rather than unbounded noise.
+        if hits.is_empty() && (!plan.languages.is_empty() || !plan.doc_types.is_empty()) {
+            let mut relaxed = plan.clone();
+            relaxed.languages.clear();
+            relaxed.doc_types.clear();
+            let bm25 = self.bm25_search(&relaxed, TOP_K)?;
+            let cosine = self.cosine_search(&relaxed, embedding, TOP_K)?;
+            return Ok(merge(bm25, cosine, alpha, TOP_K));
+        }
+
+        Ok(hits)
     }
 
     #[allow(dead_code)]
