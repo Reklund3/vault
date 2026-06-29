@@ -277,22 +277,65 @@ mod tests {
         assert_eq!(q.len(), config.embedding_dim());
     }
 
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (na * nb)
+    }
+
+    // Order-trust is the load-bearing assumption of the batch path: we map
+    // out[i] → chunks[i] by position. A shape-only check (lengths) would pass
+    // even if TEI returned vectors out of order, silently mispairing every
+    // embedding. So verify *correspondence*: distinct probes placed at indices
+    // that straddle the MAX_CLIENT_BATCH boundary (also exercising sub-batching),
+    // each matched to its own single embed by cosine — not `==`, since batched
+    // vs single inference differs in the low bits (FP non-associativity).
     #[test]
     #[ignore = "requires live TEI at http://localhost:8081"]
-    fn live_tei_batch_embed_subbatches() {
+    fn live_tei_batch_preserves_order_across_subbatches() {
         let config = Config::default();
         let client = TeiEmbedder::from_config(&config).expect("client");
 
-        // More than MAX_CLIENT_BATCH so the sub-batch loop runs at least twice.
-        let texts: Vec<String> = (0..MAX_CLIENT_BATCH + 5)
-            .map(|i| format!("chunk number {i}"))
-            .collect();
+        let probes = [
+            (0usize, "the cat sat on the mat"),
+            (1, "quarterly revenue grew twelve percent year over year"),
+            (MAX_CLIENT_BATCH, "fn main() { println!(\"hello\"); }"),
+            (
+                MAX_CLIENT_BATCH + 1,
+                "photosynthesis converts sunlight into chemical energy",
+            ),
+        ];
+        // > MAX_CLIENT_BATCH forces a second sub-batch; probes straddle the seam.
+        let total = MAX_CLIENT_BATCH + 5;
+        let mut texts: Vec<String> = (0..total).map(|i| format!("filler row {i}")).collect();
+        for (idx, text) in probes {
+            texts[idx] = text.to_string();
+        }
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
 
         let out = client.embed_documents(&refs).expect("batch embed");
-        assert_eq!(out.len(), refs.len(), "one vector per input");
+        assert_eq!(out.len(), total, "one vector per input");
         for v in &out {
             assert_eq!(v.len(), config.embedding_dim());
         }
+
+        // Diagonal: each probe slot corresponds to that probe's own embedding.
+        for (idx, text) in probes {
+            let single = client.embed_document(text).expect("single embed");
+            let c = cosine(&out[idx], &single);
+            assert!(
+                c > 0.99,
+                "slot {idx} cosine {c:.4} — batch order not preserved?"
+            );
+        }
+        // Off-diagonal sanity: the probes are distinct enough that a reorder
+        // *would* be caught — otherwise the diagonal checks above are vacuous.
+        let single0 = client.embed_document(probes[0].1).expect("single embed");
+        let c_cross = cosine(&out[probes[1].0], &single0);
+        assert!(
+            c_cross < 0.95,
+            "probes too similar to detect a swap (cross cosine {c_cross:.4})"
+        );
     }
 }
