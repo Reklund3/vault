@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::config::{Config, ConfigError};
 use crate::embed::{EmbedError, Embedder, TeiEmbedder};
@@ -15,6 +16,13 @@ use crate::store::{ChunkWithEmbedding, Document, SqliteStore, Store, StoreError}
 use crate::types::{DocType, Language};
 
 const HEAD_BYTES: usize = 1024;
+
+/// Embed timeout for sync. The TEI client's 3s default is sized for the hook's
+/// single hot-path query embed; batched indexing sends up to `MAX_CLIENT_BATCH`
+/// chunks per request, so one batch of large (post-5B windowed) chunks can
+/// exceed 3s and skip the whole file. Sync is not latency-sensitive — give it
+/// room rather than spuriously drop documents.
+const SYNC_EMBED_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct SyncOptions {
     pub repo: PathBuf,
@@ -104,7 +112,8 @@ pub fn run_sync(opts: SyncOptions, config: &Config) -> Result<SyncReport, SyncEr
         None => prompt_for_project_name(&derived_name, std::io::stdin().lock(), std::io::stderr())?,
     };
 
-    let embedder = TeiEmbedder::from_config(config).map_err(SyncError::TeiUnreachable)?;
+    let embedder = TeiEmbedder::from_config_with_timeout(config, SYNC_EMBED_TIMEOUT)
+        .map_err(SyncError::TeiUnreachable)?;
     embedder
         .verify_against_server()
         .map_err(SyncError::TeiUnreachable)?;
@@ -366,23 +375,38 @@ fn process_file(
     chunks.retain(|c| !secrets::looks_like_secret(&c.content));
     report.chunks_dropped_secret += before - chunks.len();
 
-    let mut chunks_with_emb: Vec<ChunkWithEmbedding> = Vec::with_capacity(chunks.len());
-    for c in chunks {
-        match embedder.embed_document(&c.content) {
-            Ok(embedding) => chunks_with_emb.push(ChunkWithEmbedding {
-                chunk: c,
-                embedding,
-            }),
-            Err(e) => {
-                report
-                    .files_skipped
-                    .push((w.relative_path.clone(), format!("embed error: {e}")));
-                // Bail on this file; the path stays in kept_paths so its prior
-                // index entry survives the post-loop prune.
-                return Ok(());
-            }
+    // One batched embed call per file (finding 2B). Batching *per file* — not
+    // across files — keeps the prior per-chunk loop's skip granularity: a single
+    // embed failure skips exactly this file, and its path stays in kept_paths so
+    // the prior index entry survives the post-loop prune.
+    let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
+    let embeddings = match embedder.embed_documents(&texts) {
+        Ok(e) => e,
+        Err(e) => {
+            report
+                .files_skipped
+                .push((w.relative_path.clone(), format!("embed error: {e}")));
+            return Ok(());
         }
+    };
+    // Embedder contract: one vector per input, in order. Guard it anyway — a
+    // mismatch must skip the file, never silently truncate via zip.
+    if embeddings.len() != chunks.len() {
+        report.files_skipped.push((
+            w.relative_path.clone(),
+            format!(
+                "embed error: expected {} vectors, got {}",
+                chunks.len(),
+                embeddings.len()
+            ),
+        ));
+        return Ok(());
     }
+    let chunks_with_emb: Vec<ChunkWithEmbedding> = chunks
+        .into_iter()
+        .zip(embeddings)
+        .map(|(chunk, embedding)| ChunkWithEmbedding { chunk, embedding })
+        .collect();
 
     // Nothing to store. Two distinct causes, reported distinctly so the user can
     // tell them apart: either the parser produced no chunks at all (the file
@@ -844,6 +868,29 @@ mod tests {
         }
     }
 
+    /// Counts `embed_documents` invocations so a test can prove sync batches once
+    /// per file, not once per chunk. Delegates to an inner StubEmbedder (which
+    /// uses the default loop impl), so vectors are still produced per input.
+    struct CountingEmbedder {
+        inner: StubEmbedder,
+        batch_calls: AtomicUsize,
+    }
+    impl Embedder for CountingEmbedder {
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+        fn embed_document(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+            self.inner.embed_document(text)
+        }
+        fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+            self.inner.embed_query(text)
+        }
+        fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+            self.batch_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.embed_documents(texts)
+        }
+    }
+
     fn opts(repo: &Path, dry: bool) -> SyncOptions {
         SyncOptions {
             repo: repo.to_path_buf(),
@@ -994,6 +1041,48 @@ mod tests {
         assert_eq!(
             report.files_skipped[0].1, "all chunks dropped as secrets",
             "a real secret drop keeps the secret reason"
+        );
+    }
+
+    // 2B. One batched embed call per file, not one per chunk. A 3-message proto
+    // parses into 3 chunks but must trigger exactly one embed_documents call.
+    #[test]
+    fn embeds_one_batch_per_file() {
+        let tmp = Tmp::new("batch-per-file");
+        tmp.write(
+            "multi.proto",
+            b"syntax = \"proto3\";\nmessage A {}\nmessage B {}\nmessage C {}",
+        );
+        let canonical = tmp.canonical();
+
+        let config = Config::default();
+        let mut store = StubStore::new();
+        let embedder = CountingEmbedder {
+            inner: StubEmbedder::from_config(&config),
+            batch_calls: AtomicUsize::new(0),
+        };
+        let classifier = ExtClassifier;
+
+        let walked = walk_repo(&canonical, &WalkOptions::default()).unwrap();
+        let report = sync_with(
+            1,
+            "p".to_string(),
+            &walked,
+            &mut store,
+            &embedder,
+            &classifier,
+        )
+        .unwrap();
+
+        assert!(
+            report.chunks_indexed >= 3,
+            "3-message proto should yield ≥3 chunks, got {}",
+            report.chunks_indexed
+        );
+        assert_eq!(
+            embedder.batch_calls.load(Ordering::SeqCst),
+            1,
+            "exactly one batched embed call for the single file"
         );
     }
 

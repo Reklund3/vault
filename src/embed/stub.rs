@@ -76,4 +76,25 @@ mod tests {
         assert_eq!(v.iter().filter(|f| **f != 0.0).count(), 1);
         assert!(v.contains(&1.0));
     }
+
+    // The default `embed_documents` (used by every backend without a batch
+    // endpoint) must return one vector per input, in order, identical to calling
+    // `embed_document` individually. sync zips the result against its chunks, so
+    // order and count are load-bearing.
+    #[test]
+    fn default_embed_documents_matches_individual_in_order() {
+        let e = StubEmbedder::from_config(&Config::default());
+        let texts = ["alpha", "beta", "gamma"];
+        let batch = e.embed_documents(&texts).unwrap();
+        assert_eq!(batch.len(), 3);
+        for (i, t) in texts.iter().enumerate() {
+            assert_eq!(batch[i], e.embed_document(t).unwrap());
+        }
+    }
+
+    #[test]
+    fn default_embed_documents_empty_input_returns_empty() {
+        let e = StubEmbedder::from_config(&Config::default());
+        assert!(e.embed_documents(&[]).unwrap().is_empty());
+    }
 }

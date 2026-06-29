@@ -12,6 +12,14 @@ pub trait Embedder {
 
     fn embed_document(&self, text: &str) -> Result<Vec<f32>, EmbedError>;
     fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError>;
+
+    /// Embed many documents in one shot. The default loops over `embed_document`
+    /// (correct for any backend); `TeiEmbedder` overrides it to issue a single
+    /// batched HTTP request per server batch. Returns exactly one vector per
+    /// input, in input order — callers zip the result against their chunks.
+    fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        texts.iter().map(|t| self.embed_document(t)).collect()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
