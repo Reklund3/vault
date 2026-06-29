@@ -87,9 +87,11 @@ consistently or the cosine scores will be miscalibrated.
 - Asymmetric query/document prefixes (above)
 - Supported natively by TEI, no model conversion required
 
-The dimension count is **locked at schema creation**: `chunks_vec FLOAT[768]` cannot
-be changed without rebuilding the entire index. This is why **Step 0** of the
-implementation order is *confirm embedding dims* before writing schema.
+The dimension defaults to 768 but is **configurable** via `[embeddings].dims`:
+`chunks_vec` is created at that dim and then **locked per-DB** — the first sync
+records `(model, dim)` in the `meta` table, and changing it later requires
+rebuilding the entire index (delete `vault.db` and re-sync). This is why **Step 0**
+of the implementation order is *confirm embedding dims* before indexing.
 
 ---
 
@@ -172,10 +174,10 @@ prints an example line to add. The hook never auto-spawns regardless — see
 
 - **Step 0** — confirm dims (768 for nomic-embed-text-v1.5) and write
   `[embeddings]` block to `vault.toml`
-- **Step 1** — `chunks_vec FLOAT[768]` declared in `store/schema.rs`
+- **Step 1** — `chunks_vec FLOAT[N]` created in `store/schema.rs` at the configured dim (default 768)
 - **Step 8** — `src/embed/tei.rs` — HTTP client against TEI's `/embeddings` endpoint,
   applies the `search_document:` / `search_query:` prefix, returns `Vec<f32>` of
-  length 768
+  the configured length (768 for nomic-embed-text-v1.5)
 - Failure mode at hook time is the same as any backend timeout: silent passthrough,
   no context block, never breaks Claude Code
 
@@ -185,7 +187,8 @@ prints an example line to add. The hook never auto-spawns regardless — see
 
 - Re-embedding when content changes — index sync uses content-hash to detect new
   chunks, so unchanged chunks keep their existing vector
-- Alternative models — switching dims requires a full reindex, so model changes are
-  a deliberate migration, not a config flip
+- Alternative models — a different dim is a config knob now (`[embeddings].dims`),
+  applied when a fresh DB is built; switching on an existing DB still requires a
+  full reindex, so it's a deliberate migration rather than a hot swap
 - GPU acceleration via TEI — supported by the server itself, not needed at our
   corpus size

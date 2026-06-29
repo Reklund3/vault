@@ -82,7 +82,8 @@ dims     = 768
 
 - Model: `nomic-ai/nomic-embed-text-v1.5` (Apache 2.0, 768 dims, asymmetric
   `search_document:` / `search_query:` prefixes)
-- Dimensions: **768, locked** at schema creation — `chunks_vec FLOAT[768]`
+- Dimensions: **768 by default**, configurable via `[embeddings].dims` — `chunks_vec`
+  is built at that dim and locked per-DB after first sync (recorded in `meta`)
 - Step 0 unblocked. Schema can be written.
 - Why not fastembed-rs: bus-factor concern (single maintainer), ONNX Windows build
   issues, runtime model download. TEI is HuggingFace-maintained and avoids those.
@@ -91,12 +92,12 @@ dims     = 768
 
 **Subject to change** — see `docs/embeddings.md` for the full rationale. If TEI
 becomes inconvenient, the swap is mechanical: change `src/embed/tei.rs` for a new
-backend, keep the schema and the 768-dim contract.
+backend, keep the schema and the configured-dim contract.
 
 ### SQLite + FTS5 + sqlite-vec
 Single embedded database at `~/.vault/vault.db`. No external services.
 - FTS5 for BM25 keyword retrieval (porter stemming)
-- sqlite-vec for cosine similarity at 768 dims
+- sqlite-vec for cosine similarity at the configured dim (768 default)
 - rusqlite with `bundled` feature (compiles SQLite from source, supports extension loading)
 
 ### Manual explicit sync only
@@ -260,8 +261,9 @@ meta). If no context block is present, none was relevant.
 ### Blocking — resolved
 1. **Embedding approach** — TEI (HuggingFace `text-embeddings-inference`). See
    "Embeddings — TEI (current decision)" above and `docs/embeddings.md`.
-2. **Vector dimensions** — 768 (nomic-embed-text-v1.5). Locked in schema as
-   `chunks_vec FLOAT[768]`.
+2. **Vector dimensions** — 768 default (nomic-embed-text-v1.5), set via
+   `[embeddings].dims`. `chunks_vec` is created at that dim and locked per-DB
+   (recorded in `meta`); changing it needs a full reindex.
 
 ### Non-blocking (empirical, validate with vault diagnose)
 - Alpha tuning (BM25/cosine weight) — start 0.6/0.4
