@@ -216,10 +216,10 @@ CREATE VIRTUAL TABLE chunks_fts USING fts5(
   tokenize='porter unicode61'
 );
 
--- sqlite-vec: nomic-embed-text = 768 dims, locked
+-- sqlite-vec: dim from [embeddings].dims (768 = nomic default), locked per-DB
 CREATE VIRTUAL TABLE chunks_vec USING vec0(
   chunk_id  INTEGER PRIMARY KEY,
-  embedding FLOAT[768]
+  embedding FLOAT[768]   -- built in `migrate` at the configured dim, not in SCHEMA_V1
 );
 
 -- Retrieval audit — used for tuning alpha and token budget
@@ -244,21 +244,24 @@ CREATE TABLE meta (
 ### Migrations & the embedding lock
 
 The schema is versioned through SQLite's built-in `PRAGMA user_version`, not a
-migrations table. `schema::migrate` reads `user_version`; when it is `< 1` it
-applies the whole DDL above as `SCHEMA_V1` (every statement is
-`CREATE … IF NOT EXISTS`) and stamps `user_version = 1`. There is no v2 ladder
-yet — the project is pre-deployment, so new columns (e.g. `projects.domain`)
-are folded into the base schema rather than added as incremental steps.
+migrations table. `schema::migrate(conn, dim)` reads `user_version`; when it is
+`< 1` it applies the DDL above as `SCHEMA_V1` (every statement is
+`CREATE … IF NOT EXISTS`), then creates `chunks_vec` separately with the
+configured `dim` formatted into `FLOAT[N]` (vec0 fixes the dimension at table
+creation, so it can't live in the fixed-text const), and stamps
+`user_version = 1`. There is no v2 ladder yet — the project is pre-deployment, so
+new columns (e.g. `projects.domain`) are folded into the base schema rather than
+added as incremental steps.
 
-`chunks_vec FLOAT[768]` is fixed at table creation, so the embedding stack is
-locked the first time a DB is opened. `verify_or_init_embedding(model, dim)`
-enforces this: on a fresh DB it writes `embedding_model` / `embedding_dim` into
-`meta`; on every later open it compares the caller's configured values against
-the stored ones and returns `IncompatibleEmbedding` on mismatch. It also
-refuses any configured `dim` that differs from the schema-locked 768 up front,
-so a 1024-in-config / 768-in-schema mismatch fails fast at startup instead of
-producing vec0 errors later. Changing the embedding model therefore means a
-full reindex, by construction.
+`chunks_vec` is created at the configured dim and vec0 fixes that dimension at
+table creation, so the embedding stack is locked the first time a DB is opened.
+`verify_or_init_embedding(model, dim)` is the lock: on a fresh DB it writes
+`embedding_model` / `embedding_dim` into `meta`; on every later open it compares
+the caller's configured values against the stored ones and returns
+`IncompatibleEmbedding` on mismatch. (Well-formedness of the dim — non-zero — is
+checked in `migrate`, which rejects `FLOAT[0]`.) A fresh DB therefore honors
+whatever `[embeddings].dims` declares, while changing the model or dim on an
+existing DB means a full reindex, by construction.
 
 ### FTS5 Sync Triggers
 
@@ -888,7 +891,7 @@ router_model  = "gemma-4-31b-bf16"       # the loaded mlx_lm model (serves route
 [embeddings]
 endpoint = "http://localhost:8081"       # HuggingFace text-embeddings-inference
 model    = "nomic-ai/nomic-embed-text-v1.5"
-dims     = 768                           # locked at schema creation — chunks_vec FLOAT[768]
+dims     = 768                           # chunks_vec built at this dim, then locked per-DB (change ⇒ delete vault.db + re-sync)
 
 [indexer.exclude]
 # Appended to the built-in defaults (see Indexing → Exclusions). The defaults
@@ -1086,7 +1089,7 @@ No session state lives in vault.db. The hook binary is read-only at runtime.
 | Embedder placement | External process (TEI), not linked into vault | Process boundary as defense-in-depth: smaller Cargo audit surface in vault, execution-context separation, vault stays out of candle/ort/safetensors CVE surface. Trade-off accepted: one extra service to install + start once. NOT a hard security wall — TEI runs as the same OS user, so FS / network permissions are equivalent; see `docs/security.md` "Process boundaries are defense-in-depth" |
 | TEI launcher in v1 | `vault tei start \| stop \| status \| logs` subcommand group | Hides the operational surface so daily use is one binary even though two processes run. `[embeddings].launcher_cmd` config knob; child-process spawn does `env_clear()` then re-adds a minimal allowlist (`PATH`, `HOME`, HuggingFace cache vars, locale; plus required system vars on Windows) — `ANTHROPIC_API_KEY` never inherited. Detach via `process_group(0)` (Unix) / `DETACHED_PROCESS` (Windows). Hook never auto-spawns; `vault index sync` errors with a hint to run `vault tei start` if unreachable |
 | Embedding model | `nomic-ai/nomic-embed-text-v1.5` | Apache 2.0, strong MTEB scores, asymmetric `search_document:` / `search_query:` prefixes; supported natively by TEI |
-| Vector dimensions | 768 | Locked at schema creation — `chunks_vec FLOAT[768]`. Changing the model means a full reindex |
+| Vector dimensions | 768 default, set by `[embeddings].dims` | `chunks_vec` built at that dim, locked per-DB via `meta`; changing the model/dim means a full reindex |
 | Primary interface | Pre-send hook (vault hook) | All routing/retrieval before Claude sees prompt; zero Claude token cost |
 | Hook runtime access | Read-only | No session writes; vault.db only written during explicit index sync |
 | Context tag | Domain-level; `{domain}-context` by convention | Tag signals knowledge domain (software, finance, personal) not individual project; per-project assignment in vault.db, tag meaning authored in ~/.claude/CLAUDE.md |
@@ -1171,7 +1174,7 @@ Bottom-up so retrieval is testable before the full stack is wired:
 ```
 Step 0  confirm embed stack  — TEI reachable at localhost:8081 with nomic-embed-text-v1.5
                               (768 dims). Write [embeddings] block in vault.toml. chunks_vec
-                              FLOAT[768] is locked at schema creation. `vault tei start`
+                              is built at [embeddings].dims, then locked per-DB. `vault tei start`
                               (Step 8b) launches TEI from [embeddings].launcher_cmd.
 Step 1  store/schema.rs     — embedded SQL, migration runner, open DB,
                               sqlite-vec auto-extension registration

@@ -21,9 +21,11 @@ Provides 768-dim embeddings for `nomic-ai/nomic-embed-text-v1.5`. Required by
 when TEI is down, so the only operational consequence of TEI being offline at
 hook time is "no new context injection until it's back."
 
-The dimension is **locked at 768** because `chunks_vec FLOAT[768]` is fixed at
-schema creation. Verifying the dim before any real indexing is the Step 0
-prerequisite.
+The dimension defaults to **768** (nomic-embed-text-v1.5). `chunks_vec` is built
+at whatever `[embeddings].dims` declares, then locked per-DB — the first sync
+records `(model, dim)` in the `meta` table and changing it means deleting
+`vault.db` and re-syncing. Verifying the server's dim matches your configured
+`dims` before any real indexing is the Step 0 prerequisite.
 
 ### One-time install (macOS, Apple Silicon)
 
@@ -94,7 +96,8 @@ Two checks. First, health:
 curl -fs http://localhost:8081/health && echo "ok"
 ```
 
-Then confirm the dim is actually 768 — this is the Step 0 gate:
+Then confirm the dim matches your configured `dims` (768 for the default model) —
+this is the Step 0 gate:
 
 ```bash
 curl -s http://localhost:8081/v1/embeddings \
@@ -103,9 +106,10 @@ curl -s http://localhost:8081/v1/embeddings \
   | jq '.data[0].embedding | length'
 ```
 
-Expected output: `768`. Anything else means the schema's `FLOAT[768]` is wrong
-for whatever model is loaded — either swap the model or migrate the schema.
-Don't proceed with `vault index sync` until this prints 768.
+Expected output: `768` for the default model. It must match `[embeddings].dims`
+in `vault.toml` — anything else means the loaded model and your configured `dims`
+disagree (fix whichever is wrong). Don't proceed with `vault index sync` until
+the printed length matches your `dims`.
 
 ### Stop
 
@@ -125,7 +129,7 @@ rm ~/.vault/tei.pid
 | `Address already in use` on start | Old TEI still running, or another service on 8081 | `lsof -i :8081` — kill the holder or pick a different port (and update `vault.toml`) |
 | Stalls at `Downloading` | First-run model fetch, slow link | Wait. `~/.cache/huggingface/` will hold it after the first time |
 | `jq` returns `null` for embedding length | TEI started but model failed to load | Check the server log — likely a Metal/macOS-version mismatch or insufficient memory |
-| Embedding dim != 768 | Wrong model loaded | Confirm `--model-id` is exactly `nomic-ai/nomic-embed-text-v1.5` (not `-v1` or another variant) |
+| Embedding dim != configured `dims` | Wrong model loaded, or `dims` misconfigured | Confirm `--model-id` matches `[embeddings].model` (default `nomic-ai/nomic-embed-text-v1.5`, 768-dim — not `-v1` or another variant) |
 | Cold-start latency > 30s | Model still downloading | Check `~/.cache/huggingface/hub/` size; let it finish |
 
 ### Notes on the model
