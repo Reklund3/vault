@@ -144,7 +144,7 @@ See `docs/embeddings.md` for the full write-up. Current decisions (subject to ch
 
 - **Backend** — HuggingFace [text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference) (TEI), an official Rust HTTP server. Single binary, no Python deps, OpenAI-compatible `/embeddings` endpoint. Endpoint defaults to `http://localhost:8081`.
 - **Model** — `nomic-ai/nomic-embed-text-v1.5`. Apply the `search_document:` prefix at index time and `search_query:` at query time.
-- **Dimensions** — **768, locked**. `chunks_vec FLOAT[768]` is fixed at schema creation; changing the model means a full reindex.
+- **Dimensions** — defaults to **768** (nomic-embed-text-v1.5). `chunks_vec` is created at the dim from `[embeddings].dims`, then **locked per-DB**: the first sync records `(model, dim)` in the `meta` table and later opens must match. Changing the model/dim means a full reindex (delete `~/.vault/vault.db` and re-sync). The schema no longer hardcodes 768 — only the config default does.
 
 `vault index sync` requires TEI reachable (hard error if not). At hook time, TEI unreachable falls under the same 3-second silent passthrough as any other backend failure.
 

@@ -17,7 +17,8 @@ pub enum StoreError {
     #[error(
         "incompatible embedding: DB has ({stored_model}, dim {stored_dim}); \
          config requires ({expected_model}, dim {expected_dim}). \
-         Run `vault embed migrate` to re-embed against the new model."
+         A model/dim change needs a full re-index: delete ~/.vault/vault.db and \
+         re-run `vault index sync`."
     )]
     IncompatibleEmbedding {
         stored_model: String,
