@@ -1,9 +1,11 @@
 # Runbook
 
-Operational steps for the runtime services vault depends on. None of these are
-managed by vault itself yet — Step 8b (`vault tei start|stop|status|logs`) and
-the equivalent gemma launcher are planned but not implemented. Until they land,
-start each service manually using the sections below.
+Operational steps for the runtime services vault depends on. The TEI launcher
+(`vault tei start|stop|status|logs`) **is implemented** (`src/tei/launcher.rs`)
+and handles spawn + PID/log management for you. The equivalent Gemma/mlx launcher
+is **not** built yet, so the Gemma service is still started by hand. The manual
+recipes below remain the fallback for TEI (and the only option for Gemma); they
+also document exactly what `vault tei start` automates.
 
 Service ports are fixed by `~/.vault/vault.toml`:
 
@@ -85,8 +87,9 @@ nohup text-embeddings-router \
 echo $! > ~/.vault/tei.pid
 ```
 
-(Once Step 8b lands, `vault tei start` will do all of this with proper PID and
-log management. Until then, manage by hand.)
+(`vault tei start` automates all of this — spawn, detach, and PID + log
+management in `~/.vault/`. The manual recipe above is the fallback or for
+debugging.)
 
 ### Verify
 
