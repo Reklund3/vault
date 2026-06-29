@@ -34,7 +34,7 @@ router_model = "REPLACE_ME"              # your mlx_lm model name or path, e.g. 
 [embeddings]
 endpoint = "http://localhost:8081"       # HuggingFace text-embeddings-inference (TEI)
 model    = "nomic-ai/nomic-embed-text-v1.5"
-dims     = 768                           # locked at schema creation — chunks_vec FLOAT[768]
+dims     = 768                           # chunks_vec is built at this dim, then locked per-DB (change ⇒ delete vault.db + re-sync)
 
 [indexer.exclude]
 # Appended to the built-in defaults (.env*, *.pem, .ssh/**, .aws/**,

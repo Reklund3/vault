@@ -87,7 +87,7 @@ impl SqliteStore {
 
 impl Store for SqliteStore {
     fn migrate(&mut self) -> Result<(), StoreError> {
-        schema::migrate(&self.conn)
+        schema::migrate(&self.conn, self.embedding_dim)
     }
 
     fn get_or_create_project(&mut self, name: &str, repo_path: &str) -> Result<i64, StoreError> {
