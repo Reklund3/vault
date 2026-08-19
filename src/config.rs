@@ -168,7 +168,7 @@ pub(crate) fn vault_dir_path() -> Option<PathBuf> {
 
 impl Config {
     // Todo for now we do this. Will load from vault.toml later?
-    pub(crate) fn load() -> Result<Self, ConfigError> {
+    pub fn load() -> Result<Self, ConfigError> {
         let config_path = home_dir()
             .ok_or(ConfigError::HomeNotFound)?
             .join(CONFIG_DIR)

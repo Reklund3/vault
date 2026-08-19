@@ -1,19 +1,8 @@
-mod config;
-mod configure;
-mod diagnose;
-mod embed;
-mod hook;
-mod index;
-mod parse;
-mod retrieve;
-mod store;
-mod tei;
-mod types;
-mod util;
-
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+
+use vault::{config, configure, diagnose, hook, index, tei};
 
 #[derive(Parser)]
 #[command(name = "vault", about = "vault: project context for Claude Code")]
