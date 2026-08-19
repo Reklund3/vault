@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Once;
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -107,11 +108,50 @@ fn register_vec_extension() {
     });
 }
 
+/// How long a connection waits for a lock before giving up with `SQLITE_BUSY`.
+///
+/// With WAL enabled readers never block on the writer, so this only governs
+/// writer-vs-writer contention — two concurrent `vault index sync` runs. Waiting
+/// is the right answer there. The hook is a reader and never pays it.
+///
+/// Note this value matches what rusqlite already applies on `Connection::open`,
+/// so setting it changes nothing today. It is here to pin the number vault
+/// depends on rather than inherit a library default that could change without
+/// notice — `open_sets_a_busy_timeout` guards it in either direction.
+const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
+
+/// Connection-level setup applied to every vault connection.
+///
+/// `foreign_keys` and `busy_timeout` are per-connection in SQLite and must be
+/// set on each open. `journal_mode` is persisted in the database file, but
+/// setting it every time is idempotent and keeps a restored or hand-created
+/// `vault.db` from silently running in rollback-journal mode.
+///
+/// WAL is what lets a `vault hook` read run while a `vault index sync` write is
+/// in flight — under the default rollback journal the reader would block, and
+/// the hook is on the prompt hot path. It is an availability property, not a
+/// correctness one: if the filesystem can't support WAL (network homes are the
+/// usual case) the connection keeps working in whatever mode SQLite chose, just
+/// with less concurrency. That is why a non-WAL result is not an error.
+fn apply_pragmas(conn: &Connection, wal: bool) -> Result<(), StoreError> {
+    conn.pragma_update(None, "foreign_keys", true)
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    conn.busy_timeout(BUSY_TIMEOUT)
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    if wal {
+        // `PRAGMA journal_mode` reports the resulting mode as a result row, so
+        // `pragma_update` (which expects no rows back) cannot be used here.
+        let _mode: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn open(path: &Path) -> Result<Connection, StoreError> {
     register_vec_extension();
     let conn = Connection::open(path).map_err(|e| StoreError::Backend(e.to_string()))?;
-    conn.pragma_update(None, "foreign_keys", true)
-        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    apply_pragmas(&conn, true)?;
     Ok(conn)
 }
 
@@ -119,8 +159,8 @@ pub(crate) fn open(path: &Path) -> Result<Connection, StoreError> {
 pub(crate) fn open_in_memory() -> Result<Connection, StoreError> {
     register_vec_extension();
     let conn = Connection::open_in_memory().map_err(|e| StoreError::Backend(e.to_string()))?;
-    conn.pragma_update(None, "foreign_keys", true)
-        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    // An in-memory database has no journal file; WAL does not apply to it.
+    apply_pragmas(&conn, false)?;
     Ok(conn)
 }
 
@@ -234,6 +274,220 @@ mod tests {
             |_| Ok(()),
         )
         .is_ok()
+    }
+
+    /// Unique temp path per test run; the file DB tests need a real file
+    /// because WAL does not apply to `:memory:`.
+    fn temp_db_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "vault-pragma-{tag}-{}-{nanos}.db",
+            std::process::id()
+        ))
+    }
+
+    /// A connection set up the way vault opened databases *before* WAL and
+    /// `busy_timeout` were applied: SQLite's defaults. Used to reproduce the
+    /// contention the pragmas fix, so the tests below fail for the original
+    /// reason rather than passing vacuously.
+    fn legacy_open(path: &std::path::Path) -> Connection {
+        register_vec_extension();
+        let conn = Connection::open(path).expect("legacy open");
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        // Explicit rather than implied: these two are exactly what the fix changed.
+        conn.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get::<_, String>(0))
+            .unwrap();
+        conn.busy_timeout(Duration::from_millis(0)).unwrap();
+        conn
+    }
+
+    fn is_busy(e: &rusqlite::Error) -> bool {
+        matches!(
+            e,
+            rusqlite::Error::SqliteFailure(f, _)
+                if f.code == rusqlite::ErrorCode::DatabaseBusy
+                    || f.code == rusqlite::ErrorCode::DatabaseLocked
+        )
+    }
+
+    /// The defect, reproduced. Under the rollback journal a reader holding a
+    /// transaction keeps a SHARED lock, and the writer's COMMIT needs EXCLUSIVE
+    /// — so the commit is refused. With no busy timeout that surfaces
+    /// immediately as SQLITE_BUSY.
+    ///
+    /// This is precisely the production case: `vault hook` reads on the prompt
+    /// hot path while `vault index sync` writes.
+    #[test]
+    fn legacy_setup_lets_a_reader_break_a_writers_commit() {
+        let path = temp_db_path("legacy-contention");
+        let w = legacy_open(&path);
+        migrate(&w, DEFAULT_DIM).expect("migrate");
+        let r = legacy_open(&path);
+
+        // Reader opens a transaction and touches a table -> holds SHARED.
+        r.execute_batch("BEGIN; SELECT count(*) FROM projects;")
+            .expect("reader begins");
+
+        // Writer gets RESERVED fine; it is the COMMIT (EXCLUSIVE) that fails.
+        w.execute_batch(
+            "BEGIN IMMEDIATE; INSERT INTO projects (name, created_at) VALUES ('p', 0);",
+        )
+        .expect("writer begins");
+        let err = w
+            .execute_batch("COMMIT;")
+            .expect_err("commit must be refused");
+        assert!(is_busy(&err), "expected SQLITE_BUSY/LOCKED, got: {err}");
+
+        let _ = r.execute_batch("ROLLBACK;");
+        drop(r);
+        drop(w);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The fix. Same shape as the test above, but through `open()`: in WAL the
+    /// reader keeps a snapshot instead of a lock, so the writer commits.
+    #[test]
+    fn wal_lets_a_writer_commit_while_a_reader_holds_a_transaction() {
+        let path = temp_db_path("wal-contention");
+        let w = open(&path).expect("open writer");
+        migrate(&w, DEFAULT_DIM).expect("migrate");
+        let r = open(&path).expect("open reader");
+
+        r.execute_batch("BEGIN; SELECT count(*) FROM projects;")
+            .expect("reader begins");
+
+        w.execute_batch(
+            "BEGIN IMMEDIATE; INSERT INTO projects (name, created_at) VALUES ('p', 0); COMMIT;",
+        )
+        .expect("writer must commit despite the open reader");
+
+        let _ = r.execute_batch("ROLLBACK;");
+        drop(r);
+        drop(w);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Property test, not a fix test. WAL still serializes writer-vs-writer (the
+    /// two concurrent `vault index sync` case), so the second writer must *wait*
+    /// rather than fail. This holds via rusqlite's default timeout as much as
+    /// ours; it pins the behaviour vault relies on.
+    #[test]
+    fn busy_timeout_makes_a_second_writer_wait_rather_than_fail() {
+        use std::sync::mpsc;
+
+        let path = temp_db_path("writer-contention");
+        let setup = open(&path).expect("open");
+        migrate(&setup, DEFAULT_DIM).expect("migrate");
+        drop(setup);
+
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let holder_path = path.clone();
+        let holder = std::thread::spawn(move || {
+            let c = open(&holder_path).expect("holder open");
+            c.execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO projects (name, created_at) VALUES ('held', 0);",
+            )
+            .expect("holder takes the write lock");
+            locked_tx.send(()).unwrap();
+            // Held briefly — far under the 5s busy timeout, so the waiter wins.
+            std::thread::sleep(Duration::from_millis(150));
+            c.execute_batch("COMMIT;").expect("holder commits");
+        });
+
+        locked_rx.recv().expect("holder signalled");
+
+        // With busy_timeout the contended write waits for the holder and succeeds.
+        let waiter = open(&path).expect("waiter open");
+        waiter
+            .execute_batch("INSERT INTO projects (name, created_at) VALUES ('waited', 0);")
+            .expect("must wait for the holder, not fail");
+
+        holder.join().unwrap();
+        drop(waiter);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The same contention with `busy_timeout = 0` fails immediately — proving
+    /// the timeout above is what made the difference.
+    #[test]
+    fn without_busy_timeout_a_contended_write_fails_immediately() {
+        let path = temp_db_path("no-timeout");
+        let setup = open(&path).expect("open");
+        migrate(&setup, DEFAULT_DIM).expect("migrate");
+
+        let holder = open(&path).expect("holder");
+        holder
+            .execute_batch(
+                "BEGIN IMMEDIATE; INSERT INTO projects (name, created_at) VALUES ('held', 0);",
+            )
+            .expect("holder takes the write lock");
+
+        let impatient = open(&path).expect("impatient");
+        impatient.busy_timeout(Duration::from_millis(0)).unwrap();
+        let err = impatient
+            .execute_batch("INSERT INTO projects (name, created_at) VALUES ('nope', 0);")
+            .expect_err("must fail without a busy timeout");
+        assert!(is_busy(&err), "expected SQLITE_BUSY/LOCKED, got: {err}");
+
+        let _ = holder.execute_batch("ROLLBACK;");
+        drop(holder);
+        drop(impatient);
+        drop(setup);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_enables_wal_on_a_file_db() {
+        // WAL is what lets a `vault hook` read proceed while a `vault index
+        // sync` write is in flight. Without it the hook blocks on the prompt
+        // hot path.
+        let path = temp_db_path("wal");
+        let conn = open(&path).expect("open");
+
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .expect("read journal_mode");
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Guards the value, not our code path: rusqlite already applies a 5s busy
+    /// timeout on open, so this passes with or without `apply_pragmas` setting
+    /// it. It is a regression guard against that default changing underneath us.
+    #[test]
+    fn open_sets_a_busy_timeout() {
+        let path = temp_db_path("busy");
+        let conn = open(&path).expect("open");
+
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .expect("read busy_timeout");
+        assert_eq!(timeout, BUSY_TIMEOUT.as_millis() as i64);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_in_memory_sets_busy_timeout_and_skips_wal() {
+        // Covers the `wal: false` branch: an in-memory db has no journal file,
+        // so WAL is not requested, but the timeout still applies.
+        let conn = open_in_memory().expect("open");
+
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .expect("read busy_timeout");
+        assert_eq!(timeout, BUSY_TIMEOUT.as_millis() as i64);
+
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .expect("read journal_mode");
+        assert_ne!(mode.to_ascii_lowercase(), "wal");
     }
 
     #[test]
