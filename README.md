@@ -40,9 +40,6 @@ vault index sync ~/repos/build-service --dry-run      # preview: walk + counts o
 # Diagnose retrieval quality
 vault diagnose "what does BuildRequest need for auth?"
 vault diagnose "what does BuildRequest need for auth?" --alpha 0.75
-
-# Remove a project
-vault index remove --project build-service
 ```
 
 Sync is always explicit — you choose when to index and from what branch. This prevents WIP branch state from polluting the vault. Always sync from main/trunk.

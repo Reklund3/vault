@@ -12,11 +12,52 @@ Routing is local-first via Gemma (zero Claude token cost). When Gemma is unreach
 
 ```bash
 cargo build
-cargo build --release
+cargo build --release --locked   # as CI builds it
 cargo test
-cargo test <test_name>       # run a single test
-cargo run -- <subcommand>    # e.g. cargo run -- diagnose "what does BuildRequest need?"
+cargo test <test_name>           # run a single test
+cargo run -- <subcommand>        # e.g. cargo run -- diagnose "what does BuildRequest need?"
 ```
+
+CI (`.github/workflows/ci.yml`) gates on `fmt` first, then runs `test`, `build --release --locked`,
+and `clippy` in parallel behind it. Both gates are enforced — run them before pushing:
+
+```bash
+cargo fmt --check              # blocks every other CI job
+cargo clippy -- -D warnings    # warnings are errors in CI
+```
+
+### Subcommand flags
+
+```bash
+vault configure --force                     # re-seed an existing ~/.vault/vault.toml
+
+vault index sync <repo>                     # classify -> parse -> embed -> upsert
+vault index sync <repo> --name <name>       # project-name override (default: canonical path's last component)
+vault index sync <repo> --domain <domain>   # skip the first-run domain prompt
+vault index sync <repo> --dry-run           # walk + cache lookup only: no TEI, no classifier, no writes
+
+vault diagnose "<prompt>"                   # full retrieval trace
+vault diagnose "<prompt>" --alpha 0.75      # override the BM25/cosine weight for this run
+vault diagnose "<prompt>" --stub            # StubEmbedder instead of TEI (plumbing only, cosine meaningless)
+vault diagnose "<prompt>" --no-router       # build the QueryPlan from CLI flags; isolates the store from routing
+```
+
+## Docs & Project Skills
+
+| Doc | Role |
+|------|---------------|
+| `docs/vault-plan.md` | canonical design spec — the 14-step order, schema DDL, config shape. **Written before Steps 1–14 were built and has drifted; cross-check against the source before trusting it.** |
+| `docs/plan-review-2026-06-11.md` | the recorded drift — findings verified against the tree at `6b08f9d`, each naming where the plan contradicts the code. Read alongside `vault-plan.md`. |
+| `docs/security.md` | threat model, trust-boundary table, full design constraints |
+| `docs/embeddings.md` | what an embedding is here, and why nomic-embed-text-v1.5 + TEI |
+| `docs/runbook.md` | starting the runtime services by hand — TEI has a launcher, the Gemma/mlx one is not built yet |
+| `docs/vault-context.md` | design-conversation log |
+
+`.claude/skills/` ships three project skills:
+
+- **`impl-status`** — reads the source tree against the 14-step order; reports position and the next blocker
+- **`parser-test`** — runs one `src/parse/` parser against a sample file and pretty-prints the chunks, so boundary correctness can be checked without the full hook pipeline
+- **`schema-check`** — verifies `src/store/schema.rs` DDL against the spec; `chunks_vec FLOAT[N]` is locked at creation and the FTS5 triggers must stay in sync with `chunks`
 
 ## Architecture
 
@@ -44,6 +85,7 @@ The router returns `{ skip: true }` for prompts that need no context — immedia
 
 | Path | Responsibility |
 |------|---------------|
+| `src/main.rs` | clap `Cli`/`Command` definitions and subcommand dispatch — the only place execution modes are wired |
 | `src/hook/mod.rs` | stdin→stdout hook protocol, full pipeline entry; outcome taxonomy (injected / skip / failed-at-stage) |
 | `src/hook/log.rs` | hook telemetry — one metadata-only JSONL record per call to `~/.vault/hook.log` (5MB rotation) |
 | `src/store/traits.rs` | `Store` trait + `StoreError` — backend abstraction; carries the embedding model/dim lock error |
@@ -65,8 +107,10 @@ The router returns `{ skip: true }` for prompts that need no context — immedia
 | `src/index/walk.rs` | repo walker — globset exclusions, symlink refusal, canonical-root bound (enforces the indexer security rules) |
 | `src/index/sync.rs` | `vault index sync` pipeline — classify → parse (whole-file fallback) → embed → upsert; `SyncReport` |
 | `src/index/secrets.rs` | index-time secret pre-scan (`RegexSet`) — drops chunks matching AWS/GitHub/Anthropic/OpenAI/JWT/PEM patterns before storage |
+| `src/embed/mod.rs` | `Embedder` trait + `EmbedError`; the default `embed_documents` loops `embed_document`, TEI overrides it with one batched request |
 | `src/embed/tei.rs` | nomic-embed-text-v1.5 embeddings via TEI HTTP (`localhost:8081`); single + batched (`embed_documents`, sub-batched to TEI's client cap) |
 | `src/tei/launcher.rs` | `vault tei start\|stop\|status\|logs` — spawn TEI from `[embeddings].launcher_cmd` with env scrubbing; PID + log in `~/.vault/`; cross-platform detach |
+| `src/configure/mod.rs` | `vault configure` — provisions `~/.vault/` (0700), seeds `vault.toml` only when absent, prints the hook entry; `--force` re-seeds |
 | `src/diagnose/mod.rs` | `vault diagnose "<prompt>"` — full retrieval trace for tuning α and token budget |
 | `src/config.rs` | `vault.toml` parsing — `Config`, `ConfigError`, context-tag fallback (`default_context_tag`), router/classifier mode + timeout knobs |
 | `src/types.rs` | top-level shared enums — `Language`, `DocType` (orthogonal axes used across parse/classify/router) |
@@ -210,6 +254,7 @@ Vault is on the hot path of every Claude Code prompt. Full design constraints, t
 - **Index-time secret pre-scan.** Chunks matching common secret patterns (AWS keys, GitHub/Anthropic/OpenAI tokens, JWT, PEM headers) are dropped before storage.
 - **Classifier sees filename + extension + first 1KB only**, never full files. Full content reaches Anthropic only via retrieval-time injection, which the user controls via `vault diagnose`.
 - **Hook fails open.** Any error → empty stdout, exit 0 — never block the user. Failures stay observable without breaking that contract: one stderr breadcrumb (visible only in Claude Code debug mode) plus a metadata-only JSONL record in `~/.vault/hook.log` — never prompt text, never chunk content; error detail truncated.
+- **Stub backends are `#[cfg(test)]`-gated on purpose.** `retrieve/router/stub.rs` and `index/classify/stub.rs` compile only under test, so the compiler enforces that a stub can never become a silent production fallback — with Gemma and the remote backend both unreachable, vault passes through (hook) or prompts/fails (sync), never guesses. `embed/stub.rs` is deliberately **not** gated: `vault diagnose --stub` exposes `StubEmbedder` in release builds to trace retrieval plumbing without TEI, and says so in its output. Don't "resolve" that asymmetry in either direction.
 - **`~/.claude/settings.json` should reference vault by absolute path** (not `vault hook` resolved via PATH).
 
 ## v1 Scope Boundaries
