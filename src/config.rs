@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -14,10 +14,18 @@ pub enum ConfigError {
     #[error("missing key {0}")]
     #[allow(dead_code)]
     MissingKey(String),
-    #[error("io error reading config: {0}")]
-    IoError(#[from] std::io::Error),
-    #[error("parse error: {0}")]
-    ParseError(#[from] toml::de::Error),
+    #[error("io error reading config {}: {source}", path.display())]
+    IoError {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("parse error in {}: {source}", path.display())]
+    ParseError {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -151,6 +159,15 @@ pub struct Config {
     // falls back to the built-in exclusion list.
     #[serde(default)]
     indexer: Indexer,
+
+    /// Where `vault.db`, `hook.log` and this file live.
+    ///
+    /// Not read from the toml — `#[serde(skip)]` — because it records where the
+    /// config *came from*, which a file cannot know about itself. `None` means
+    /// "resolve `~/.vault` from the environment at call time", which is the
+    /// historical behaviour and what `Config::default()` gets.
+    #[serde(skip)]
+    vault_dir: Option<PathBuf>,
 }
 
 // Todo: Move to a helper file/dir
@@ -167,15 +184,45 @@ pub(crate) fn vault_dir_path() -> Option<PathBuf> {
 }
 
 impl Config {
-    // Todo for now we do this. Will load from vault.toml later?
+    /// Load `~/.vault/vault.toml`. The convenience constructor, and what every
+    /// CLI subcommand uses.
     pub fn load() -> Result<Self, ConfigError> {
-        let config_path = home_dir()
-            .ok_or(ConfigError::HomeNotFound)?
-            .join(CONFIG_DIR)
-            .join(CONFIG_FILE);
-        let content = std::fs::read_to_string(config_path)?;
-        let config: Config = toml::from_str(&content)?;
+        let dir = vault_dir_path().ok_or(ConfigError::HomeNotFound)?;
+        Self::from_path(dir)
+    }
+
+    /// Load `<dir>/vault.toml` and remember `dir` as this config's vault
+    /// directory, so `vault_dir` and `db_path` resolve against it rather than
+    /// against `$HOME`.
+    ///
+    /// This is the constructor for a consumer that is not the user's login
+    /// shell — a service in a container, or one running as a different user,
+    /// where `$HOME` either does not exist or is not where vault's data lives.
+    pub fn from_path(dir: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let dir = dir.as_ref();
+        let config_path = dir.join(CONFIG_FILE);
+        let content =
+            std::fs::read_to_string(&config_path).map_err(|source| ConfigError::IoError {
+                path: config_path.clone(),
+                source,
+            })?;
+        let mut config: Config =
+            toml::from_str(&content).map_err(|source| ConfigError::ParseError {
+                path: config_path,
+                source,
+            })?;
+        config.vault_dir = Some(dir.to_path_buf());
         Ok(config)
+    }
+
+    /// Point an already-built `Config` at an explicit vault directory.
+    ///
+    /// The pair to `from_path` for a consumer that has no `vault.toml` at all —
+    /// a container configured entirely from defaults still needs to say where
+    /// `vault.db` goes.
+    pub fn with_vault_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        self.vault_dir = Some(dir.as_ref().to_path_buf());
+        self
     }
 
     pub fn embedding_dim(&self) -> usize {
@@ -300,7 +347,10 @@ impl Config {
     /// write into it (e.g. the TEI launcher) are responsible for `create_dir_all`
     /// and permission hardening.
     pub fn vault_dir(&self) -> Result<PathBuf, ConfigError> {
-        vault_dir_path().ok_or(ConfigError::HomeNotFound)
+        match &self.vault_dir {
+            Some(dir) => Ok(dir.clone()),
+            None => vault_dir_path().ok_or(ConfigError::HomeNotFound),
+        }
     }
 
     pub fn db_path(&self) -> Result<PathBuf, ConfigError> {
@@ -330,6 +380,9 @@ impl Default for Config {
                 launcher_cmd: None,
             },
             indexer: Indexer::default(),
+            // No file was read, so there is nowhere to remember. `vault_dir()`
+            // falls back to `$HOME` — call `with_vault_dir` to pin it.
+            vault_dir: None,
         }
     }
 }
@@ -562,5 +615,137 @@ dims = 768
         let cfg: Config = toml::from_str(toml_text).expect("parse");
         assert_eq!(cfg.router_timeout(), Duration::from_secs(5));
         assert_eq!(cfg.classifier_timeout(), Duration::from_secs(120));
+    }
+
+    // ----- vault directory resolution (lib-split Step 7) -----
+
+    const MINIMAL_TOML: &str = r#"
+[defaults]
+context_tag = "container-context"
+token_budget = 10000
+alpha = 0.6
+min_score = 0.15
+
+[router]
+mode = "auto"
+model = "haiku"
+
+[mlx]
+endpoint = "http://localhost:8080"
+router_model = "test"
+
+[embeddings]
+endpoint = "http://localhost:8081"
+model = "nomic-ai/nomic-embed-text-v1.5"
+dims = 768
+"#;
+
+    /// One temp dir per test; cleaned up on drop.
+    struct TmpDir(PathBuf);
+    impl TmpDir {
+        fn new(label: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let root = std::env::temp_dir().join(format!(
+                "vault-config-{label}-{}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).expect("mkdir");
+            Self(root)
+        }
+        fn write_config(&self, body: &str) -> &Path {
+            std::fs::write(self.0.join(CONFIG_FILE), body).expect("write");
+            &self.0
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn from_path_reads_the_toml_in_that_directory() {
+        let tmp = TmpDir::new("reads");
+        let dir = tmp.write_config(MINIMAL_TOML);
+
+        let cfg = Config::from_path(dir).expect("load from explicit dir");
+        assert_eq!(cfg.default_context_tag(), "container-context");
+    }
+
+    /// The whole point of Step 7: a consumer that named a directory gets that
+    /// directory back, not `$HOME`. Asserting the exact paths is what makes this
+    /// fail if `vault_dir` ever silently re-derives from the environment — and it
+    /// does so without mutating `HOME`, which would race the other tests.
+    #[test]
+    fn from_path_pins_vault_dir_and_db_path_away_from_home() {
+        let tmp = TmpDir::new("pins");
+        let dir = tmp.write_config(MINIMAL_TOML);
+
+        let cfg = Config::from_path(dir).expect("load");
+
+        assert_eq!(cfg.vault_dir().expect("dir"), dir);
+        assert_eq!(cfg.db_path().expect("db"), dir.join(CONFIG_DB));
+
+        if let Some(home) = home_dir() {
+            assert!(
+                !cfg.db_path().expect("db").starts_with(home),
+                "explicit dir must not resolve under $HOME"
+            );
+        }
+    }
+
+    /// A container configured entirely from defaults still has to say where
+    /// `vault.db` goes, and it has no toml for `from_path` to read.
+    #[test]
+    fn with_vault_dir_pins_a_config_that_has_no_toml() {
+        let dir = Path::new("/srv/vault-data");
+        let cfg = Config::default().with_vault_dir(dir);
+
+        assert_eq!(cfg.vault_dir().expect("dir"), dir);
+        assert_eq!(cfg.db_path().expect("db"), dir.join(CONFIG_DB));
+    }
+
+    /// `load()` keeps the historical behaviour, and an unpinned `Config` still
+    /// resolves `~/.vault` — the hook's logger and `vault configure` depend on
+    /// that path existing without a config to consult.
+    #[test]
+    fn an_unpinned_config_still_resolves_under_home() {
+        let cfg = Config::default();
+        match home_dir() {
+            Some(home) => assert_eq!(cfg.vault_dir().expect("dir"), home.join(CONFIG_DIR)),
+            None => assert!(matches!(cfg.vault_dir(), Err(ConfigError::HomeNotFound))),
+        }
+    }
+
+    /// A consumer juggling two config directories needs to know *which* one
+    /// failed. An unqualified "No such file or directory" does not say.
+    #[test]
+    fn a_missing_config_names_the_path_it_looked_at() {
+        let tmp = TmpDir::new("missing");
+        let err = Config::from_path(&tmp.0).expect_err("no toml written");
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&tmp.0.join(CONFIG_FILE).display().to_string()),
+            "error must name the path it tried: {rendered}"
+        );
+        assert!(matches!(err, ConfigError::IoError { .. }));
+    }
+
+    #[test]
+    fn a_malformed_config_names_the_path_it_parsed() {
+        let tmp = TmpDir::new("malformed");
+        let dir = tmp.write_config("this is not toml = = =");
+        let err = Config::from_path(dir).expect_err("malformed");
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&dir.join(CONFIG_FILE).display().to_string()),
+            "error must name the file it parsed: {rendered}"
+        );
+        assert!(matches!(err, ConfigError::ParseError { .. }));
     }
 }

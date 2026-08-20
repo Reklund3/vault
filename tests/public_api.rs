@@ -223,3 +223,16 @@ fn a_consumer_can_read_a_sync_report() {
     assert_eq!(report.chunks_indexed, 40);
     assert_eq!(report.domain, None);
 }
+
+/// A consumer whose data does not live under `$HOME` — a service in a
+/// container, or one running as a different user — must be able to say where it
+/// does. Without this, `Vault::open` would always resolve `~/.vault` and a
+/// containerised consumer could not point vault at a mounted volume.
+#[test]
+fn a_consumer_can_put_the_vault_directory_somewhere_other_than_home() {
+    let dir = std::path::Path::new("/srv/vault-data");
+    let config = Config::default().with_vault_dir(dir);
+
+    assert_eq!(config.vault_dir().expect("dir"), dir);
+    assert_eq!(config.db_path().expect("db"), dir.join("vault.db"));
+}
