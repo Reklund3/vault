@@ -167,7 +167,7 @@ fn resolve_tag(store: &dyn Store, config: &Config, projects: &[String]) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::SqliteStore;
+    use crate::store::{ChunkWithEmbedding, Document, RetrievalLogEntry, SqliteStore, StoreError};
     use crate::types::DocType;
 
     fn planned_for(projects: Vec<String>) -> PlannedQuery {
@@ -181,6 +181,84 @@ mod tests {
                 languages: vec![],
             },
             embedding: vec![0.0; config.embedding_dim()],
+        }
+    }
+
+    /// How the fake store answers `resolve_domain`.
+    enum Domain {
+        Assigned(&'static str),
+        Unassigned,
+        /// The store is reachable but the domain lookup fails.
+        Errors,
+    }
+
+    /// Minimal store for exercising tag resolution. `hybrid_search` returns a
+    /// fixed hit so retrieval reaches the tag step at all.
+    struct TagStore {
+        domain: Domain,
+    }
+
+    impl Store for TagStore {
+        fn migrate(&mut self) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn get_or_create_project(&mut self, _n: &str, _p: &str) -> Result<i64, StoreError> {
+            Ok(1)
+        }
+        fn upsert_document(
+            &mut self,
+            _doc: &Document,
+            _chunks: &[ChunkWithEmbedding],
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn get_document_content_hash(
+            &self,
+            _project_id: i64,
+            _source_path: &str,
+        ) -> Result<Option<String>, StoreError> {
+            Ok(None)
+        }
+        fn resolve_domain(&self, _projects: &[String]) -> Result<Option<String>, StoreError> {
+            match self.domain {
+                Domain::Assigned(d) => Ok(Some(d.to_string())),
+                Domain::Unassigned => Ok(None),
+                Domain::Errors => Err(StoreError::Backend("domain lookup failed".into())),
+            }
+        }
+        fn hybrid_search(
+            &self,
+            _plan: &QueryPlan,
+            _embedding: &[f32],
+            _alpha: f32,
+        ) -> Result<Vec<Hit>, StoreError> {
+            Ok(vec![hit("Chunk", "body")])
+        }
+        fn log_retrieval(&mut self, _entry: &RetrievalLogEntry) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn prune_orphans(&mut self, _p: i64, _kept: &[String]) -> Result<usize, StoreError> {
+            Ok(0)
+        }
+        fn bm25_search(&self, _plan: &QueryPlan, _top_k: usize) -> Result<Vec<Hit>, StoreError> {
+            Ok(vec![])
+        }
+        fn cosine_search(
+            &self,
+            _plan: &QueryPlan,
+            _embedding: &[f32],
+            _top_k: usize,
+        ) -> Result<Vec<Hit>, StoreError> {
+            Ok(vec![])
+        }
+    }
+
+    fn tag_of(domain: Domain) -> String {
+        let config = Config::default();
+        let store = TagStore { domain };
+        match search(&planned_for(vec!["p".into()]), &config, &store).expect("search") {
+            Retrieval::Context(c) => c.tag,
+            other => panic!("expected context, got {other:?}"),
         }
     }
 
@@ -256,5 +334,26 @@ mod tests {
         assert!(block.contains("## Alpha [contract]\naaa"));
         assert!(block.contains("## Beta [contract]\nbbb"));
         assert!(block.ends_with("</vault-context>\n"));
+    }
+
+    /// A project with a domain drives the tag by convention.
+    #[test]
+    fn assigned_domain_becomes_the_context_tag() {
+        assert_eq!(tag_of(Domain::Assigned("software")), "software-context");
+    }
+
+    /// No assignment falls back to `defaults.context_tag`.
+    #[test]
+    fn unassigned_project_uses_the_configured_fallback() {
+        assert_eq!(tag_of(Domain::Unassigned), "vault-context");
+    }
+
+    /// The documented degrade-don't-discard rule, previously untested: a failed
+    /// domain lookup must not throw away an otherwise-good result. The tag is
+    /// framing, not content — losing it is worth far less than losing the
+    /// chunks, so the fallback applies and retrieval still succeeds.
+    #[test]
+    fn a_failing_domain_lookup_degrades_to_the_fallback_tag() {
+        assert_eq!(tag_of(Domain::Errors), "vault-context");
     }
 }

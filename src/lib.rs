@@ -35,9 +35,16 @@ mod store;
 mod types;
 mod util;
 
-// The error types `VaultError` names are re-exported here so consumers can match
-// on them without the modules that define them becoming public.
+// Types named by the public API, re-exported so consumers can reach them
+// without the modules that define them becoming public.
+//
+// A public field whose type is unnameable is only half-public: `Context.hits`
+// can be read, but without `Hit` in scope a consumer cannot write a function
+// that takes one or store it in a struct. Everything reachable through a public
+// field belongs here — `tests/public_api.rs` names each of them so a regression
+// fails the build rather than surfacing as an awkward downstream workaround.
 pub use embed::EmbedError;
 pub use error::VaultError;
-pub use retrieve::{Context, PlannedQuery, Retrieval, RouterError, SkipReason};
-pub use store::StoreError;
+pub use retrieve::{Context, PlannedQuery, QueryPlan, Retrieval, RouterError, SkipReason};
+pub use store::{Hit, StoreError};
+pub use types::{DocType, Language};
