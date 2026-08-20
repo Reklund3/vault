@@ -5,10 +5,9 @@ use std::time::Instant;
 use serde::Deserialize;
 
 use crate::config::Config;
-use crate::embed::{Embedder, TeiEmbedder};
 use crate::error::VaultError;
-use crate::retrieve::{self, PlannedQuery, Retrieval, Router, RouterOutput, SkipReason};
-use crate::store::{SqliteStore, Store};
+use crate::retrieve::{PlannedQuery, Retrieval, SkipReason};
+use crate::vault::Vault;
 
 mod log;
 
@@ -159,57 +158,21 @@ fn pipeline(stdin: &str, tel: &mut log::Telemetry) -> Outcome {
             reason: SkipReason::EmptyPrompt,
         };
     }
-    let svc = match open_services() {
-        Ok(s) => s,
+    let config = match Config::load() {
+        Ok(c) => c,
+        Err(e) => return Outcome::from_vault_error(&VaultError::Config(e)),
+    };
+    let vault = match Vault::open(&config) {
+        Ok(v) => v,
         Err(e) => return Outcome::from_vault_error(&e),
     };
-    pipeline_with(
-        &event.prompt,
-        &svc.config,
-        &*svc.router,
-        &svc.embedder,
-        &svc.store,
-        tel,
-    )
+    pipeline_with(&event.prompt, &vault, tel)
 }
 
-/// Everything the retrieval pipeline needs, constructed together.
-///
-/// This is the shape `Vault::open` takes in lib-split Step 5. Returning one
-/// `Result<_, VaultError>` instead of five separately-tagged failures is what
-/// lets the caller derive telemetry from the error.
-struct Services {
-    config: Config,
-    router: Box<dyn Router>,
-    embedder: TeiEmbedder,
-    store: SqliteStore,
-}
-
-fn open_services() -> Result<Services, VaultError> {
-    let config = Config::load().map_err(VaultError::Config)?;
-    let router = retrieve::build_router(&config).map_err(VaultError::RouterBuild)?;
-    let embedder = TeiEmbedder::from_config(&config).map_err(VaultError::EmbedderBuild)?;
-    let db_path = config.db_path().map_err(VaultError::Config)?;
-    let store = SqliteStore::open(&db_path, &config).map_err(VaultError::DbOpen)?;
-    Ok(Services {
-        config,
-        router,
-        embedder,
-        store,
-    })
-}
-
-/// Inner pipeline with injected dependencies — testable with stubs. Adapts the
-/// library-shaped `retrieve_with` to the hook's fail-open `Outcome`.
-fn pipeline_with(
-    prompt: &str,
-    config: &Config,
-    router: &dyn Router,
-    embedder: &dyn Embedder,
-    store: &dyn Store,
-    tel: &mut log::Telemetry,
-) -> Outcome {
-    match retrieve_with(prompt, config, router, embedder, store, tel) {
+/// Inner pipeline with an injected `Vault` — testable with stub backends.
+/// Adapts the library-shaped `retrieve_with` to the hook's fail-open `Outcome`.
+fn pipeline_with(prompt: &str, vault: &Vault, tel: &mut log::Telemetry) -> Outcome {
+    match retrieve_with(prompt, vault, tel) {
         Ok(Retrieval::Skip(reason)) => Outcome::Skip { reason },
         Ok(Retrieval::Context(context)) => Outcome::Injected {
             chunks: context.hits.len(),
@@ -222,48 +185,40 @@ fn pipeline_with(
 
 /// The retrieval pipeline in library terms: `Ok` is a decision the system made
 /// (skip, or here is the context), `Err` is a failure carrying its real source.
-/// Nothing here decides to fail open — that is the caller's call, and for
-/// `vault hook` specifically it is `pipeline_with` above.
+/// Nothing here decides to fail open — that is `pipeline_with`'s job above.
 ///
-/// The body is two phases with a `PlannedQuery` between them. The first is
-/// network-bound and touches no store; the second is `retrieve::search`, which
-/// is store-bound and nothing else. That boundary is the point: a concurrent
-/// caller only has to serialise the second half.
-///
-/// Fills `tel` as it goes, so even a failure carries the timing that preceded
-/// it. Each `tel` write happens before the corresponding `?` for that reason.
+/// Uses the planner's two steps rather than `QueryPlanner::plan` so router and
+/// embed latency stay separately recorded; `hook.log` has always carried them as
+/// distinct fields. Each `tel` write happens before the corresponding `?` so a
+/// failure still reports the timing that preceded it.
 fn retrieve_with(
     prompt: &str,
-    config: &Config,
-    router: &dyn Router,
-    embedder: &dyn Embedder,
-    store: &dyn Store,
+    vault: &Vault,
     tel: &mut log::Telemetry,
 ) -> Result<Retrieval, VaultError> {
-    tel.backend = Some(router.name());
+    let planner = vault.planner();
+    tel.backend = Some(planner.backend());
 
     // --- phase 1: network-bound, no store access ---
     let t = Instant::now();
-    let planned = router.plan(prompt);
+    let routed = planner.route(prompt);
     tel.router_ms = Some(ms_since(t));
-    let plan = match planned.map_err(VaultError::RouterPlan)? {
-        RouterOutput::Skip => return Ok(Retrieval::Skip(SkipReason::RouterSkip)),
-        RouterOutput::Plan(p) => p,
+    let Some(plan) = routed? else {
+        return Ok(Retrieval::Skip(SkipReason::RouterSkip));
     };
 
     let t = Instant::now();
-    let embedded = embedder.embed_query(prompt);
+    let embedded = planner.embed_query(prompt);
     tel.embed_ms = Some(ms_since(t));
-    let embedding = embedded.map_err(VaultError::EmbedQuery)?;
+    let embedding = embedded?;
 
     let planned = PlannedQuery { plan, embedding };
 
     // --- phase 2: store-bound ---
-    // `query_ms` now spans the whole store phase (hybrid search, budget trim and
-    // tag resolution) rather than the hybrid query alone. That is the number
-    // worth having: it is how long a concurrent caller would hold the store.
+    // `query_ms` spans the whole store phase, which is exactly how long a
+    // concurrent caller would hold the store.
     let t = Instant::now();
-    let result = retrieve::search(&planned, config, store);
+    let result = vault.store().search(&planned);
     tel.query_ms = Some(ms_since(t));
     result
 }
@@ -371,10 +326,13 @@ mod tests {
             }
         }
     }
-    use crate::embed::StubEmbedder;
+    use crate::embed::{Embedder, StubEmbedder};
     use crate::retrieve::{QueryPlan, RouterError, StubRouter};
+    use crate::retrieve::{Router, RouterOutput};
+    use crate::store::Store;
     use crate::store::{ChunkWithEmbedding, Document, Hit, RetrievalLogEntry, StoreError};
     use crate::types::DocType;
+    use crate::vault::{QueryPlanner, VaultStore};
 
     /// Fake store that returns a canned list of hits regardless of query —
     /// keeps the pipeline tests focused on hook logic, not SQL behavior.
@@ -447,6 +405,20 @@ mod tests {
         }
     }
 
+    /// Assemble a `Vault` from stub backends. The facade is what production
+    /// uses, so the pipeline tests go through it too rather than around it.
+    fn vault_of(
+        config: &Config,
+        router: Box<dyn Router + Send + Sync>,
+        embedder: Box<dyn Embedder + Send + Sync>,
+        store: Box<dyn Store + Send>,
+    ) -> Vault {
+        Vault::from_parts(
+            QueryPlanner::from_parts(router, embedder),
+            VaultStore::from_store(store, config.clone()),
+        )
+    }
+
     fn sample_hit(label: &str, content: &str, score: f32) -> Hit {
         Hit {
             chunk_id: 1,
@@ -493,10 +465,12 @@ mod tests {
         let mut tel = log::Telemetry::default();
         let out = pipeline_with(
             "what is BuildRequest?",
-            &config,
-            &StubRouter,
-            &embedder,
-            &store,
+            &vault_of(
+                &config,
+                Box::new(StubRouter),
+                Box::new(embedder),
+                Box::new(store),
+            ),
             &mut tel,
         );
         let Outcome::Injected {
@@ -524,7 +498,16 @@ mod tests {
         };
         let embedder = StubEmbedder::from_config(&config);
         let mut tel = log::Telemetry::default();
-        let out = pipeline_with("q", &config, &StubRouter, &embedder, &store, &mut tel);
+        let out = pipeline_with(
+            "q",
+            &vault_of(
+                &config,
+                Box::new(StubRouter),
+                Box::new(embedder),
+                Box::new(store),
+            ),
+            &mut tel,
+        );
         let Outcome::Injected { block, .. } = out else {
             panic!("expected Injected, got {out:?}");
         };
@@ -543,7 +526,16 @@ mod tests {
         };
         let embedder = StubEmbedder::from_config(&config);
         let mut tel = log::Telemetry::default();
-        let _ = pipeline_with("q", &config, &StubRouter, &embedder, &store, &mut tel);
+        let _ = pipeline_with(
+            "q",
+            &vault_of(
+                &config,
+                Box::new(StubRouter),
+                Box::new(embedder),
+                Box::new(store),
+            ),
+            &mut tel,
+        );
         assert_eq!(tel.backend, Some("stub"));
         assert!(tel.router_ms.is_some());
         assert!(tel.embed_ms.is_some());
@@ -559,7 +551,16 @@ mod tests {
         };
         let embedder = StubEmbedder::from_config(&config);
         let mut tel = log::Telemetry::default();
-        let out = pipeline_with("hi", &config, &SkipRouter, &embedder, &store, &mut tel);
+        let out = pipeline_with(
+            "hi",
+            &vault_of(
+                &config,
+                Box::new(SkipRouter),
+                Box::new(embedder),
+                Box::new(store),
+            ),
+            &mut tel,
+        );
         assert!(matches!(
             out,
             Outcome::Skip {
@@ -581,7 +582,16 @@ mod tests {
         };
         let embedder = StubEmbedder::from_config(&config);
         let mut tel = log::Telemetry::default();
-        let out = pipeline_with("q", &config, &ErrRouter, &embedder, &store, &mut tel);
+        let out = pipeline_with(
+            "q",
+            &vault_of(
+                &config,
+                Box::new(ErrRouter),
+                Box::new(embedder),
+                Box::new(store),
+            ),
+            &mut tel,
+        );
         let Outcome::Failed { stage, detail } = out else {
             panic!("expected Failed, got {out:?}");
         };
@@ -602,10 +612,12 @@ mod tests {
         let mut tel = log::Telemetry::default();
         let out = pipeline_with(
             "anything",
-            &config,
-            &StubRouter,
-            &embedder,
-            &store,
+            &vault_of(
+                &config,
+                Box::new(StubRouter),
+                Box::new(embedder),
+                Box::new(store),
+            ),
             &mut tel,
         );
         assert!(matches!(
@@ -627,7 +639,16 @@ mod tests {
         };
         let embedder = StubEmbedder::from_config(&config);
         let mut tel = log::Telemetry::default();
-        let out = pipeline_with("x", &config, &StubRouter, &embedder, &store, &mut tel);
+        let out = pipeline_with(
+            "x",
+            &vault_of(
+                &config,
+                Box::new(StubRouter),
+                Box::new(embedder),
+                Box::new(store),
+            ),
+            &mut tel,
+        );
         assert!(matches!(
             out,
             Outcome::Skip {

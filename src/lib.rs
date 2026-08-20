@@ -26,6 +26,7 @@ pub mod error;
 pub mod hook;
 pub mod index;
 pub mod tei;
+pub mod vault;
 
 // Private at the root: implementation detail, still crate-visible via `crate::`.
 mod embed;
@@ -48,3 +49,4 @@ pub use error::VaultError;
 pub use retrieve::{Context, PlannedQuery, QueryPlan, Retrieval, RouterError, SkipReason};
 pub use store::{Hit, StoreError};
 pub use types::{DocType, Language};
+pub use vault::{QueryPlanner, Vault, VaultStore};

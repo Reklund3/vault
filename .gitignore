@@ -6,6 +6,3 @@
 # Claude Code local-only scratch (git worktrees, machine-specific settings)
 .claude/worktrees/
 .claude/settings.local.json
-
-# Local-only working docs (kept on disk, not tracked)
-docs/lib-split-plan.md

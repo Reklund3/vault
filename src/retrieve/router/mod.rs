@@ -164,7 +164,7 @@ pub fn resolve_backend(config: &Config) -> ResolvedBackend {
 /// Construct the configured router as a trait object. Mirrors the
 /// classifier-side factory pattern so the hook can hold a `Box<dyn Router>`
 /// without caring which backend is live.
-pub fn build_router(config: &Config) -> Result<Box<dyn Router>, RouterError> {
+pub fn build_router(config: &Config) -> Result<Box<dyn Router + Send + Sync>, RouterError> {
     match resolve_backend(config) {
         ResolvedBackend::Gemma => Ok(Box::new(GemmaRouter::from_config(config)?)),
         ResolvedBackend::Haiku => Ok(Box::new(HaikuRouter::from_config(config)?)),

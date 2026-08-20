@@ -15,8 +15,8 @@
 // surface a consumer actually sees today, not the one we intend.
 use vault::config::Config;
 use vault::{
-    Context, DocType, EmbedError, Hit, Language, PlannedQuery, QueryPlan, Retrieval, RouterError,
-    SkipReason, StoreError, VaultError,
+    Context, DocType, EmbedError, Hit, Language, PlannedQuery, QueryPlan, QueryPlanner, Retrieval,
+    RouterError, SkipReason, StoreError, Vault, VaultError, VaultStore,
 };
 
 #[test]
@@ -140,4 +140,22 @@ fn retrieval_can_be_matched_by_a_consumer() {
         tokens: 0,
     });
     assert!(matches!(with_context, Retrieval::Context(_)));
+}
+
+/// The concurrency contract, verified from outside the crate.
+///
+/// A consumer building a service or an MCP server needs to know what it may
+/// share and what it must not. `QueryPlanner` is `Send + Sync`, so one instance
+/// goes behind an `Arc` and serves every request with no lock. `VaultStore` owns
+/// a SQLite connection and is `Send` only, so it is one-per-worker or behind a
+/// mutex — and because only that half needs the lock, a router call never
+/// blocks another request.
+#[test]
+fn the_concurrency_contract_holds_for_consumers() {
+    fn assert_send<T: Send>() {}
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<QueryPlanner>();
+    assert_send::<VaultStore>();
+    assert_send::<Vault>();
 }
