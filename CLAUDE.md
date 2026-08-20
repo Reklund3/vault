@@ -113,6 +113,7 @@ The router returns `{ skip: true }` for prompts that need no context — immedia
 | `src/tei/launcher.rs` | `vault tei start\|stop\|status\|logs` — spawn TEI from `[embeddings].launcher_cmd` with env scrubbing; PID + log in `~/.vault/`; cross-platform detach |
 | `src/configure/mod.rs` | `vault configure` — provisions `~/.vault/` (0700), seeds `vault.toml` only when absent, prints the hook entry; `--force` re-seeds |
 | `src/diagnose/mod.rs` | `vault diagnose "<prompt>"` — full retrieval trace for tuning α and token budget |
+| `src/error.rs` | `VaultError` — the library-boundary error type; variants mirror pipeline failure points so `hook` can derive its telemetry `Stage` from them |
 | `src/config.rs` | `vault.toml` parsing — `Config`, `ConfigError`, context-tag fallback (`default_context_tag`), router/classifier mode + timeout knobs |
 | `src/types.rs` | top-level shared enums — `Language`, `DocType` (orthogonal axes used across parse/classify/router) |
 | `src/util/` | `fs.rs` (0700/0600 hardening for `~/.vault/`), `json.rs` (balanced-brace extraction from model replies), `path.rs` (`~` expansion), `probe.rs` (200ms loopback TCP probe for auto-mode) |

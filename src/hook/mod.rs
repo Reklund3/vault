@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::io::Read;
 use std::time::Instant;
 
@@ -5,6 +6,7 @@ use serde::Deserialize;
 
 use crate::config::Config;
 use crate::embed::{Embedder, TeiEmbedder};
+use crate::error::VaultError;
 use crate::retrieve::{self, Router, RouterOutput, budget};
 use crate::store::{Hit, SqliteStore, Store};
 
@@ -77,6 +79,26 @@ impl Outcome {
             detail: log::truncate_detail(&err.to_string()),
         }
     }
+
+    /// Turn a library error into a hook outcome. The `Stage` comes from the
+    /// error variant rather than from the call site, so telemetry cannot drift
+    /// out of step with where the failure actually happened.
+    ///
+    /// The detail is taken from the *source*, not from `VaultError`'s own
+    /// `Display`. A record already carries `stage`, so logging the wrapper text
+    /// would say it twice — "router-build failed: router construction failed:
+    /// ...". The wrapper prefix earns its place for a library caller who has no
+    /// separate stage field; here it is noise.
+    fn from_vault_error(err: &VaultError) -> Self {
+        let detail = err
+            .source()
+            .map(|source| source.to_string())
+            .unwrap_or_else(|| err.to_string());
+        Outcome::Failed {
+            stage: Stage::of(err),
+            detail: log::truncate_detail(&detail),
+        }
+    }
 }
 
 /// Why the hook deliberately injected nothing.
@@ -114,6 +136,22 @@ pub(crate) enum Stage {
 }
 
 impl Stage {
+    /// The pipeline position a library error came from.
+    ///
+    /// `Stdin` has no `VaultError` counterpart on purpose: parsing the
+    /// UserPromptSubmit envelope is hook-protocol work, not library work.
+    pub(crate) fn of(err: &VaultError) -> Self {
+        match err {
+            VaultError::Config(_) => Stage::Config,
+            VaultError::RouterBuild(_) => Stage::RouterBuild,
+            VaultError::EmbedderBuild(_) => Stage::EmbedderBuild,
+            VaultError::DbOpen(_) => Stage::DbOpen,
+            VaultError::RouterPlan(_) => Stage::RouterPlan,
+            VaultError::EmbedQuery(_) => Stage::EmbedQuery,
+            VaultError::Query(_) => Stage::Query,
+        }
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Stage::Stdin => "stdin",
@@ -142,33 +180,48 @@ fn pipeline(stdin: &str, tel: &mut log::Telemetry) -> Outcome {
             reason: SkipReason::EmptyPrompt,
         };
     }
-    let config = match Config::load() {
-        Ok(c) => c,
-        Err(e) => return Outcome::failed(Stage::Config, e),
-    };
-    let router = match retrieve::build_router(&config) {
-        Ok(r) => r,
-        Err(e) => return Outcome::failed(Stage::RouterBuild, e),
-    };
-    let embedder = match TeiEmbedder::from_config(&config) {
-        Ok(em) => em,
-        Err(e) => return Outcome::failed(Stage::EmbedderBuild, e),
-    };
-    let db_path = match config.db_path() {
-        Ok(p) => p,
-        Err(e) => return Outcome::failed(Stage::Config, e),
-    };
-    let store = match SqliteStore::open(&db_path, &config) {
+    let svc = match open_services() {
         Ok(s) => s,
-        Err(e) => return Outcome::failed(Stage::DbOpen, e),
+        Err(e) => return Outcome::from_vault_error(&e),
     };
-    pipeline_with(&event.prompt, &config, &*router, &embedder, &store, tel)
+    pipeline_with(
+        &event.prompt,
+        &svc.config,
+        &*svc.router,
+        &svc.embedder,
+        &svc.store,
+        tel,
+    )
 }
 
-/// Inner pipeline with injected dependencies — testable with stubs. Fills
-/// `tel` with per-stage latency as it goes, so even a `Failed` record carries
-/// the timing that preceded the failure (a router timeout shows up as
-/// `router_ms` ≈ the configured timeout).
+/// Everything the retrieval pipeline needs, constructed together.
+///
+/// This is the shape `Vault::open` takes in lib-split Step 5. Returning one
+/// `Result<_, VaultError>` instead of five separately-tagged failures is what
+/// lets the caller derive telemetry from the error.
+struct Services {
+    config: Config,
+    router: Box<dyn Router>,
+    embedder: TeiEmbedder,
+    store: SqliteStore,
+}
+
+fn open_services() -> Result<Services, VaultError> {
+    let config = Config::load().map_err(VaultError::Config)?;
+    let router = retrieve::build_router(&config).map_err(VaultError::RouterBuild)?;
+    let embedder = TeiEmbedder::from_config(&config).map_err(VaultError::EmbedderBuild)?;
+    let db_path = config.db_path().map_err(VaultError::Config)?;
+    let store = SqliteStore::open(&db_path, &config).map_err(VaultError::DbOpen)?;
+    Ok(Services {
+        config,
+        router,
+        embedder,
+        store,
+    })
+}
+
+/// Inner pipeline with injected dependencies — testable with stubs. Adapts the
+/// library-shaped `retrieve_with` to the hook's fail-open `Outcome`.
 fn pipeline_with(
     prompt: &str,
     config: &Config,
@@ -177,51 +230,70 @@ fn pipeline_with(
     store: &dyn Store,
     tel: &mut log::Telemetry,
 ) -> Outcome {
+    match retrieve_with(prompt, config, router, embedder, store, tel) {
+        Ok(outcome) => outcome,
+        Err(e) => Outcome::from_vault_error(&e),
+    }
+}
+
+/// The retrieval pipeline in library terms: `Ok` is a decision the system made
+/// (skip, or inject this block), `Err` is a failure carrying its real source.
+/// Nothing here decides to fail open — that is the caller's call, and for
+/// `vault hook` specifically it is `pipeline_with` above.
+///
+/// Fills `tel` with per-stage latency as it goes, so even a failure carries the
+/// timing that preceded it (a router timeout shows up as `router_ms` ≈ the
+/// configured timeout). Each `tel` write happens before the corresponding `?`
+/// for exactly that reason.
+///
+/// lib-split Step 4 replaces the `Outcome` in the `Ok` arm with a `Retrieval`,
+/// which is the same split without the hook's vocabulary.
+fn retrieve_with(
+    prompt: &str,
+    config: &Config,
+    router: &dyn Router,
+    embedder: &dyn Embedder,
+    store: &dyn Store,
+    tel: &mut log::Telemetry,
+) -> Result<Outcome, VaultError> {
     tel.backend = Some(router.name());
 
     let t = Instant::now();
     let planned = router.plan(prompt);
     tel.router_ms = Some(ms_since(t));
-    let plan = match planned {
-        Ok(RouterOutput::Skip) => {
-            return Outcome::Skip {
+    let plan = match planned.map_err(VaultError::RouterPlan)? {
+        RouterOutput::Skip => {
+            return Ok(Outcome::Skip {
                 reason: SkipReason::RouterSkip,
-            };
+            });
         }
-        Ok(RouterOutput::Plan(p)) => p,
-        Err(e) => return Outcome::failed(Stage::RouterPlan, e),
+        RouterOutput::Plan(p) => p,
     };
 
     let t = Instant::now();
     let embedded = embedder.embed_query(prompt);
     tel.embed_ms = Some(ms_since(t));
-    let emb = match embedded {
-        Ok(v) => v,
-        Err(e) => return Outcome::failed(Stage::EmbedQuery, e),
-    };
+    let emb = embedded.map_err(VaultError::EmbedQuery)?;
 
     let t = Instant::now();
     let searched = store.hybrid_search(&plan, &emb, config.alpha());
     tel.query_ms = Some(ms_since(t));
-    let hits = match searched {
-        Ok(h) => h,
-        Err(e) => return Outcome::failed(Stage::Query, e),
-    };
+    let hits = searched.map_err(VaultError::Query)?;
 
     let sel = budget::select_within_budget(hits, config.token_budget() as u32, config.min_score());
     if sel.chunks.is_empty() {
-        return Outcome::Skip {
+        return Ok(Outcome::Skip {
             reason: SkipReason::NoHits,
-        };
+        });
     }
     let tag = resolve_tag(store, config, &plan.projects);
     let chunks = sel.chunks.len();
     let tokens = sel.tokens_used;
-    Outcome::Injected {
+    Ok(Outcome::Injected {
         block: render_block(&tag, &sel.chunks),
         chunks,
         tokens,
-    }
+    })
 }
 
 /// Resolve the context tag for the injected block. The first router-named
@@ -266,6 +338,105 @@ fn render_block(tag: &str, chunks: &[Hit]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `RouterError` and `StoreError` are already imported by the fixtures below.
+    use crate::config::ConfigError;
+    use crate::embed::EmbedError;
+
+    /// One instance of every `VaultError` variant, paired with the `stage`
+    /// string it must produce in hook.log.
+    fn every_variant() -> Vec<(VaultError, &'static str)> {
+        vec![
+            (VaultError::Config(ConfigError::HomeNotFound), "config"),
+            (
+                VaultError::RouterBuild(RouterError::Misconfigured("m".into())),
+                "router-build",
+            ),
+            (
+                VaultError::EmbedderBuild(EmbedError::Transport("t".into())),
+                "embedder-build",
+            ),
+            (
+                VaultError::DbOpen(StoreError::Backend("b".into())),
+                "db-open",
+            ),
+            (
+                VaultError::RouterPlan(RouterError::Transport("t".into())),
+                "router-plan",
+            ),
+            (
+                VaultError::EmbedQuery(EmbedError::Transport("t".into())),
+                "embed-query",
+            ),
+            (VaultError::Query(StoreError::Backend("b".into())), "query"),
+        ]
+    }
+
+    /// `stage` in hook.log is a stable telemetry contract, and moving the
+    /// mapping off the call sites is only safe if the strings are pinned.
+    ///
+    /// Adding a `VaultError` variant without extending `Stage::of` fails to
+    /// compile (the match is exhaustive); changing a string fails here.
+    #[test]
+    fn stage_of_maps_every_variant_to_its_telemetry_string() {
+        for (err, expected) in every_variant() {
+            assert_eq!(Stage::of(&err).as_str(), expected, "wrong stage for {err}");
+        }
+    }
+
+    /// The stage must come from the error, and the detail must still carry the
+    /// underlying message — that pairing is what hook.log records.
+    #[test]
+    fn from_vault_error_tags_the_stage_and_keeps_the_source_text() {
+        let err = VaultError::RouterPlan(RouterError::Transport("boom".into()));
+        match Outcome::from_vault_error(&err) {
+            Outcome::Failed { stage, detail } => {
+                assert_eq!(stage, Stage::RouterPlan);
+                assert!(detail.contains("boom"), "detail lost the source: {detail}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// The record carries `stage` separately, so the detail must not repeat it.
+    /// Regression guard: wrapping the per-layer errors in `VaultError` made the
+    /// naive `err.to_string()` read "router-build failed: router construction
+    /// failed: ...".
+    #[test]
+    fn detail_does_not_repeat_what_the_stage_already_says() {
+        let err = VaultError::RouterBuild(RouterError::MissingApiKey {
+            env_var: "ANTHROPIC_API_KEY".into(),
+        });
+        match Outcome::from_vault_error(&err) {
+            Outcome::Failed { stage, detail } => {
+                assert_eq!(stage, Stage::RouterBuild);
+                assert!(
+                    detail.starts_with("ANTHROPIC_API_KEY"),
+                    "detail should be the source message, got: {detail}"
+                );
+                assert!(
+                    !detail.contains("router construction failed"),
+                    "detail duplicates the stage: {detail}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// Every variant survives the round trip to an `Outcome`. Guards against a
+    /// future variant that maps to a stage but loses its message.
+    #[test]
+    fn every_variant_round_trips_to_a_failed_outcome() {
+        for (err, expected) in every_variant() {
+            match Outcome::from_vault_error(&err) {
+                Outcome::Failed { stage, detail } => {
+                    assert_eq!(stage.as_str(), expected);
+                    assert!(!detail.is_empty(), "empty detail for {expected}");
+                }
+                other => panic!("expected Failed for {expected}, got {other:?}"),
+            }
+        }
+    }
     use crate::embed::StubEmbedder;
     use crate::retrieve::{QueryPlan, RouterError, StubRouter};
     use crate::store::{ChunkWithEmbedding, Document, RetrievalLogEntry, StoreError};

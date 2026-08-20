@@ -21,6 +21,7 @@
 pub mod config;
 pub mod configure;
 pub mod diagnose;
+pub mod error;
 pub mod hook;
 pub mod index;
 pub mod tei;
@@ -32,3 +33,10 @@ mod retrieve;
 mod store;
 mod types;
 mod util;
+
+// The error types `VaultError` names are re-exported here so consumers can match
+// on them without the modules that define them becoming public.
+pub use embed::EmbedError;
+pub use error::VaultError;
+pub use retrieve::RouterError;
+pub use store::StoreError;

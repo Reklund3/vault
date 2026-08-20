@@ -1,6 +1,6 @@
 # Plan: lib + CLI split
 
-**Status:** Steps 1–2 done; 3–9 pending · **Target:** single package, `src/lib.rs` + `src/main.rs`
+**Status:** Steps 1–3 done; 4–9 pending · **Target:** single package, `src/lib.rs` + `src/main.rs`
 
 Vault is a binary-only crate today (no `src/lib.rs`, no `[lib]` in `Cargo.toml`).
 This plan turns it into a library with a thin CLI over it, so the retrieval and
@@ -156,9 +156,32 @@ pub enum VaultError {
     RouterBuild(..), RouterPlan(..),
     EmbedderBuild(..), EmbedQuery(..),
     DbOpen(StoreError), Query(StoreError),
-    Sync(SyncError),
 }
 ```
+
+**Done** (`src/error.rs`). Two deviations from the sketch above, both deliberate:
+
+- **`Sync(SyncError)` is deferred to Step 6.** The hook's retrieval path cannot
+  produce it, so including it now would force `Stage::of` to invent a telemetry
+  stage for a case that cannot occur. It lands when `Vault::sync` does.
+- **`RouterError`, `EmbedError`, and `StoreError` are now re-exported from
+  `lib.rs`.** A public error type cannot name private ones. The modules stay
+  private at the crate root; only the error types are re-exported.
+  `retrieve::RouterError` was `#[cfg(test)]`-gated on the rationale that
+  production code never named it — `VaultError` does, so that gating is gone. The
+  `StubRouter` gating, which is the one that matters, is untouched.
+
+The hook now derives its telemetry `Stage` from the error variant
+(`Stage::of`) instead of naming one at each of eight call sites, and
+`pipeline_with` splits into a library-shaped `retrieve_with` returning
+`Result<_, VaultError>` plus a thin fail-open adapter. Step 4 replaces the
+`Outcome` in that `Ok` arm with a `Retrieval`.
+
+One regression caught during the work and now pinned by a test: logging
+`VaultError`'s own `Display` made records read
+`"router-build failed: router construction failed: ..."`, since `stage` already
+encodes the position. `from_vault_error` logs the *source* message instead, so
+`hook.log` output is byte-identical to before the refactor.
 
 `hook::run()` maps `VaultError` to the existing `Stage` for its log record, so
 telemetry is unchanged. `Outcome`, `Stage`, and `SkipReason`'s hook-specific
@@ -227,7 +250,7 @@ Dependency order. Each step should leave `cargo build`, `cargo test`,
 ```
 Step 1  src/lib.rs + main.rs shim        — DONE: both targets compile; no API curation yet
 Step 2  WAL + busy_timeout               — DONE: schema::apply_pragmas
-Step 3  VaultError                       — typed errors at the library boundary
+Step 3  VaultError                       — DONE: src/error.rs; hook derives Stage from it
 Step 4  Retrieval / Context / PlannedQuery — split pipeline_with into stateless + store phases
 Step 5  QueryPlanner + VaultStore + Vault — rewire hook::run over the facade
 Step 6  Interaction policy               — thread through SyncOptions; branch the 4 call sites
