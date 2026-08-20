@@ -7,8 +7,8 @@ use serde::Deserialize;
 use crate::config::Config;
 use crate::embed::{Embedder, TeiEmbedder};
 use crate::error::VaultError;
-use crate::retrieve::{self, Router, RouterOutput, budget};
-use crate::store::{Hit, SqliteStore, Store};
+use crate::retrieve::{self, PlannedQuery, Retrieval, Router, RouterOutput, SkipReason};
+use crate::store::{SqliteStore, Store};
 
 mod log;
 
@@ -97,27 +97,6 @@ impl Outcome {
         Outcome::Failed {
             stage: Stage::of(err),
             detail: log::truncate_detail(&detail),
-        }
-    }
-}
-
-/// Why the hook deliberately injected nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SkipReason {
-    /// Envelope parsed but the prompt body was empty.
-    EmptyPrompt,
-    /// The router returned `{ skip: true }` — prompt needs no context.
-    RouterSkip,
-    /// Retrieval ran but nothing survived min-score + budget selection.
-    NoHits,
-}
-
-impl SkipReason {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            SkipReason::EmptyPrompt => "empty-prompt",
-            SkipReason::RouterSkip => "router-skip",
-            SkipReason::NoHits => "no-hits",
         }
     }
 }
@@ -231,23 +210,28 @@ fn pipeline_with(
     tel: &mut log::Telemetry,
 ) -> Outcome {
     match retrieve_with(prompt, config, router, embedder, store, tel) {
-        Ok(outcome) => outcome,
+        Ok(Retrieval::Skip(reason)) => Outcome::Skip { reason },
+        Ok(Retrieval::Context(context)) => Outcome::Injected {
+            chunks: context.hits.len(),
+            tokens: context.tokens,
+            block: context.render_block(),
+        },
         Err(e) => Outcome::from_vault_error(&e),
     }
 }
 
 /// The retrieval pipeline in library terms: `Ok` is a decision the system made
-/// (skip, or inject this block), `Err` is a failure carrying its real source.
+/// (skip, or here is the context), `Err` is a failure carrying its real source.
 /// Nothing here decides to fail open — that is the caller's call, and for
 /// `vault hook` specifically it is `pipeline_with` above.
 ///
-/// Fills `tel` with per-stage latency as it goes, so even a failure carries the
-/// timing that preceded it (a router timeout shows up as `router_ms` ≈ the
-/// configured timeout). Each `tel` write happens before the corresponding `?`
-/// for exactly that reason.
+/// The body is two phases with a `PlannedQuery` between them. The first is
+/// network-bound and touches no store; the second is `retrieve::search`, which
+/// is store-bound and nothing else. That boundary is the point: a concurrent
+/// caller only has to serialise the second half.
 ///
-/// lib-split Step 4 replaces the `Outcome` in the `Ok` arm with a `Retrieval`,
-/// which is the same split without the hook's vocabulary.
+/// Fills `tel` as it goes, so even a failure carries the timing that preceded
+/// it. Each `tel` write happens before the corresponding `?` for that reason.
 fn retrieve_with(
     prompt: &str,
     config: &Config,
@@ -255,84 +239,33 @@ fn retrieve_with(
     embedder: &dyn Embedder,
     store: &dyn Store,
     tel: &mut log::Telemetry,
-) -> Result<Outcome, VaultError> {
+) -> Result<Retrieval, VaultError> {
     tel.backend = Some(router.name());
 
+    // --- phase 1: network-bound, no store access ---
     let t = Instant::now();
     let planned = router.plan(prompt);
     tel.router_ms = Some(ms_since(t));
     let plan = match planned.map_err(VaultError::RouterPlan)? {
-        RouterOutput::Skip => {
-            return Ok(Outcome::Skip {
-                reason: SkipReason::RouterSkip,
-            });
-        }
+        RouterOutput::Skip => return Ok(Retrieval::Skip(SkipReason::RouterSkip)),
         RouterOutput::Plan(p) => p,
     };
 
     let t = Instant::now();
     let embedded = embedder.embed_query(prompt);
     tel.embed_ms = Some(ms_since(t));
-    let emb = embedded.map_err(VaultError::EmbedQuery)?;
+    let embedding = embedded.map_err(VaultError::EmbedQuery)?;
 
+    let planned = PlannedQuery { plan, embedding };
+
+    // --- phase 2: store-bound ---
+    // `query_ms` now spans the whole store phase (hybrid search, budget trim and
+    // tag resolution) rather than the hybrid query alone. That is the number
+    // worth having: it is how long a concurrent caller would hold the store.
     let t = Instant::now();
-    let searched = store.hybrid_search(&plan, &emb, config.alpha());
+    let result = retrieve::search(&planned, config, store);
     tel.query_ms = Some(ms_since(t));
-    let hits = searched.map_err(VaultError::Query)?;
-
-    let sel = budget::select_within_budget(hits, config.token_budget() as u32, config.min_score());
-    if sel.chunks.is_empty() {
-        return Ok(Outcome::Skip {
-            reason: SkipReason::NoHits,
-        });
-    }
-    let tag = resolve_tag(store, config, &plan.projects);
-    let chunks = sel.chunks.len();
-    let tokens = sel.tokens_used;
-    Ok(Outcome::Injected {
-        block: render_block(&tag, &sel.chunks),
-        chunks,
-        tokens,
-    })
-}
-
-/// Resolve the context tag for the injected block. The first router-named
-/// project with a domain assignment in vault.db drives it, derived by
-/// convention as `{domain}-context`; otherwise the global `defaults.context_tag`
-/// fallback applies. A store error degrades to the fallback rather than
-/// discarding an otherwise-good injection — the tag is framing, not content.
-fn resolve_tag(store: &dyn Store, config: &Config, projects: &[String]) -> String {
-    match store.resolve_domain(projects) {
-        Ok(Some(domain)) => format!("{domain}-context"),
-        Ok(None) | Err(_) => config.default_context_tag().to_string(),
-    }
-}
-
-/// Render the context block Claude Code will see appended to the user's
-/// prompt. Each chunk gets a `## label [doc_type]` header so Claude can tell
-/// the sources apart; chunks arrive in score-descending order (preserved by
-/// `select_within_budget`).
-fn render_block(tag: &str, chunks: &[Hit]) -> String {
-    let mut out = String::new();
-    out.push('<');
-    out.push_str(tag);
-    out.push_str(">\n");
-    for (i, c) in chunks.iter().enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        out.push_str("## ");
-        out.push_str(&c.label);
-        out.push_str(" [");
-        out.push_str(c.doc_type.as_str());
-        out.push_str("]\n");
-        out.push_str(&c.content);
-        out.push('\n');
-    }
-    out.push_str("</");
-    out.push_str(tag);
-    out.push_str(">\n");
-    out
+    result
 }
 
 #[cfg(test)]
@@ -342,6 +275,7 @@ mod tests {
     // `RouterError` and `StoreError` are already imported by the fixtures below.
     use crate::config::ConfigError;
     use crate::embed::EmbedError;
+    use crate::retrieve::Context;
 
     /// One instance of every `VaultError` variant, paired with the `stage`
     /// string it must produce in hook.log.
@@ -439,7 +373,7 @@ mod tests {
     }
     use crate::embed::StubEmbedder;
     use crate::retrieve::{QueryPlan, RouterError, StubRouter};
-    use crate::store::{ChunkWithEmbedding, Document, RetrievalLogEntry, StoreError};
+    use crate::store::{ChunkWithEmbedding, Document, Hit, RetrievalLogEntry, StoreError};
     use crate::types::DocType;
 
     /// Fake store that returns a canned list of hits regardless of query —
@@ -736,17 +670,28 @@ mod tests {
         ));
     }
 
+    /// `render_block` moved onto `Context`; these tests still assert the exact
+    /// bytes `vault hook` writes to stdout, which is the contract that matters.
+    fn block(tag: &str, hits: Vec<Hit>) -> String {
+        Context {
+            tag: tag.to_string(),
+            hits,
+            tokens: 0,
+        }
+        .render_block()
+    }
+
     #[test]
     fn render_block_single_chunk_shape() {
         let chunks = vec![sample_hit("Foo", "body line 1", 0.5)];
-        let out = render_block("tag-x", &chunks);
+        let out = block("tag-x", chunks);
         assert_eq!(out, "<tag-x>\n## Foo [contract]\nbody line 1\n</tag-x>\n");
     }
 
     #[test]
     fn render_block_multiple_chunks_separated_by_blank_line() {
         let chunks = vec![sample_hit("A", "alpha", 0.9), sample_hit("B", "beta", 0.8)];
-        let out = render_block("ctx", &chunks);
+        let out = block("ctx", chunks);
         // Blank line between chunks; no leading blank before the first.
         let expected = "<ctx>\n## A [contract]\nalpha\n\n## B [contract]\nbeta\n</ctx>\n";
         assert_eq!(out, expected);
@@ -760,7 +705,7 @@ mod tests {
             sample_hit("second", "2", 0.9),
             sample_hit("third", "3", 0.7),
         ];
-        let out = render_block("t", &chunks);
+        let out = block("t", chunks);
         let first_pos = out.find("first").unwrap();
         let second_pos = out.find("second").unwrap();
         let third_pos = out.find("third").unwrap();

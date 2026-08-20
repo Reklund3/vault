@@ -4,9 +4,10 @@
 //! as a library by other processes that want the retrieval or indexing
 //! pipelines directly.
 //!
-//! The public surface is deliberately narrow and is curated in
-//! `docs/lib-split-plan.md`. Modules kept private at the crate root are
-//! implementation detail and still reachable crate-internally via `crate::`.
+//! The public surface is deliberately narrow and is still being curated (the
+//! lib-split is a staged migration; this is a waypoint, not the destination).
+//! Modules kept private at the crate root are implementation detail and remain
+//! reachable crate-internally via `crate::`.
 //!
 //! Two invariants matter to anything built on this crate:
 //!
@@ -38,5 +39,5 @@ mod util;
 // on them without the modules that define them becoming public.
 pub use embed::EmbedError;
 pub use error::VaultError;
-pub use retrieve::RouterError;
+pub use retrieve::{Context, PlannedQuery, Retrieval, RouterError, SkipReason};
 pub use store::StoreError;
