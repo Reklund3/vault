@@ -117,7 +117,8 @@ pub fn run(args: Args) -> CliResult {
     let query_emb = embedder.embed_query(&args.prompt)?;
     let raw_hits = store.hybrid_search(&plan, &query_emb, alpha)?;
     let raw_count = raw_hits.len();
-    let selection = budget::select_within_budget(raw_hits, budget_tokens, min_score);
+    let selection =
+        budget::select_within_budget(raw_hits, budget_tokens, min_score, config.max_hits());
 
     print_results(&selection, raw_count, args.top, budget_tokens);
     Ok(())

@@ -139,8 +139,12 @@ pub(crate) fn search(
         .hybrid_search(&planned.plan, &planned.embedding, config.alpha())
         .map_err(VaultError::Query)?;
 
-    let selected =
-        budget::select_within_budget(hits, config.token_budget() as u32, config.min_score());
+    let selected = budget::select_within_budget(
+        hits,
+        config.token_budget() as u32,
+        config.min_score(),
+        config.max_hits(),
+    );
     if selected.chunks.is_empty() {
         return Ok(Retrieval::Skip(SkipReason::NoHits));
     }

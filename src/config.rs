@@ -34,6 +34,12 @@ struct Defaults {
     token_budget: u16,
     alpha: f32,
     min_score: f32,
+    /// Hard cap on how many chunks the budget pass selects, highest
+    /// `final_score` first. `#[serde(default)]` so existing `vault.toml` files
+    /// keep loading, and `None` means uncapped — the historical behaviour,
+    /// where only `token_budget` and `min_score` bound the selection.
+    #[serde(default)]
+    max_hits: Option<u16>,
 }
 
 // `#[serde(default)]` on the struct lets a present `[router]`/`[classifier]`
@@ -327,6 +333,12 @@ impl Config {
         self.defaults.min_score
     }
 
+    /// Cap on selected chunks, or `None` for uncapped. The third limit on the
+    /// budget pass, alongside `token_budget` and `min_score`.
+    pub fn max_hits(&self) -> Option<usize> {
+        self.defaults.max_hits.map(usize::from)
+    }
+
     /// User-supplied extra exclusion globs from `[indexer.exclude].patterns`.
     /// These are added to the walker's non-removable `BUILT_IN_EXCLUDES`; an
     /// empty vec means "use the built-ins only".
@@ -366,6 +378,7 @@ impl Default for Config {
                 token_budget: 10000,
                 alpha: 0.6,
                 min_score: 0.15,
+                max_hits: None,
             },
             router: Router::default(),
             classifier: Classifier::default(),
