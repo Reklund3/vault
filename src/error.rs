@@ -22,6 +22,7 @@
 
 use crate::config::ConfigError;
 use crate::embed::EmbedError;
+use crate::index::sync::SyncError;
 use crate::retrieve::RouterError;
 use crate::store::StoreError;
 
@@ -60,6 +61,12 @@ pub enum VaultError {
     /// The hybrid FTS5 + vector query failed.
     #[error("store query failed: {0}")]
     Query(#[source] StoreError),
+
+    /// Indexing failed. Unlike every variant above, nothing on the hook's
+    /// retrieval path can produce this one — it exists for `Vault::sync`, whose
+    /// callers are the CLI and library consumers, never `vault hook`.
+    #[error("sync failed: {0}")]
+    Sync(#[source] SyncError),
 }
 
 #[cfg(test)]

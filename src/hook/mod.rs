@@ -111,6 +111,10 @@ pub(crate) enum Stage {
     RouterPlan,
     EmbedQuery,
     Query,
+    /// Unreachable from the hook — `vault hook` never indexes. It exists so
+    /// `Stage::of` stays total without mislabelling a sync failure as a query
+    /// one; an unused-but-truthful name beats a reachable-but-wrong one.
+    Sync,
 }
 
 impl Stage {
@@ -127,6 +131,7 @@ impl Stage {
             VaultError::RouterPlan(_) => Stage::RouterPlan,
             VaultError::EmbedQuery(_) => Stage::EmbedQuery,
             VaultError::Query(_) => Stage::Query,
+            VaultError::Sync(_) => Stage::Sync,
         }
     }
 
@@ -140,6 +145,7 @@ impl Stage {
             Stage::RouterPlan => "router-plan",
             Stage::EmbedQuery => "embed-query",
             Stage::Query => "query",
+            Stage::Sync => "sync",
         }
     }
 }

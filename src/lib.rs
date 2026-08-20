@@ -46,6 +46,7 @@ mod util;
 // fails the build rather than surfacing as an awkward downstream workaround.
 pub use embed::EmbedError;
 pub use error::VaultError;
+pub use index::sync::{Interaction, SyncError, SyncOptions, SyncReport};
 pub use retrieve::{Context, PlannedQuery, QueryPlan, Retrieval, RouterError, SkipReason};
 pub use store::{Hit, StoreError};
 pub use types::{DocType, Language};

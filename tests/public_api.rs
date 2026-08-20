@@ -15,8 +15,9 @@
 // surface a consumer actually sees today, not the one we intend.
 use vault::config::Config;
 use vault::{
-    Context, DocType, EmbedError, Hit, Language, PlannedQuery, QueryPlan, QueryPlanner, Retrieval,
-    RouterError, SkipReason, StoreError, Vault, VaultError, VaultStore,
+    Context, DocType, EmbedError, Hit, Interaction, Language, PlannedQuery, QueryPlan,
+    QueryPlanner, Retrieval, RouterError, SkipReason, StoreError, SyncError, SyncOptions,
+    SyncReport, Vault, VaultError, VaultStore,
 };
 
 #[test]
@@ -158,4 +159,67 @@ fn the_concurrency_contract_holds_for_consumers() {
     assert_send_sync::<QueryPlanner>();
     assert_send::<VaultStore>();
     assert_send::<Vault>();
+}
+
+/// A consumer that is not a terminal must be able to say so, and must be able
+/// to build a `SyncOptions` without one.
+///
+/// The absence of a `Default` on `SyncOptions` is the point: `Interaction` has
+/// no safe guess. Defaulting to `Terminal` would leave a service blocked on a
+/// read of a stdin that belongs to somebody else's protocol, and defaulting to
+/// `NonInteractive` would decide a billing question on the caller's behalf.
+#[test]
+fn a_non_terminal_consumer_can_configure_a_sync() {
+    let opts = SyncOptions {
+        repo: std::path::PathBuf::from("/tmp/some-repo"),
+        explicit_name: Some("vault".to_string()),
+        explicit_domain: Some("software".to_string()),
+        dry_run: true,
+        interaction: Interaction::NonInteractive {
+            allow_remote_billing: false,
+        },
+    };
+
+    assert_eq!(
+        opts.interaction,
+        Interaction::NonInteractive {
+            allow_remote_billing: false
+        }
+    );
+    assert_ne!(opts.interaction, Interaction::Terminal);
+}
+
+/// The consent refusal has to be distinguishable from a user declining, or a
+/// caller cannot tell "retry with consent" from "the user said no".
+#[test]
+fn a_consumer_can_tell_a_missing_consent_from_a_refused_one() {
+    let err = VaultError::Sync(SyncError::RemoteBillingNotPermitted { backend: "haiku" });
+
+    match &err {
+        VaultError::Sync(SyncError::RemoteBillingNotPermitted { backend }) => {
+            assert_eq!(*backend, "haiku");
+        }
+        other => panic!("wrong variant: {other}"),
+    }
+
+    let declined = VaultError::Sync(SyncError::DeclinedRemoteCost);
+    assert_ne!(err.to_string(), declined.to_string());
+}
+
+/// `SyncReport` is the return value of `Vault::sync`, so its fields have to be
+/// readable from out here — a consumer reporting on an unattended index run has
+/// nothing else to go on.
+#[test]
+fn a_consumer_can_read_a_sync_report() {
+    let report = SyncReport {
+        project: "vault".to_string(),
+        files_walked: 12,
+        chunks_indexed: 40,
+        ..SyncReport::default()
+    };
+
+    assert_eq!(report.project, "vault");
+    assert_eq!(report.files_walked, 12);
+    assert_eq!(report.chunks_indexed, 40);
+    assert_eq!(report.domain, None);
 }

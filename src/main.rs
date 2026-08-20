@@ -108,6 +108,8 @@ fn run_index_sync(
         explicit_name: name,
         explicit_domain: domain,
         dry_run,
+        // The CLI is the one caller that genuinely has a terminal.
+        interaction: index::sync::Interaction::Terminal,
     };
     let report = index::sync::run_sync(opts, &config)?;
     print!("{}", index::sync::format_report(&report));

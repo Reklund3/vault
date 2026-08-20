@@ -29,6 +29,27 @@ pub struct SyncOptions {
     pub explicit_name: Option<String>,
     pub explicit_domain: Option<String>,
     pub dry_run: bool,
+    /// Whether this sync may prompt. Deliberately has no `Default`: a library
+    /// consumer must state which one it wants, because guessing `Terminal` for
+    /// a caller that has no terminal would block it on a read of a stdin that
+    /// is somebody else's protocol channel.
+    pub interaction: Interaction,
+}
+
+/// Whether `run_sync` is allowed to talk to a human.
+///
+/// Three of the four prompts have a safe silent answer — the derived project
+/// name, and an unassigned domain. The fourth does not: the one-time cost
+/// prompt is a *consent gate* for provider billing, so `NonInteractive` has to
+/// say explicitly whether consent was given rather than inherit a default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interaction {
+    /// Read stdin, write prompts to stderr. What `vault index sync` passes.
+    Terminal,
+    /// Never prompt. A missing name falls back to the directory-derived one and
+    /// a missing domain resolves to `None`; `allow_remote_billing` answers the
+    /// cost gate in advance.
+    NonInteractive { allow_remote_billing: bool },
 }
 
 #[derive(Debug, Default)]
@@ -64,6 +85,15 @@ pub enum SyncError {
     ProjectNameCollision { name: String, message: String },
     #[error("declined remote classification cost — sync aborted")]
     DeclinedRemoteCost,
+    /// Distinct from `DeclinedRemoteCost`: nobody declined, nobody was asked.
+    /// A caller that meant to allow billing can tell the two apart and retry
+    /// with consent instead of reporting a refusal that never happened.
+    #[error(
+        "classification would fall back to the remote {backend} backend, which bills, \
+         but this sync is non-interactive and did not grant consent — \
+         set `allow_remote_billing: true` to opt in, or run Gemma locally"
+    )]
+    RemoteBillingNotPermitted { backend: &'static str },
     #[error(
         "TEI embeddings server unreachable ({0}).\n\
          Start it with `vault tei start` (or check `vault tei status`), then re-run sync."
@@ -85,6 +115,50 @@ pub enum SyncError {
 /// SqliteStore) and delegates to `sync_with`. Dry-run short-circuits before any
 /// remote services are touched — see `dry_run_report`.
 pub fn run_sync(opts: SyncOptions, config: &Config) -> Result<SyncReport, SyncError> {
+    match prepare_sync(&opts, config)? {
+        Prepared::DryRun(report) => Ok(report),
+        Prepared::Live(live) => {
+            let db_path = config.db_path().map_err(SyncError::Config)?;
+            let mut store = SqliteStore::open(&db_path, config).map_err(SyncError::Store)?;
+            finish_sync(live, &mut store, &opts)
+        }
+    }
+}
+
+/// Same pipeline against a store the caller already holds open — what
+/// `VaultStore::sync` uses. The only difference from `run_sync` is who owns the
+/// connection: a library consumer keeps one across calls rather than opening a
+/// fresh one per sync, so a DB-open failure surfaces at `VaultStore::open`
+/// instead of here.
+pub(crate) fn run_sync_with_store(
+    store: &mut dyn Store,
+    opts: SyncOptions,
+    config: &Config,
+) -> Result<SyncReport, SyncError> {
+    match prepare_sync(&opts, config)? {
+        Prepared::DryRun(report) => Ok(report),
+        Prepared::Live(live) => finish_sync(live, store, &opts),
+    }
+}
+
+/// Everything settled before the store is needed: the walk, the project name,
+/// the consent gate, and the two remote services. Split out so both entry
+/// points share it verbatim — the store is the only thing they disagree about.
+enum Prepared {
+    /// Dry-run short-circuit. No store, no TEI, no classifier.
+    DryRun(SyncReport),
+    Live(LiveSync),
+}
+
+struct LiveSync {
+    canonical: PathBuf,
+    project_name: String,
+    walked: Vec<Walked>,
+    embedder: TeiEmbedder,
+    classifier: Box<dyn Classifier>,
+}
+
+fn prepare_sync(opts: &SyncOptions, config: &Config) -> Result<Prepared, SyncError> {
     let canonical = std::fs::canonicalize(&opts.repo).map_err(SyncError::Io)?;
     let derived_name = derive_project_name(&canonical);
 
@@ -100,17 +174,15 @@ pub fn run_sync(opts: SyncOptions, config: &Config) -> Result<SyncReport, SyncEr
         // Dry-run is a non-interactive preview — never prompt; use the explicit
         // or derived name silently.
         let project_name = opts.explicit_name.clone().unwrap_or(derived_name);
-        return Ok(dry_run_report(&walked, config, project_name));
+        return Ok(Prepared::DryRun(dry_run_report(
+            &walked,
+            config,
+            project_name,
+        )));
     }
 
-    // First-run name confirmation: with no `--name`, offer the directory-derived
-    // default for the user to accept (empty line / EOF) or override. The chosen
-    // name is persisted by `get_or_create_project` below; vault.toml is never
-    // written.
-    let project_name = match opts.explicit_name.clone() {
-        Some(name) => name,
-        None => prompt_for_project_name(&derived_name, std::io::stdin().lock(), std::io::stderr())?,
-    };
+    let project_name =
+        resolve_project_name(opts.explicit_name.clone(), &derived_name, &opts.interaction)?;
 
     let embedder = TeiEmbedder::from_config_with_timeout(config, SYNC_EMBED_TIMEOUT)
         .map_err(SyncError::TeiUnreachable)?;
@@ -118,26 +190,37 @@ pub fn run_sync(opts: SyncOptions, config: &Config) -> Result<SyncReport, SyncEr
         .verify_against_server()
         .map_err(SyncError::TeiUnreachable)?;
 
-    let mode = config.classifier_mode();
-    let backend = resolve_backend(config);
-    if mode == "auto" && !walked.is_empty() {
-        match backend {
-            ResolvedBackend::Haiku => {
-                prompt_for_haiku_cost(walked.len(), std::io::stdin().lock(), std::io::stderr())?;
-            }
-            // The OpenAI-compatible backend bills per provider; we don't carry a
-            // pricing table, so confirm generically rather than quote a figure.
-            ResolvedBackend::OpenAiCompat => {
-                prompt_for_remote_cost(walked.len(), std::io::stdin().lock(), std::io::stderr())?;
-            }
-            ResolvedBackend::Gemma => {}
-        }
-    }
+    confirm_remote_classification(
+        &opts.interaction,
+        config.classifier_mode(),
+        resolve_backend(config),
+        walked.len(),
+    )?;
 
     let classifier = build_classifier(config).map_err(SyncError::BuildClassifier)?;
 
-    let db_path = config.db_path().map_err(SyncError::Config)?;
-    let mut store = SqliteStore::open(&db_path, config).map_err(SyncError::Store)?;
+    Ok(Prepared::Live(LiveSync {
+        canonical,
+        project_name,
+        walked,
+        embedder,
+        classifier,
+    }))
+}
+
+fn finish_sync(
+    live: LiveSync,
+    store: &mut dyn Store,
+    opts: &SyncOptions,
+) -> Result<SyncReport, SyncError> {
+    let LiveSync {
+        canonical,
+        project_name,
+        walked,
+        embedder,
+        classifier,
+    } = live;
+
     let canonical_str = canonical.to_str().unwrap_or_default().to_string();
     let project_id = store
         .get_or_create_project(&project_name, &canonical_str)
@@ -160,10 +243,7 @@ pub fn run_sync(opts: SyncOptions, config: &Config) -> Result<SyncReport, SyncEr
     {
         Some(existing) => Some(existing),
         None => {
-            let chosen = match opts.explicit_domain.clone() {
-                Some(d) => Some(d),
-                None => prompt_for_domain(std::io::stdin().lock(), std::io::stderr())?,
-            };
+            let chosen = resolve_domain_choice(opts.explicit_domain.clone(), &opts.interaction)?;
             if let Some(ref d) = chosen {
                 store
                     .set_project_domain(project_id, d)
@@ -171,6 +251,10 @@ pub fn run_sync(opts: SyncOptions, config: &Config) -> Result<SyncReport, SyncEr
                 // A new domain needs matching framing in the user's global
                 // CLAUDE.md or the emitted tag means nothing to Claude — the
                 // taxonomy's single source of truth (see `docs/vault-plan.md`).
+                //
+                // stderr, not stdout: stdout is the CLI's report channel and,
+                // under a stdio consumer, the protocol channel (`Interaction`
+                // exists so that consumer never lands here at all).
                 let _ = writeln!(
                     std::io::stderr(),
                     "Assigned to domain {d:?} (context tag <{d}-context>). \
@@ -186,7 +270,7 @@ pub fn run_sync(opts: SyncOptions, config: &Config) -> Result<SyncReport, SyncEr
         project_id,
         project_name,
         &walked,
-        &mut store,
+        store,
         &embedder,
         classifier.as_ref(),
     )?;
@@ -590,6 +674,95 @@ fn derive_project_name(canonical_repo: &Path) -> String {
         .to_string()
 }
 
+// The interaction points, each resolved against the policy before any terminal
+// I/O is attempted. `Interaction::Terminal` is the only arm that reaches for
+// stdin — the others answer from the options alone, so a non-interactive caller
+// never locks a stream it does not own.
+
+/// With no `--name`, offer the directory-derived default for the user to accept
+/// (empty line / EOF) or override. The chosen name is persisted by
+/// `get_or_create_project`; vault.toml is never written.
+fn resolve_project_name(
+    explicit: Option<String>,
+    derived: &str,
+    interaction: &Interaction,
+) -> Result<String, SyncError> {
+    match (explicit, interaction) {
+        (Some(name), _) => Ok(name),
+        (None, Interaction::NonInteractive { .. }) => Ok(derived.to_string()),
+        (None, Interaction::Terminal) => {
+            prompt_for_project_name(derived, std::io::stdin().lock(), std::io::stderr())
+        }
+    }
+}
+
+/// With no `--domain`, ask; `None` leaves the project unassigned and the hook
+/// falls back to `defaults.context_tag`.
+fn resolve_domain_choice(
+    explicit: Option<String>,
+    interaction: &Interaction,
+) -> Result<Option<String>, SyncError> {
+    match (explicit, interaction) {
+        (Some(d), _) => Ok(Some(d)),
+        (None, Interaction::NonInteractive { .. }) => Ok(None),
+        (None, Interaction::Terminal) => {
+            prompt_for_domain(std::io::stdin().lock(), std::io::stderr())
+        }
+    }
+}
+
+/// The consent gate for provider billing.
+///
+/// Only `auto` mode reaches here: an explicit `mode = "haiku"` / `"openai"` is
+/// already the user having chosen a paid backend, and a fallback the user did
+/// not choose is the whole reason the gate exists. Gemma bills nothing, and a
+/// walk that found no files will classify nothing, so neither prompts.
+///
+/// `NonInteractive { allow_remote_billing: false }` **errors** rather than
+/// proceeding. Skipping a consent gate for a caller that cannot answer it would
+/// silently spend their money, which is the one failure mode this gate exists
+/// to prevent.
+fn confirm_remote_classification(
+    interaction: &Interaction,
+    mode: &str,
+    backend: ResolvedBackend,
+    file_count: usize,
+) -> Result<(), SyncError> {
+    if mode != "auto" || file_count == 0 || backend == ResolvedBackend::Gemma {
+        return Ok(());
+    }
+
+    match interaction {
+        Interaction::Terminal => match backend {
+            ResolvedBackend::Haiku => {
+                prompt_for_haiku_cost(file_count, std::io::stdin().lock(), std::io::stderr())
+            }
+            // The OpenAI-compatible backend bills per provider; we don't carry
+            // a pricing table, so confirm generically rather than quote a figure.
+            ResolvedBackend::OpenAiCompat => {
+                prompt_for_remote_cost(file_count, std::io::stdin().lock(), std::io::stderr())
+            }
+            ResolvedBackend::Gemma => Ok(()),
+        },
+        Interaction::NonInteractive {
+            allow_remote_billing: true,
+        } => Ok(()),
+        Interaction::NonInteractive {
+            allow_remote_billing: false,
+        } => Err(SyncError::RemoteBillingNotPermitted {
+            backend: backend_name(backend),
+        }),
+    }
+}
+
+fn backend_name(backend: ResolvedBackend) -> &'static str {
+    match backend {
+        ResolvedBackend::Gemma => "gemma",
+        ResolvedBackend::Haiku => "haiku",
+        ResolvedBackend::OpenAiCompat => "openai",
+    }
+}
+
 fn prompt_for_haiku_cost<R: BufRead, W: Write>(
     file_count: usize,
     mut stdin: R,
@@ -897,6 +1070,9 @@ mod tests {
             explicit_name: Some("test-project".to_string()),
             explicit_domain: None,
             dry_run: dry,
+            // These tests drive `sync_with` / `dry_run_report` directly and
+            // never reach a prompt; `Terminal` keeps them on the CLI's path.
+            interaction: Interaction::Terminal,
         }
     }
 
@@ -1495,5 +1671,194 @@ mod tests {
         };
         let s = format_report(&r);
         assert!(!s.contains("Skipped ("));
+    }
+
+    // ---------- Interaction policy (lib-split Step 6) ----------
+    //
+    // The Terminal arms of these three resolvers are covered by the existing
+    // `prompt_for_*` tests, which drive the readers directly. What is new here
+    // is the *policy*: which arm gets taken, and what the non-interactive
+    // answers are.
+
+    #[test]
+    fn an_explicit_name_wins_regardless_of_interaction() {
+        for interaction in [
+            Interaction::Terminal,
+            Interaction::NonInteractive {
+                allow_remote_billing: false,
+            },
+        ] {
+            let got = resolve_project_name(Some("explicit".into()), "derived", &interaction)
+                .expect("explicit name never prompts");
+            assert_eq!(got, "explicit");
+        }
+    }
+
+    #[test]
+    fn a_non_interactive_sync_takes_the_derived_name_without_prompting() {
+        let got = resolve_project_name(
+            None,
+            "derived",
+            &Interaction::NonInteractive {
+                allow_remote_billing: false,
+            },
+        )
+        .expect("must not prompt");
+        assert_eq!(got, "derived");
+    }
+
+    #[test]
+    fn a_non_interactive_sync_leaves_the_domain_unassigned() {
+        let got = resolve_domain_choice(
+            None,
+            &Interaction::NonInteractive {
+                allow_remote_billing: false,
+            },
+        )
+        .expect("must not prompt");
+        assert_eq!(got, None, "unassigned; the hook falls back to context_tag");
+    }
+
+    #[test]
+    fn an_explicit_domain_wins_regardless_of_interaction() {
+        let got = resolve_domain_choice(
+            Some("finance".into()),
+            &Interaction::NonInteractive {
+                allow_remote_billing: false,
+            },
+        )
+        .expect("explicit domain never prompts");
+        assert_eq!(got.as_deref(), Some("finance"));
+    }
+
+    /// The load-bearing one. A non-interactive caller that has not consented to
+    /// provider billing must be told, not quietly billed. Skipping the gate
+    /// because nobody is there to answer it is the exact failure this prevents.
+    #[test]
+    fn a_non_interactive_sync_without_consent_refuses_a_remote_classifier() {
+        for backend in [ResolvedBackend::Haiku, ResolvedBackend::OpenAiCompat] {
+            let err = confirm_remote_classification(
+                &Interaction::NonInteractive {
+                    allow_remote_billing: false,
+                },
+                "auto",
+                backend,
+                12,
+            )
+            .expect_err("must refuse rather than bill");
+
+            match err {
+                SyncError::RemoteBillingNotPermitted { backend: named } => {
+                    assert_eq!(named, backend_name(backend));
+                }
+                other => panic!("wrong variant for {backend:?}: {other}"),
+            }
+        }
+    }
+
+    /// Refusal and declining are different events, and a caller retrying with
+    /// consent needs to tell them apart.
+    #[test]
+    fn refusing_for_lack_of_consent_is_not_the_same_error_as_declining() {
+        let refused = confirm_remote_classification(
+            &Interaction::NonInteractive {
+                allow_remote_billing: false,
+            },
+            "auto",
+            ResolvedBackend::Haiku,
+            1,
+        )
+        .expect_err("must refuse");
+
+        assert!(
+            !matches!(refused, SyncError::DeclinedRemoteCost),
+            "nobody declined — nobody was asked"
+        );
+    }
+
+    #[test]
+    fn consent_lets_a_non_interactive_sync_use_a_remote_classifier() {
+        for backend in [ResolvedBackend::Haiku, ResolvedBackend::OpenAiCompat] {
+            confirm_remote_classification(
+                &Interaction::NonInteractive {
+                    allow_remote_billing: true,
+                },
+                "auto",
+                backend,
+                12,
+            )
+            .unwrap_or_else(|e| panic!("consent given, {backend:?} should proceed: {e}"));
+        }
+    }
+
+    /// Gemma bills nothing, so the gate never fires for it — a non-interactive
+    /// sync against a local classifier needs no consent flag at all.
+    #[test]
+    fn a_local_classifier_needs_no_billing_consent() {
+        confirm_remote_classification(
+            &Interaction::NonInteractive {
+                allow_remote_billing: false,
+            },
+            "auto",
+            ResolvedBackend::Gemma,
+            12,
+        )
+        .expect("gemma bills nothing");
+    }
+
+    /// An explicit `mode = "haiku"` is the user already having chosen a paid
+    /// backend. The gate is for the fallback they did *not* choose, so it must
+    /// not fire here and strand a non-interactive caller.
+    #[test]
+    fn an_explicitly_configured_remote_backend_bypasses_the_gate() {
+        for mode in ["haiku", "openai", "gemini"] {
+            confirm_remote_classification(
+                &Interaction::NonInteractive {
+                    allow_remote_billing: false,
+                },
+                mode,
+                ResolvedBackend::Haiku,
+                12,
+            )
+            .unwrap_or_else(|e| panic!("mode {mode:?} was chosen explicitly: {e}"));
+        }
+    }
+
+    /// Nothing walked means nothing to classify, so there is nothing to consent
+    /// to. Erroring on an empty repo would be a gate with no subject.
+    #[test]
+    fn an_empty_walk_needs_no_billing_consent() {
+        confirm_remote_classification(
+            &Interaction::NonInteractive {
+                allow_remote_billing: false,
+            },
+            "auto",
+            ResolvedBackend::Haiku,
+            0,
+        )
+        .expect("no files, no classification, no cost");
+    }
+
+    /// A dry run is a preview: it opens no store, calls no classifier, and bills
+    /// nothing, so it must work non-interactively even without consent — and
+    /// must not prompt for a name on the way.
+    #[test]
+    fn a_dry_run_is_non_interactive_without_consent() {
+        let tmp = Tmp::new("dryrun-noninteractive");
+        tmp.write("a.proto", b"syntax = \"proto3\";\nmessage A {}");
+
+        let opts = SyncOptions {
+            repo: tmp.canonical(),
+            explicit_name: None,
+            explicit_domain: None,
+            dry_run: true,
+            interaction: Interaction::NonInteractive {
+                allow_remote_billing: false,
+            },
+        };
+
+        let report = run_sync(opts, &Config::default()).expect("dry run must not need consent");
+        assert!(report.dry_run);
+        assert_eq!(report.files_walked, 1);
     }
 }

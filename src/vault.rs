@@ -20,6 +20,7 @@
 use crate::config::Config;
 use crate::embed::{Embedder, TeiEmbedder};
 use crate::error::VaultError;
+use crate::index::sync::{self, SyncOptions, SyncReport};
 use crate::retrieve::{self, PlannedQuery, QueryPlan, Retrieval, Router, RouterOutput, SkipReason};
 use crate::store::{SqliteStore, Store};
 
@@ -121,6 +122,22 @@ impl VaultStore {
     pub fn search(&self, planned: &PlannedQuery) -> Result<Retrieval, VaultError> {
         retrieve::search(planned, &self.config, self.store.as_ref())
     }
+
+    /// Index a repository into this store.
+    ///
+    /// `&mut self` because indexing writes, and because it is the honest
+    /// signature: two concurrent syncs of the same project would race on the
+    /// project row and the orphan prune, so the borrow checker serialises them
+    /// rather than SQLite discovering it later.
+    ///
+    /// Whether this may prompt is [`SyncOptions::interaction`]. A consumer that
+    /// is not a terminal must pass [`Interaction::NonInteractive`], or the sync
+    /// will block reading a stdin it does not own.
+    ///
+    /// [`Interaction::NonInteractive`]: crate::index::sync::Interaction::NonInteractive
+    pub fn sync(&mut self, opts: SyncOptions) -> Result<SyncReport, VaultError> {
+        sync::run_sync_with_store(self.store.as_mut(), opts, &self.config).map_err(VaultError::Sync)
+    }
 }
 
 /// Planner plus store, for callers that want one call rather than two phases.
@@ -157,6 +174,12 @@ impl Vault {
 
     pub fn store(&self) -> &VaultStore {
         &self.store
+    }
+
+    /// Index a repository. Delegates to [`VaultStore::sync`]; see there for the
+    /// interaction contract.
+    pub fn sync(&mut self, opts: SyncOptions) -> Result<SyncReport, VaultError> {
+        self.store.sync(opts)
     }
 
     /// Plan and search in one call.
