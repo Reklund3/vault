@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
-use std::io::{BufRead, Write};
+// `BufRead` is only needed by the prompt helpers, which are `cli`-gated along
+// with the `Interaction::Terminal` arms that call them.
+#[cfg(any(feature = "cli", test))]
+use std::io::BufRead;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -45,6 +49,15 @@ pub struct SyncOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Interaction {
     /// Read stdin, write prompts to stderr. What `vault index sync` passes.
+    ///
+    /// **Behind the `cli` feature on purpose.** Every stdin read in the library
+    /// half of this crate sits inside a `Terminal` arm, so gating the variant
+    /// takes that surface to zero for a `default-features = false` consumer.
+    /// The name reads like a harmless default — a stdio MCP server that picked
+    /// it would block forever reading its own JSON-RPC channel and parse
+    /// protocol bytes as a project name. Making it unnameable is the difference
+    /// between a documented hazard and one the compiler rules out.
+    #[cfg(feature = "cli")]
     Terminal,
     /// Never prompt. A missing name falls back to the directory-derived one and
     /// a missing domain resolves to `None`; `allow_remote_billing` answers the
@@ -253,8 +266,12 @@ fn finish_sync(
                 // taxonomy's single source of truth (see `docs/vault-plan.md`).
                 //
                 // stderr, not stdout: stdout is the CLI's report channel and,
-                // under a stdio consumer, the protocol channel (`Interaction`
-                // exists so that consumer never lands here at all).
+                // under a stdio consumer, the protocol channel.
+                //
+                // A non-interactive caller DOES reach this line — passing
+                // `explicit_domain` skips the prompt but still assigns, and the
+                // note still needs saying. stderr is chosen so that it cannot
+                // corrupt a protocol stream; it is not unreachable here.
                 let _ = writeln!(
                     std::io::stderr(),
                     "Assigned to domain {d:?} (context tag <{d}-context>). \
@@ -690,6 +707,7 @@ fn resolve_project_name(
     match (explicit, interaction) {
         (Some(name), _) => Ok(name),
         (None, Interaction::NonInteractive { .. }) => Ok(derived.to_string()),
+        #[cfg(feature = "cli")]
         (None, Interaction::Terminal) => {
             prompt_for_project_name(derived, std::io::stdin().lock(), std::io::stderr())
         }
@@ -705,6 +723,7 @@ fn resolve_domain_choice(
     match (explicit, interaction) {
         (Some(d), _) => Ok(Some(d)),
         (None, Interaction::NonInteractive { .. }) => Ok(None),
+        #[cfg(feature = "cli")]
         (None, Interaction::Terminal) => {
             prompt_for_domain(std::io::stdin().lock(), std::io::stderr())
         }
@@ -733,6 +752,7 @@ fn confirm_remote_classification(
     }
 
     match interaction {
+        #[cfg(feature = "cli")]
         Interaction::Terminal => match backend {
             ResolvedBackend::Haiku => {
                 prompt_for_haiku_cost(file_count, std::io::stdin().lock(), std::io::stderr())
@@ -763,6 +783,7 @@ fn backend_name(backend: ResolvedBackend) -> &'static str {
     }
 }
 
+#[cfg(any(feature = "cli", test))]
 fn prompt_for_haiku_cost<R: BufRead, W: Write>(
     file_count: usize,
     mut stdin: R,
@@ -792,6 +813,7 @@ fn prompt_for_haiku_cost<R: BufRead, W: Write>(
 /// fallback. No dollar figure (provider pricing varies and isn't tabled here);
 /// the user confirms that paid remote calls are acceptable. Same fail-closed
 /// EOF semantics as `prompt_for_haiku_cost`.
+#[cfg(any(feature = "cli", test))]
 fn prompt_for_remote_cost<R: BufRead, W: Write>(
     file_count: usize,
     mut stdin: R,
@@ -817,6 +839,7 @@ fn prompt_for_remote_cost<R: BufRead, W: Write>(
 /// empty line or EOF (piped / CI). Mirrors `prompt_for_haiku_cost`'s injected
 /// reader/writer so it tests without a real terminal. Only called when `--name`
 /// was not passed; the chosen name is persisted by `get_or_create_project`.
+#[cfg(any(feature = "cli", test))]
 fn prompt_for_project_name<R: BufRead, W: Write>(
     derived: &str,
     mut stdin: R,
@@ -839,6 +862,7 @@ fn prompt_for_project_name<R: BufRead, W: Write>(
 /// stdin → `None`, mirroring the fail-open contract of the other sync prompts.
 /// Only called when `--domain` was not passed and the project has no assignment
 /// yet; the choice persists via `Store::set_project_domain`.
+#[cfg(any(feature = "cli", test))]
 fn prompt_for_domain<R: BufRead, W: Write>(
     mut stdin: R,
     mut stderr: W,

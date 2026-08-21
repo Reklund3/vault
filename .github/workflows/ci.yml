@@ -73,6 +73,13 @@ jobs:
       - name: Lint without the CLI feature
         run: cargo clippy --no-default-features --lib -- -D warnings
 
+      # Design rule 3, checked on the artifact a consumer links rather than on
+      # the source. A source grep cannot do this: the library's stdin reads sit
+      # inside `#[cfg(feature = "cli")]` arms, so the text is present in a build
+      # that does not contain the code.
+      - name: Assert the library touches no stdin/stdout
+        run: ./scripts/check-library-io.sh
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
