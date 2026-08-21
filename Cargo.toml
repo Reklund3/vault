@@ -21,6 +21,13 @@ yaml-rust2 = "0.10"
 # The CLI is a feature so a library consumer can leave it — and clap — behind.
 # On by default, so `cargo build` / `test` / `clippy` behave exactly as before;
 # a consumer opts out with `default-features = false`.
+# libc is already in the graph transitively (ring -> getrandom). It is a
+# dev-dependency here only so `tests/pipeline.rs` can redirect fd 1 while the
+# library runs, which is the only way to check rule 3 — that the library writes
+# nothing to stdout — from inside the test process.
+[dev-dependencies]
+libc = "0.2"
+
 [features]
 default = ["cli"]
 cli = ["dep:clap"]
