@@ -159,7 +159,11 @@ fn pipeline(stdin: &str, tel: &mut log::Telemetry) -> Outcome {
         Ok(ev) => ev,
         Err(e) => return Outcome::failed(Stage::Stdin, e),
     };
-    if event.prompt.is_empty() {
+    // Kept even though `Vault::retrieve` now guards too: this fires before
+    // `Config::load` and `Vault::open`, which build a router and a TEI client.
+    // `trim()` matches the library predicate — a whitespace-only prompt used to
+    // reach the router and get billed for it.
+    if event.prompt.trim().is_empty() {
         return Outcome::Skip {
             reason: SkipReason::EmptyPrompt,
         };

@@ -88,6 +88,7 @@ pub fn run(args: Args) -> CliResult {
     let alpha = args.alpha.unwrap_or(config.alpha());
     let budget_tokens = config.token_budget() as u32;
     let min_score = config.min_score();
+    let max_hits = config.max_hits();
     let used_stub = args.stub;
 
     print_header(&TraceHeader {
@@ -99,6 +100,7 @@ pub fn run(args: Args) -> CliResult {
         alpha,
         budget_tokens,
         min_score,
+        max_hits,
         used_stub,
     });
 
@@ -117,10 +119,9 @@ pub fn run(args: Args) -> CliResult {
     let query_emb = embedder.embed_query(&args.prompt)?;
     let raw_hits = store.hybrid_search(&plan, &query_emb, alpha)?;
     let raw_count = raw_hits.len();
-    let selection =
-        budget::select_within_budget(raw_hits, budget_tokens, min_score, config.max_hits());
+    let selection = budget::select_within_budget(raw_hits, budget_tokens, min_score, max_hits);
 
-    print_results(&selection, raw_count, args.top, budget_tokens);
+    print_results(&selection, raw_count, args.top, budget_tokens, max_hits);
     Ok(())
 }
 
@@ -211,6 +212,10 @@ struct TraceHeader<'a> {
     alpha: f32,
     budget_tokens: u32,
     min_score: f32,
+    /// `defaults.max_hits`, or `None` when uncapped. Shown because it silently
+    /// bounds the result set: without it on screen, a cap doing the trimming
+    /// looks exactly like a scoring problem.
+    max_hits: Option<usize>,
     used_stub: bool,
 }
 
@@ -273,6 +278,10 @@ fn print_header(h: &TraceHeader<'_>) {
         "budget:    {} tokens (min_score {})",
         h.budget_tokens, h.min_score
     );
+    match h.max_hits {
+        Some(cap) => println!("max_hits:  {cap}"),
+        None => println!("max_hits:  uncapped"),
+    }
     if h.used_stub {
         println!("embedder:  StubEmbedder (cosine scores are not semantically meaningful)");
     } else {
@@ -280,7 +289,27 @@ fn print_header(h: &TraceHeader<'_>) {
     }
 }
 
-fn print_results(sel: &BudgetedSelection, raw_count: usize, top: usize, budget_tokens: u32) {
+/// Which limit stopped the selection.
+///
+/// `select_within_budget` breaks the moment the cap fills, so `kept == cap` is
+/// exactly the condition under which `max_hits` — not scoring — did the
+/// trimming. Getting this wrong is not cosmetic: `diagnose` exists to explain
+/// why chunks were cut, and blaming `min_score/budget` for a cap sends someone
+/// tuning alpha after a phantom.
+fn trim_cause(kept: usize, max_hits: Option<usize>) -> &'static str {
+    match max_hits {
+        Some(cap) if kept == cap => "max_hits cap",
+        _ => "min_score/budget",
+    }
+}
+
+fn print_results(
+    sel: &BudgetedSelection,
+    raw_count: usize,
+    top: usize,
+    budget_tokens: u32,
+    max_hits: Option<usize>,
+) {
     let kept = sel.chunks.len();
     let trimmed = raw_count.saturating_sub(kept);
     println!(
@@ -290,7 +319,7 @@ fn print_results(sel: &BudgetedSelection, raw_count: usize, top: usize, budget_t
         sel.tokens_used,
         budget_tokens,
         if trimmed > 0 {
-            format!(", {trimmed} dropped (min_score/budget)")
+            format!(", {trimmed} dropped ({})", trim_cause(kept, max_hits))
         } else {
             String::new()
         }
@@ -304,7 +333,10 @@ fn print_results(sel: &BudgetedSelection, raw_count: usize, top: usize, budget_t
                  it's wired up, or seed via integration tests.)"
             );
         } else {
-            println!("(all {raw_count} hits dropped by min_score or token budget)");
+            println!(
+                "(all {raw_count} hits dropped by {})",
+                trim_cause(0, max_hits)
+            );
         }
         return;
     }
@@ -419,5 +451,28 @@ mod tests {
             ..Overrides::default()
         };
         assert!(!o.is_empty());
+    }
+
+    // ----- trim attribution (code-review finding 1) -----
+
+    /// `select_within_budget` stops the moment the cap fills, so `kept == cap`
+    /// is exactly when `max_hits` did the trimming. Naming `min_score/budget`
+    /// there sends someone tuning alpha after a problem that is not there.
+    #[test]
+    fn a_full_cap_is_attributed_to_max_hits() {
+        assert_eq!(trim_cause(4, Some(4)), "max_hits cap");
+        assert_eq!(trim_cause(0, Some(0)), "max_hits cap");
+    }
+
+    /// Under the cap, the cap cannot be what stopped it.
+    #[test]
+    fn stopping_below_the_cap_is_attributed_to_scoring() {
+        assert_eq!(trim_cause(3, Some(10)), "min_score/budget");
+    }
+
+    #[test]
+    fn without_a_cap_trimming_is_always_scoring() {
+        assert_eq!(trim_cause(0, None), "min_score/budget");
+        assert_eq!(trim_cause(50, None), "min_score/budget");
     }
 }

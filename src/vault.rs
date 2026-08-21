@@ -67,6 +67,13 @@ impl QueryPlanner {
     /// can time the two independently — `vault hook` records them as distinct
     /// fields, and a single combined call would flatten that.
     pub fn route(&self, prompt: &str) -> Result<Option<QueryPlan>, VaultError> {
+        // A prompt with no content cannot produce a useful plan, and asking
+        // anyway costs a real HTTP round trip that the remote backends bill for.
+        // The hook has always guarded this; the library did not, so
+        // `Vault::retrieve("")` paid for a router call, an embed, and a query.
+        if prompt.trim().is_empty() {
+            return Ok(None);
+        }
         match self.router.plan(prompt).map_err(VaultError::RouterPlan)? {
             RouterOutput::Skip => Ok(None),
             RouterOutput::Plan(plan) => Ok(Some(plan)),
@@ -184,6 +191,13 @@ impl Vault {
 
     /// Plan and search in one call.
     pub fn retrieve(&self, prompt: &str) -> Result<Retrieval, VaultError> {
+        // Checked here as well as in `route` so the caller gets the *reason*.
+        // `route` can only say "no plan"; these two skips call for different
+        // follow-up, and `SkipReason::EmptyPrompt` was a public variant no
+        // public entry point could return.
+        if prompt.trim().is_empty() {
+            return Ok(Retrieval::Skip(SkipReason::EmptyPrompt));
+        }
         match self.planner.plan(prompt)? {
             None => Ok(Retrieval::Skip(SkipReason::RouterSkip)),
             Some(planned) => self.store.search(&planned),
@@ -299,5 +313,43 @@ mod tests {
             Box::new(StubEmbedder::from_config(&config)),
         );
         assert_eq!(planner.backend(), "stub");
+    }
+
+    /// A blank prompt short-circuits before the router and before the embedder.
+    ///
+    /// `SkipReason::EmptyPrompt` was a public variant that no public entry point
+    /// could produce — the guard lived only in `vault hook`. A library consumer
+    /// calling `retrieve("")` paid for a router call (billable on the remote
+    /// backends), an embed, and a store query to be told nothing.
+    ///
+    /// Whitespace counts as blank. It used to reach the router, which is the
+    /// same waste with an extra step.
+    #[test]
+    fn a_blank_prompt_short_circuits_before_any_backend() {
+        let config = Config::default();
+        let vault = stub_vault(&config);
+
+        for prompt in ["", "   ", "\n\t "] {
+            match vault.retrieve(prompt).expect("retrieve") {
+                Retrieval::Skip(SkipReason::EmptyPrompt) => {}
+                other => panic!("expected EmptyPrompt for {prompt:?}, got {other:?}"),
+            }
+            assert!(
+                vault.planner().route(prompt).expect("route").is_none(),
+                "route must short-circuit too, for {prompt:?}"
+            );
+        }
+    }
+
+    /// The guard must not swallow a real prompt that merely looks short.
+    #[test]
+    fn a_non_blank_prompt_still_reaches_the_router() {
+        let config = Config::default();
+        let vault = stub_vault(&config);
+
+        assert!(
+            vault.planner().route("x").expect("route").is_some(),
+            "a one-character prompt is not blank"
+        );
     }
 }

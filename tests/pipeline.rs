@@ -15,7 +15,7 @@
 mod common;
 
 use common::{TmpDir, config_in, plan_for};
-use vault::{Interaction, Retrieval, SkipReason, SyncOptions, VaultStore};
+use vault::{Interaction, QueryPlanner, Retrieval, SkipReason, SyncOptions, VaultStore};
 
 /// Opening a store creates and migrates the database, in the directory the
 /// caller named rather than `~/.vault`.
@@ -155,4 +155,56 @@ fn a_non_interactive_sync_derives_a_name_instead_of_prompting() {
         .and_then(|s| s.to_str())
         .expect("dir name");
     assert_eq!(report.project, derived);
+}
+
+/// A consumer gets `EmptyPrompt` — not a silent empty result, and not a
+/// billable round trip.
+///
+/// This variant was public but unreachable: the guard lived only in the CLI
+/// hook, so `Vault::retrieve("")` called the router, embedded the empty string,
+/// and queried SQLite before returning nothing. The deterministic coverage is
+/// the inline test in `src/vault.rs`, which can use stubs; this one proves it
+/// from outside the crate wherever a backend happens to be configured.
+#[test]
+fn a_consumer_gets_empty_prompt_rather_than_a_billable_round_trip() {
+    let tmp = TmpDir::new("empty-prompt");
+    let config = config_in(tmp.path());
+
+    let Ok(vault) = vault::Vault::open(&config) else {
+        eprintln!("skipped: no router backend configured on this machine");
+        return;
+    };
+
+    for prompt in ["", "   ", "\n\t "] {
+        match vault.retrieve(prompt).expect("must not error") {
+            Retrieval::Skip(SkipReason::EmptyPrompt) => {}
+            other => panic!("expected EmptyPrompt for {prompt:?}, got {other:?}"),
+        }
+    }
+}
+
+/// The router step short-circuits on a blank prompt, so no HTTP request is made.
+///
+/// Driven through `QueryPlanner` rather than `Vault` because this is the seam
+/// that used to pay for the call. Constructing a planner needs a configured
+/// backend, so the assertion is on `route` returning `None` before it would
+/// reach one — an unreachable backend would surface as `Err`, not `Ok(None)`.
+#[test]
+fn a_blank_prompt_never_reaches_the_router() {
+    let tmp = TmpDir::new("blank-route");
+    let config = config_in(tmp.path());
+
+    // `QueryPlanner::new` resolves a backend, which may legitimately fail on a
+    // machine with no Gemma and no API key — that is not what is under test.
+    let Ok(planner) = QueryPlanner::new(&config) else {
+        eprintln!("skipped: no router backend available on this machine");
+        return;
+    };
+
+    for prompt in ["", "   ", "\n\t "] {
+        assert!(
+            planner.route(prompt).expect("must not error").is_none(),
+            "blank prompt {prompt:?} must short-circuit before the router"
+        );
+    }
 }
