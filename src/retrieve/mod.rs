@@ -135,30 +135,84 @@ impl Context {
 /// this is the only segment a concurrent caller has to serialise. It is
 /// milliseconds of SQLite work; the router call that produced `planned` is the
 /// multi-second part, and it has already happened.
+/// Everything one store phase produced, including what the budget pass threw
+/// away. [`Retrieval`] is the view of this the hook needs; `vault diagnose`
+/// needs the rest — chiefly `raw_count`, which is gone by the time a
+/// `Retrieval` exists.
+///
+/// This type is why there is one pipeline instead of two. `diagnose` used to
+/// hand-roll its own copy of query then trim, and when `max_hits` was added the
+/// copy was the one that got it wrong: it kept reporting cuts as
+/// `min_score/budget`. A trace tool that drifts from the thing it traces is
+/// worse than no trace tool.
+pub(crate) struct SearchTrace {
+    /// Hits the store returned, before `min_score`, the token budget, or
+    /// `max_hits` removed any. Only `vault diagnose` reads it — the hook needs
+    /// the survivors, not the count of what was cut.
+    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
+    pub raw_count: usize,
+    pub selection: budget::BudgetedSelection,
+    /// `None` when nothing survived the trim. Resolving a tag costs a query,
+    /// and there is no block to put it on.
+    pub tag: Option<String>,
+}
+
+impl SearchTrace {
+    fn into_retrieval(self) -> Retrieval {
+        match self.tag {
+            None => Retrieval::Skip(SkipReason::NoHits),
+            Some(tag) => Retrieval::Context(Context {
+                tag,
+                tokens: self.selection.tokens_used,
+                hits: self.selection.chunks,
+            }),
+        }
+    }
+}
+
 pub(crate) fn search(
     planned: &PlannedQuery,
     config: &Config,
     store: &dyn Store,
 ) -> Result<Retrieval, VaultError> {
-    let hits = store
-        .hybrid_search(&planned.plan, &planned.embedding, config.alpha())
-        .map_err(VaultError::Query)?;
+    Ok(search_traced(planned, config, store, config.alpha())?.into_retrieval())
+}
 
-    let selected = budget::select_within_budget(
+/// The store phase, with the trim reported rather than discarded.
+///
+/// `alpha` is a parameter instead of coming from `config` because
+/// `vault diagnose --alpha` overrides it for a single run; every other knob the
+/// budget pass reads still comes from `config`, so the two callers cannot drift
+/// on `min_score`, `token_budget`, or `max_hits`.
+pub(crate) fn search_traced(
+    planned: &PlannedQuery,
+    config: &Config,
+    store: &dyn Store,
+    alpha: f32,
+) -> Result<SearchTrace, VaultError> {
+    let hits = store
+        .hybrid_search(&planned.plan, &planned.embedding, alpha)
+        .map_err(VaultError::Query)?;
+    let raw_count = hits.len();
+
+    let selection = budget::select_within_budget(
         hits,
         config.token_budget() as u32,
         config.min_score(),
         config.max_hits(),
     );
-    if selected.chunks.is_empty() {
-        return Ok(Retrieval::Skip(SkipReason::NoHits));
-    }
 
-    Ok(Retrieval::Context(Context {
-        tag: resolve_tag(store, config, &planned.plan.projects),
-        tokens: selected.tokens_used,
-        hits: selected.chunks,
-    }))
+    let tag = if selection.chunks.is_empty() {
+        None
+    } else {
+        Some(resolve_tag(store, config, &planned.plan.projects))
+    };
+
+    Ok(SearchTrace {
+        raw_count,
+        selection,
+        tag,
+    })
 }
 
 /// Resolve the context tag for the block. The first router-named project with a
@@ -452,5 +506,48 @@ mod tests {
             ctx.render_block(),
             "<software-context>\n</software-context>\n"
         );
+    }
+
+    // ----- one pipeline, two views (code-review finding 10) -----
+
+    /// `search` must be nothing but a view of `search_traced`.
+    ///
+    /// This is the property the fix bought. `diagnose` used to hand-roll its own
+    /// copy of query-then-trim; when `max_hits` landed, the copy was the one
+    /// that got it wrong and kept blaming `min_score/budget` for a cap. Two
+    /// implementations of one pipeline drift silently, and the one that drifts
+    /// is the tool whose entire job is reporting what the other did.
+    #[test]
+    fn search_is_a_view_of_the_trace_not_a_second_implementation() {
+        let config = Config::default();
+        let store = SqliteStore::open_in_memory(&config).expect("store");
+        let planned = planned_for(vec!["vault".to_string()]);
+
+        let trace = search_traced(&planned, &config, &store, config.alpha()).expect("traced");
+        let retrieval = search(&planned, &config, &store).expect("search");
+
+        // Empty store: the trace says nothing survived, and `search` reports the
+        // skip that follows from exactly that.
+        assert_eq!(trace.selection.chunks.len(), 0);
+        assert!(
+            trace.tag.is_none(),
+            "no tag is resolved for an empty result"
+        );
+        assert!(matches!(retrieval, Retrieval::Skip(SkipReason::NoHits)));
+    }
+
+    /// The alpha override is the *only* knob `diagnose` supplies itself. Every
+    /// other budget input still comes from `config`, so the two callers cannot
+    /// disagree about `min_score`, `token_budget`, or `max_hits`.
+    #[test]
+    fn only_alpha_is_caller_supplied() {
+        let config = Config::default();
+        let store = SqliteStore::open_in_memory(&config).expect("store");
+        let planned = planned_for(vec![]);
+
+        for alpha in [0.0, 0.5, 1.0] {
+            let trace = search_traced(&planned, &config, &store, alpha).expect("traced");
+            assert_eq!(trace.raw_count, 0);
+        }
     }
 }

@@ -5,9 +5,11 @@ use clap::Args as ClapArgs;
 
 use crate::config::Config;
 use crate::embed::{Embedder, StubEmbedder, TeiEmbedder};
-use crate::retrieve::budget::{self, BudgetedSelection};
-use crate::retrieve::{QueryPlan, ResolvedBackend, RouterOutput, build_router, resolve_backend};
-use crate::store::{SqliteStore, Store};
+use crate::retrieve::{
+    PlannedQuery, QueryPlan, ResolvedBackend, RouterOutput, SearchTrace, build_router,
+    resolve_backend, search_traced,
+};
+use crate::store::SqliteStore;
 use crate::types::{DocType, Language};
 
 type CliResult = Result<(), Box<dyn Error + Send + Sync>>;
@@ -116,12 +118,15 @@ pub fn run(args: Args) -> CliResult {
     let db_path = config.db_path()?;
     let store = SqliteStore::open(&db_path, &config)?;
 
-    let query_emb = embedder.embed_query(&args.prompt)?;
-    let raw_hits = store.hybrid_search(&plan, &query_emb, alpha)?;
-    let raw_count = raw_hits.len();
-    let selection = budget::select_within_budget(raw_hits, budget_tokens, min_score, max_hits);
+    // The same call `vault hook` makes. Everything below is a view of its
+    // result, not a second implementation — see `SearchTrace`.
+    let planned = PlannedQuery {
+        plan,
+        embedding: embedder.embed_query(&args.prompt)?,
+    };
+    let trace = search_traced(&planned, &config, &store, alpha)?;
 
-    print_results(&selection, raw_count, args.top, budget_tokens, max_hits);
+    print_results(&trace, args.top, budget_tokens, max_hits);
     Ok(())
 }
 
@@ -303,13 +308,9 @@ fn trim_cause(kept: usize, max_hits: Option<usize>) -> &'static str {
     }
 }
 
-fn print_results(
-    sel: &BudgetedSelection,
-    raw_count: usize,
-    top: usize,
-    budget_tokens: u32,
-    max_hits: Option<usize>,
-) {
+fn print_results(trace: &SearchTrace, top: usize, budget_tokens: u32, max_hits: Option<usize>) {
+    let sel = &trace.selection;
+    let raw_count = trace.raw_count;
     let kept = sel.chunks.len();
     let trimmed = raw_count.saturating_sub(kept);
     println!(
@@ -324,6 +325,11 @@ fn print_results(
             String::new()
         }
     );
+    // Which block the hook would actually emit. Available now that diagnose runs
+    // the same pipeline; previously this tool could not tell you.
+    if let Some(tag) = &trace.tag {
+        println!("tag:       <{tag}>");
+    }
     println!();
 
     if sel.chunks.is_empty() {
