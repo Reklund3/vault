@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::io::Read;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use serde::Deserialize;
@@ -27,7 +28,11 @@ pub fn run() -> ! {
     let _ = std::io::stdin().read_to_string(&mut stdin_buf);
 
     let mut tel = log::Telemetry::default();
-    let outcome = pipeline(&stdin_buf, &mut tel);
+    // `pipeline` hands back the vault directory it resolved, so the log lands
+    // beside the database rather than wherever `$HOME` happens to point. `None`
+    // means config loading failed — the logger falls back, because that failure
+    // is itself worth recording.
+    let (outcome, vault_dir) = pipeline(&stdin_buf, &mut tel);
 
     if let Outcome::Injected { block, .. } = &outcome {
         print!("{block}");
@@ -38,7 +43,7 @@ pub fn run() -> ! {
             stage.as_str()
         );
     }
-    log::append_best_effort(&outcome, &tel, started.elapsed());
+    log::append_best_effort(&outcome, &tel, started.elapsed(), vault_dir.as_deref());
     std::process::exit(0);
 }
 
@@ -154,29 +159,38 @@ fn ms_since(start: Instant) -> u64 {
     start.elapsed().as_millis() as u64
 }
 
-fn pipeline(stdin: &str, tel: &mut log::Telemetry) -> Outcome {
+/// Returns the outcome plus the vault directory the run resolved, if it got
+/// far enough to load a config. The directory is the logger's destination — see
+/// `log::log_dir` for why it is an `Option` rather than always resolved here.
+fn pipeline(stdin: &str, tel: &mut log::Telemetry) -> (Outcome, Option<PathBuf>) {
     let event: HookInput = match serde_json::from_str(stdin) {
         Ok(ev) => ev,
-        Err(e) => return Outcome::failed(Stage::Stdin, e),
+        Err(e) => return (Outcome::failed(Stage::Stdin, e), None),
     };
     // Kept even though `Vault::retrieve` now guards too: this fires before
     // `Config::load` and `Vault::open`, which build a router and a TEI client.
     // `trim()` matches the library predicate — a whitespace-only prompt used to
     // reach the router and get billed for it.
     if event.prompt.trim().is_empty() {
-        return Outcome::Skip {
-            reason: SkipReason::EmptyPrompt,
-        };
+        return (
+            Outcome::Skip {
+                reason: SkipReason::EmptyPrompt,
+            },
+            None,
+        );
     }
     let config = match Config::load() {
         Ok(c) => c,
-        Err(e) => return Outcome::from_vault_error(&VaultError::Config(e)),
+        Err(e) => return (Outcome::from_vault_error(&VaultError::Config(e)), None),
     };
+    // Resolved before `Vault::open`, so a store or router failure still logs to
+    // the right place.
+    let vault_dir = config.vault_dir().ok();
     let vault = match Vault::open(&config) {
         Ok(v) => v,
-        Err(e) => return Outcome::from_vault_error(&e),
+        Err(e) => return (Outcome::from_vault_error(&e), vault_dir),
     };
-    pipeline_with(&event.prompt, &vault, tel)
+    (pipeline_with(&event.prompt, &vault, tel), vault_dir)
 }
 
 /// Inner pipeline with an injected `Vault` — testable with stub backends.
@@ -673,7 +687,7 @@ mod tests {
         // a valid envelope), distinguished from deliberate skips.
         for bad in ["not json at all", "", "{}"] {
             let mut tel = log::Telemetry::default();
-            let out = pipeline(bad, &mut tel);
+            let (out, dir) = pipeline(bad, &mut tel);
             assert!(
                 matches!(
                     out,
@@ -684,6 +698,11 @@ mod tests {
                 ),
                 "input {bad:?} → {out:?}"
             );
+            // Bailed before a config existed; the logger falls back to $HOME.
+            assert!(
+                dir.is_none(),
+                "input {bad:?} resolved a dir it never loaded"
+            );
         }
     }
 
@@ -692,13 +711,17 @@ mod tests {
         // Valid envelope, empty prompt body — bails before touching any
         // backend (no Config load, no router probe).
         let mut tel = log::Telemetry::default();
-        let out = pipeline(r#"{"prompt": ""}"#, &mut tel);
+        let (out, dir) = pipeline(r#"{"prompt": ""}"#, &mut tel);
         assert!(matches!(
             out,
             Outcome::Skip {
                 reason: SkipReason::EmptyPrompt
             }
         ));
+        assert!(
+            dir.is_none(),
+            "no config is loaded on the empty-prompt path"
+        );
     }
 
     /// `render_block` moved onto `Context`; these tests still assert the exact
