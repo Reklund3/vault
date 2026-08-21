@@ -19,12 +19,26 @@ cargo run -- <subcommand>        # e.g. cargo run -- diagnose "what does BuildRe
 
 # The library without the CLI — what a service or MCP server consumes. CI gates
 # on this, because nothing else builds without the `cli` feature.
-cargo build --no-default-features --lib
-cargo clippy --no-default-features --lib -- -D warnings
+cargo build --no-default-features --lib --locked
+cargo clippy --no-default-features --lib --locked -- -D warnings
+
+# Design rule 3, checked on the artifact: asserts the library-only rlib holds no
+# stdin/stdout symbol. A source grep cannot do this — the library's stdin reads
+# are textually present inside `#[cfg(feature = "cli")]` arms.
+./scripts/check-library-io.sh
 ```
 
 CI (`.github/workflows/ci.yml`) gates on `fmt` first, then runs `test`, `build --release --locked`,
-`lib-only` (the two `--no-default-features` commands above), and `clippy` in parallel behind it.
+`lib-only` (the `--no-default-features` commands plus the rule-3 check), and `clippy` in parallel
+behind it.
+
+**Every cargo invocation in CI passes `--locked`** — all except `cargo fmt`, which does not resolve
+dependencies and rejects the flag. This is a supply-chain control, not a style choice: without it
+cargo silently rewrites `Cargo.lock` when resolution would change, which is precisely how the
+2026-08-20 `arrayref`/`proc-macro1` attack propagated (the attacker yanked the good versions to force
+resolution onto a malicious one). `--locked` turns that into a failed build. `scripts/supply-chain-audit.sh`
+sweeps history for known-bad crates when an advisory lands.
+
 Both gates are enforced — run them before pushing:
 
 ```bash

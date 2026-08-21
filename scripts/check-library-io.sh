@@ -33,7 +33,7 @@ TARGET="target/rule3-check"
 PATTERN='io[0-9]+std(in|out)|io[0-9]+_+print'
 
 echo "Building the library without the \`cli\` feature..."
-CARGO_TARGET_DIR="$TARGET" cargo build --no-default-features --lib --quiet
+CARGO_TARGET_DIR="$TARGET" cargo build --no-default-features --lib --locked --quiet
 
 rlib=$(find "$TARGET/debug" -maxdepth 1 -name 'libvault*.rlib' | head -1)
 if [ -z "$rlib" ]; then

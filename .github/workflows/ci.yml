@@ -10,6 +10,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Every cargo invocation below passes --locked (except `cargo fmt`, which does
+# not resolve dependencies and rejects the flag). Without it cargo silently
+# rewrites Cargo.lock when resolution would change, which is exactly how the
+# 2026-08-20 arrayref/proc-macro1 attack propagated: the attacker yanked the
+# good versions to force resolution onto a malicious one. --locked turns that
+# into a failed build instead of a silent upgrade.
+
 jobs:
   fmt:
     name: Rustfmt
@@ -34,7 +41,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Run tests
-        run: cargo test
+        run: cargo test --locked
 
   build:
     name: Build (release)
@@ -68,10 +75,10 @@ jobs:
       # without this job an accidental dependency on a CLI module would only
       # surface for a downstream consumer.
       - name: Build without the CLI feature
-        run: cargo build --no-default-features --lib
+        run: cargo build --no-default-features --lib --locked
 
       - name: Lint without the CLI feature
-        run: cargo clippy --no-default-features --lib -- -D warnings
+        run: cargo clippy --no-default-features --lib --locked -- -D warnings
 
       # Design rule 3, checked on the artifact a consumer links rather than on
       # the source. A source grep cannot do this: the library's stdin reads sit
@@ -94,4 +101,4 @@ jobs:
           components: clippy
 
       - name: Linting
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --locked -- -D warnings
