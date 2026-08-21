@@ -15,6 +15,7 @@ pub fn mlx_reachable(endpoint: &str) -> bool {
 /// `vault index sync` preflight. A successful connect means something is
 /// listening; dim/model correctness is confirmed separately by
 /// `TeiEmbedder::verify_against_server`.
+#[cfg(feature = "cli")]
 pub fn tei_reachable(endpoint: &str) -> bool {
     port_reachable(endpoint)
 }

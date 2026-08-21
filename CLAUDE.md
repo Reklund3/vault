@@ -16,10 +16,16 @@ cargo build --release --locked   # as CI builds it
 cargo test
 cargo test <test_name>           # run a single test
 cargo run -- <subcommand>        # e.g. cargo run -- diagnose "what does BuildRequest need?"
+
+# The library without the CLI — what a service or MCP server consumes. CI gates
+# on this, because nothing else builds without the `cli` feature.
+cargo build --no-default-features --lib
+cargo clippy --no-default-features --lib -- -D warnings
 ```
 
 CI (`.github/workflows/ci.yml`) gates on `fmt` first, then runs `test`, `build --release --locked`,
-and `clippy` in parallel behind it. Both gates are enforced — run them before pushing:
+`lib-only` (the two `--no-default-features` commands above), and `clippy` in parallel behind it.
+Both gates are enforced — run them before pushing:
 
 ```bash
 cargo fmt --check              # blocks every other CI job
@@ -85,7 +91,9 @@ The router returns `{ skip: true }` for prompts that need no context — immedia
 
 | Path | Responsibility |
 |------|---------------|
+| `src/lib.rs` | the curated public API — library modules (`config`, `error`, `index`, `vault`) plus root re-exports; the four CLI modules sit behind the default-on `cli` feature |
 | `src/main.rs` | clap `Cli`/`Command` definitions and subcommand dispatch — the only place execution modes are wired |
+| `src/vault.rs` | library facade — `QueryPlanner` (Send+Sync, network half), `VaultStore` (Send, owns the connection), `Vault` (both) |
 | `src/hook/mod.rs` | stdin→stdout hook protocol, full pipeline entry; outcome taxonomy (injected / skip / failed-at-stage) |
 | `src/hook/log.rs` | hook telemetry — one metadata-only JSONL record per call to `~/.vault/hook.log` (5MB rotation) |
 | `src/store/traits.rs` | `Store` trait + `StoreError` — backend abstraction; carries the embedding model/dim lock error |
@@ -255,7 +263,7 @@ Vault is on the hot path of every Claude Code prompt. Full design constraints, t
 - **Index-time secret pre-scan.** Chunks matching common secret patterns (AWS keys, GitHub/Anthropic/OpenAI tokens, JWT, PEM headers) are dropped before storage.
 - **Classifier sees filename + extension + first 1KB only**, never full files. Full content reaches Anthropic only via retrieval-time injection, which the user controls via `vault diagnose`.
 - **Hook fails open.** Any error → empty stdout, exit 0 — never block the user. Failures stay observable without breaking that contract: one stderr breadcrumb (visible only in Claude Code debug mode) plus a metadata-only JSONL record in `~/.vault/hook.log` — never prompt text, never chunk content; error detail truncated.
-- **Stub backends are `#[cfg(test)]`-gated on purpose.** `retrieve/router/stub.rs` and `index/classify/stub.rs` compile only under test, so the compiler enforces that a stub can never become a silent production fallback — with Gemma and the remote backend both unreachable, vault passes through (hook) or prompts/fails (sync), never guesses. `embed/stub.rs` is deliberately **not** gated: `vault diagnose --stub` exposes `StubEmbedder` in release builds to trace retrieval plumbing without TEI, and says so in its output. Don't "resolve" that asymmetry in either direction.
+- **Stub backends are `#[cfg(test)]`-gated on purpose.** `retrieve/router/stub.rs` and `index/classify/stub.rs` compile only under test, so the compiler enforces that a stub can never become a silent production fallback — with Gemma and the remote backend both unreachable, vault passes through (hook) or prompts/fails (sync), never guesses. `embed/stub.rs` is deliberately **not** test-gated: `vault diagnose --stub` exposes `StubEmbedder` in release builds to trace retrieval plumbing without TEI, and says so in its output. Its gate is `#[cfg(any(feature = "cli", test))]` — it ships in every release build that has a CLI, which is exactly when `--stub` exists, and is absent only from a `--no-default-features` library build where `diagnose` does not exist either. Don't "resolve" that asymmetry by making it `#[cfg(test)]` or by un-gating the router/classifier stubs.
 - **`~/.claude/settings.json` should reference vault by absolute path** (not `vault hook` resolved via PATH).
 
 ## v1 Scope Boundaries

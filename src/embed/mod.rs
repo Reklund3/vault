@@ -1,6 +1,13 @@
 mod stub;
 mod tei;
 
+// `StubEmbedder` exists for `vault diagnose --stub`, which traces retrieval
+// plumbing without TEI. It must NOT be `#[cfg(test)]`-gated — that is the
+// deliberate asymmetry with the router and classifier stubs (see CLAUDE.md), and
+// it still holds: this ships in every release build that has a CLI, which is
+// exactly when `--stub` exists. `test` is in the gate because the facade and
+// hook unit tests use it as a cheap deterministic embedder.
+#[cfg(any(feature = "cli", test))]
 pub use stub::StubEmbedder;
 pub use tei::TeiEmbedder;
 

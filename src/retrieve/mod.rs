@@ -2,7 +2,11 @@ pub mod budget;
 pub mod hybrid;
 mod router;
 
-pub use router::{ResolvedBackend, Router, RouterError, build_router, resolve_backend};
+pub use router::{Router, RouterError, build_router};
+// Only `vault diagnose` reports which backend `auto` picked; the library's own
+// paths never need to ask.
+#[cfg(feature = "cli")]
+pub use router::{ResolvedBackend, resolve_backend};
 // `RouterError` is named by `VaultError::{RouterBuild, RouterPlan}`, so it is
 // part of the public surface now — it used to be `#[cfg(test)]` back when
 // production code only ever saw it through `Display`. The stub stays test-only:

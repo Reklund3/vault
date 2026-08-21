@@ -18,15 +18,31 @@
 //!   `main.rs`, `configure`, `diagnose`, and `tei`. A future stdio consumer
 //!   (an MCP server) uses both streams for protocol framing.
 
-// Public: reached by the CLI today, and the starting point for the curated API.
+// The library. This is what a service or a future MCP server consumes.
 pub mod config;
-pub mod configure;
-pub mod diagnose;
 pub mod error;
-pub mod hook;
 pub mod index;
-pub mod tei;
 pub mod vault;
+
+// The CLI. These four are `vault` the command-line tool, not `vault` the
+// library: between them they own every `print!`, every stdin read, and the one
+// `process::exit`. They are behind the default-on `cli` feature so a consumer
+// can leave them — and clap — behind with `default-features = false`, and so
+// that "is this the library or the CLI?" is a question the compiler answers
+// rather than a convention in a doc comment.
+//
+// This is what keeps rule 3 honest. It does not make the pipelines print-free
+// by itself — that is a property of the pipeline code, checked separately —
+// but it means a consumer who opts out cannot even reach a printing entry
+// point.
+#[cfg(feature = "cli")]
+pub mod configure;
+#[cfg(feature = "cli")]
+pub mod diagnose;
+#[cfg(feature = "cli")]
+pub mod hook;
+#[cfg(feature = "cli")]
+pub mod tei;
 
 // Private at the root: implementation detail, still crate-visible via `crate::`.
 mod embed;
@@ -44,9 +60,12 @@ mod util;
 // that takes one or store it in a struct. Everything reachable through a public
 // field belongs here — `tests/public_api.rs` names each of them so a regression
 // fails the build rather than surfacing as an awkward downstream workaround.
+pub use config::{Config, ConfigError};
 pub use embed::EmbedError;
 pub use error::VaultError;
+pub use index::classify::ClassifyError;
 pub use index::sync::{Interaction, SyncError, SyncOptions, SyncReport};
+pub use index::walk::WalkError;
 pub use retrieve::{Context, PlannedQuery, QueryPlan, Retrieval, RouterError, SkipReason};
 pub use store::{Hit, StoreError};
 pub use types::{DocType, Language};

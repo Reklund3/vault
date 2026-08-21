@@ -50,6 +50,29 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
+  lib-only:
+    name: Build (library only)
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+
+      # The `cli` feature is what keeps `vault` the library separable from
+      # `vault` the command-line tool. Nothing else in CI builds without it, so
+      # without this job an accidental dependency on a CLI module would only
+      # surface for a downstream consumer.
+      - name: Build without the CLI feature
+        run: cargo build --no-default-features --lib
+
+      - name: Lint without the CLI feature
+        run: cargo clippy --no-default-features --lib -- -D warnings
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

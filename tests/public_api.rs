@@ -9,15 +9,13 @@
 //! and usable, not that retrieval works. The full integration suite is a later
 //! step; this exists so an accidental privatisation fails the build.
 
-// NOTE the shape of these paths. `Config` lives behind `vault::config` while
-// the retrieval types are re-exported at the root — an inconsistency the
-// curation step is meant to settle. Written as-is so this file reflects the
-// surface a consumer actually sees today, not the one we intend.
-use vault::config::Config;
+// Everything a consumer needs is at the crate root. Step 8 settled the earlier
+// inconsistency where `Config` alone lived behind `vault::config` — that path
+// still works, but the root is the curated surface and this file names it.
 use vault::{
-    Context, DocType, EmbedError, Hit, Interaction, Language, PlannedQuery, QueryPlan,
-    QueryPlanner, Retrieval, RouterError, SkipReason, StoreError, SyncError, SyncOptions,
-    SyncReport, Vault, VaultError, VaultStore,
+    ClassifyError, Config, ConfigError, Context, DocType, EmbedError, Hit, Interaction, Language,
+    PlannedQuery, QueryPlan, QueryPlanner, Retrieval, RouterError, SkipReason, StoreError,
+    SyncError, SyncOptions, SyncReport, Vault, VaultError, VaultStore, WalkError,
 };
 
 #[test]
@@ -235,4 +233,53 @@ fn a_consumer_can_put_the_vault_directory_somewhere_other_than_home() {
 
     assert_eq!(config.vault_dir().expect("dir"), dir);
     assert_eq!(config.db_path().expect("db"), dir.join("vault.db"));
+}
+
+/// Every type reachable through a `SyncError` variant must be nameable, for the
+/// same reason `Hit` must be: a consumer matching on the variant needs to bind
+/// what it carries. `ClassifyError` and `WalkError` live in modules that are
+/// crate-internal, so only the root re-export makes them reachable.
+#[test]
+fn every_type_carried_by_a_sync_error_is_nameable() {
+    fn takes_a_classify_error(e: ClassifyError) -> SyncError {
+        SyncError::BuildClassifier(e)
+    }
+    fn takes_a_walk_error(e: WalkError) -> SyncError {
+        SyncError::Walk(e)
+    }
+    fn takes_a_config_error(e: ConfigError) -> SyncError {
+        SyncError::Config(e)
+    }
+
+    assert!(matches!(
+        takes_a_config_error(ConfigError::HomeNotFound),
+        SyncError::Config(_)
+    ));
+
+    // Named purely so the signatures above have to compile.
+    let _ = takes_a_classify_error;
+    let _ = takes_a_walk_error;
+}
+
+/// The CLI is not the library.
+///
+/// `vault hook`, `vault diagnose`, `vault configure` and `vault tei` own every
+/// `print!`, the one stdin read, and the one `process::exit` in the tree. They
+/// sit behind the default-on `cli` feature, so a consumer building with
+/// `default-features = false` cannot reach a printing entry point at all — which
+/// is what makes rule 3 something the compiler helps with rather than a
+/// convention.
+///
+/// This test runs *with* default features, so those modules are present here. It
+/// pins what the library half must expose on its own; the library-only build is
+/// verified separately by `cargo build --no-default-features --lib`.
+#[test]
+fn the_library_half_stands_on_its_own() {
+    // Retrieval, indexing, config and errors — no CLI module named.
+    fn _library_surface(config: &Config) -> Result<VaultStore, VaultError> {
+        VaultStore::open(config)
+    }
+
+    let config = Config::default();
+    assert!(config.embedding_dim() > 0);
 }
