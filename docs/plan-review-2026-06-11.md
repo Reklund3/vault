@@ -1,7 +1,11 @@
-# Review: docs/vault-plan.md — open items
+# Open findings
 
-**Originally:** 2026-06-11, verified against commit `6b08f9d` (branch `init`)
+**Originally:** a review of `docs/vault-plan.md`, 2026-06-11, verified against
+commit `6b08f9d` (branch `init`)
 **Pruned:** 2026-08-21 — resolved findings removed; see below for what went and why
+**Extended:** 2026-08-22 — section D added for findings that did not come from
+that review (the `lib-cli-split` code review, and one pair found while bringing
+TEI up for the test suite)
 
 The design plan was written before Steps 1–14.8 were implemented and drifted from
 the code. This file recorded that drift. Roughly two thirds of the findings have
@@ -15,8 +19,10 @@ resolved finding with its resolution note and commit — is in git history:
 git show af1aeab:docs/plan-review-2026-06-11.md
 ```
 
-Item IDs are unchanged, so an external reference to "A9" or "C2" still resolves.
-Gaps in the numbering mean that item was fixed.
+Item IDs in sections A–C are unchanged, so an external reference to "A9" or "C2"
+still resolves. Gaps in the numbering mean that item was fixed. Section D uses its
+own IDs, because those findings are about the code as built rather than about the
+plan drifting from it.
 
 ---
 
@@ -35,7 +41,8 @@ Gaps in the numbering mean that item was fixed.
   stalled for that whole time, and cancelled to passthrough past 30s.
 - The auto-probe is TCP-reachability only (200ms, `src/util/probe.rs`) — it
   cannot detect "reachable but too slow", so auto mode selects the unusable
-  backend happily.
+  backend happily. **See D4**: the same probe was measured going green ~28s early
+  on the TEI side, so this is no longer a hypothetical.
 - One `[mlx].router_model` serves both router and classifier. Routing needs
   small and fast; classification tolerates big and slow. No per-role knob.
 - Candidate resolutions: a dedicated small routing model (or Haiku for the
@@ -48,8 +55,16 @@ model or timeout exists.*
 
 When this was written nothing was registered, which made it a design decision.
 It is no longer: `~/.claude/settings.json` **has** a `UserPromptSubmit` entry and
-`~/.claude/CLAUDE.md` **does not exist**, so injected context reaches the model
-today with no data-not-instructions framing at all.
+`~/.claude/CLAUDE.md` **does not exist**.
+
+*Scope correction (2026-08-22).* An earlier revision of this section said context
+"reaches the model today" unframed. That overstates it on this machine: all 13
+records in `hook.log` are failures — `router-build` ×7 (no `ANTHROPIC_API_KEY`),
+`stdin` ×3, `config` ×1, plus 2 skips — with no `router_ms` sample, so no call has
+ever reached the router and nothing has ever been injected here. The accurate
+statement is that the exposure opens the moment the router works, which is exactly
+what fixing P1 does. The defence is missing either way; only the window is not yet
+open locally.
 
 - The proposed global CLAUDE.md text enumerates three domain tags. The fallback
   `<vault-context>` tag — returned whenever no project matches a domain — is not
@@ -142,6 +157,104 @@ passthrough — exactly when context would help most.
 
 ---
 
+## D. Findings from the code, not from the plan
+
+These did not come from the 2026-06-11 review. **D1** and **D2** are the two
+findings left unfixed from the `lib-cli-split` code review; **D3** and **D4** were
+found on 2026-08-22 while starting TEI for the test suite. All four are verified
+against the tree.
+
+- **D1. `Vault::open` builds the router before the store.**
+
+  ```rust
+  // src/vault.rs:164
+  planner: QueryPlanner::new(config)?,   // network half — fails first
+  store:   VaultStore::open(config)?,
+  ```
+
+  A consumer that only wants to index gets `VaultError::RouterBuild` — on a
+  machine with no Gemma and no key, for a backend `sync` never calls. The
+  workaround is to use `VaultStore::open` directly, which nothing documents.
+
+  This matters more than its size suggests: the whole point of the library/CLI
+  split was a service or MCP server consuming the library, and "index a repo" is
+  the first thing such a consumer does. Either open the store first and build the
+  planner lazily, or document `VaultStore` as the indexing-only entry point.
+
+- **D2. Temp-directory helpers are duplicated across the test suite.**
+
+  The original finding said four copies. It is **15 `std::env::temp_dir()` sites
+  across 10 files** — `configure/mod.rs`, `hook/log.rs`, `index/walk.rs`,
+  `index/sync.rs`, `store/schema.rs`, `store/sqlite_store.rs`, `tei/launcher.rs`,
+  `util/path.rs`, `config.rs`, and `tests/common/mod.rs` — and it grew by two
+  during the review pass, which is the actual argument for fixing it.
+
+  Most carry a `Drop` guard that removes the directory. `schema.rs`'s
+  `temp_db_path` does not: it returns a bare `PathBuf`, so a panicking test leaks
+  the file, and nothing removes the `-wal`/`-shm` sidecars even on the happy path.
+  Those sidecars hold plaintext content from whatever the test indexed.
+
+- **D3. `vault tei start` reports success for a child that has already died.**
+
+  `command.spawn()` succeeds whenever the *launcher* program starts — for the
+  Docker launcher that is the `docker` client, not the server. On a name conflict
+  with a leftover container the client exits within milliseconds, but `start`
+  writes the pidfile and prints `Started TEI (pid N)` without checking
+  (`src/tei/launcher.rs:90-104`).
+
+  The readiness loop then polls, fails, and prints *"TEI process is running but
+  <endpoint> is not answering yet — first run downloads model weights and can take
+  minutes"*, and returns `Ok(())`. Every clause of that is wrong in this case: the
+  process is not running, and no amount of waiting will help. `vault tei status`
+  then shows a live-looking pidfile for a dead PID.
+
+  Observed 2026-08-22: a `vault-tei` container sitting `Exited (0)` since
+  2026-08-19 — `--rm` had not cleaned it up — made `docker run` fail on the name,
+  and the real error (`Conflict. The container name "/vault-tei" is already in
+  use`) was only visible by reading `~/.vault/tei.log` directly.
+
+  Fix: check the child is alive before claiming it started, and again before
+  printing the "still warming up" message. When it is not, tail the log — the
+  error is already sitting there.
+
+- **D4. Reachability probes are TCP-only, so "reachable" can precede "serving".**
+
+  `util::probe::port_reachable` is a TCP connect. Docker publishes the port the
+  instant the container starts, while TEI downloads weights, warms the model, and
+  only then binds its HTTP server.
+
+  Measured 2026-08-22: `vault tei start` printed `TEI is reachable on
+  http://localhost:8081` and `vault tei status` reported `reachable: yes`, while
+  `curl` to `/health`, `/info` and `/` all returned connection failures for the
+  next ~28 seconds, until the log line `Starting HTTP server: 0.0.0.0:80` / `Ready`.
+
+  The consequence for TEI is a false green: a user told the server is up runs
+  `vault index sync`, which hard-errors. The consequence for MLX is **P1**'s third
+  bullet — `auto` mode selects a backend that is listening but unusable, and the
+  hook eats the full timeout. Same root cause, two symptoms.
+
+  Fix: probe the health endpoint rather than the socket. `tei_reachable` already
+  takes the endpoint URL, so this is a change of method, not of signature.
+
+---
+
+## Loose ends
+
+Neither is a code finding; both are real and neither has another home.
+
+- **No `cargo audit` job.** Since the incident-response sweep was deliberately
+  untracked (see CLAUDE.md), `--locked` is the *only* standing supply-chain gate.
+  It stops resolution being silently rewritten, but nothing reads a maintained
+  advisory database. `cargo audit` or `cargo-deny` is the durable complement.
+
+- **`e2b7c12` does not compile standalone**, so `git bisect` dies on it. `lib.rs`
+  declared `pub mod vault;` in a commit where `src/vault.rs` was untracked; the
+  follow-up `8b1805e` fixed it forward rather than amending. Both are pushed, so
+  correcting it means rewriting shared history — probably not worth it, but a
+  bisect through that range needs `git bisect skip`.
+
+---
+
 ## Doc-sync checklist — what is left
 
 ### `docs/vault-plan.md`
@@ -155,6 +268,9 @@ passthrough — exactly when context would help most.
       latency-aware fallback), P3 (single-tag + domain-attribute decision, block
       grouping vs contract text, doctor check), P4 (query-side embed truncation),
       B1/B3 (retrieval_log fate), C1, C2.
+- [ ] The plan describes `vault tei start|status` without noting that both report
+      on a TCP socket rather than the service (D4), or that `start` does not
+      verify the child survived (D3).
 
 ### Verification when executing
 - `cargo test` stays green (docs only).
