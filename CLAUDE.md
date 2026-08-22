@@ -101,7 +101,7 @@ vault diagnose "<prompt>" --projects a,b --type-names BuildRequest --topics auth
 
 Execution modes from one binary, dispatched by subcommand in `main.rs`:
 - **`vault configure`** — first-run setup; provisions `~/.vault/` (0700), seeds a `vault.toml` template **only when absent** (0600), prints the Claude Code hook entry to add, and reports backend readiness. Idempotent. Never edits `~/.claude/settings.json` (print-only); `--force` re-seeds an existing toml.
-- **`vault hook`** — pre-send hook (registered globally in `~/.claude/settings.json`); reads prompt JSON from stdin, emits only the `<{domain}-context>` block to stdout (Claude Code appends it to the prompt)
+- **`vault hook`** — pre-send hook (registered globally in `~/.claude/settings.json`); reads prompt JSON from stdin, emits only the `<vault-context domain="...">` block to stdout (Claude Code appends it to the prompt)
 - **`vault index sync <repo>`** — explicit manual indexing; the classifier (Gemma local or Haiku fallback) labels files automatically (black box — no confirm/override), chunks written to SQLite
 - **`vault diagnose "<prompt>"`** — full retrieval trace for tuning alpha and token budget
 - **`vault tei start|stop|status|logs`** — manage the local TEI embeddings server
@@ -300,7 +300,9 @@ Tune `alpha` via `vault diagnose "<prompt>" --alpha X` after seeding real data; 
 
 ## Context Tags
 
-Tags are domain-level (not project-level). A project's domain is assigned during `vault index sync` and stored in `vault.db` (`projects.domain`); the hook derives the tag by convention as `{domain}-context`, falling back to `defaults.context_tag` when unassigned. Introducing a *new* domain requires adding a matching `## {domain}-context` section to `~/.claude/CLAUDE.md` (the single source of truth for what a tag means) — vault.toml is not involved.
+The wrapper tag is **constant** — `defaults.context_tag`, `vault-context` by default — and the domain rides as an attribute: `<vault-context domain="software">`. A project's domain is assigned during `vault index sync` and stored in `vault.db` (`projects.domain`); an unassigned project simply gets no attribute.
+
+This shape exists so `~/.claude/CLAUDE.md` needs **one** `## Vault Context` section, forever. The earlier design derived the tag as `{domain}-context` and required a matching section per domain, which drifted the moment a domain was added and never covered the unassigned fallback at all — context arrived with no data-not-instructions framing and nothing reported it.
 
 ## Security
 

@@ -327,8 +327,12 @@ fn print_results(trace: &SearchTrace, top: usize, budget_tokens: u32, max_hits: 
     );
     // Which block the hook would actually emit. Available now that diagnose runs
     // the same pipeline; previously this tool could not tell you.
-    if let Some(tag) = &trace.tag {
-        println!("tag:       <{tag}>");
+    if let Some(f) = &trace.framing {
+        let tag = crate::retrieve::safe_tag(&f.tag);
+        match crate::retrieve::safe_domain(f.domain.as_deref()) {
+            Some(domain) => println!("tag:       <{tag} domain=\"{domain}\">"),
+            None => println!("tag:       <{tag}>  (no domain assigned)"),
+        }
     }
     println!();
 

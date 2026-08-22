@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS projects (
     repo_path  TEXT,
     -- domain assignment (NULL = unassigned -> hook falls back to
     -- defaults.context_tag). Interactive runtime state vault writes during sync;
-    -- only the name is stored, the context tag is derived as `{domain}-context`.
+    -- only the name is stored; it renders as the `domain` attribute on the block.
     domain     TEXT,
     created_at INTEGER NOT NULL
 );

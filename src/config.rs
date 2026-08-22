@@ -348,7 +348,7 @@ impl Config {
 
     /// The global fallback context tag (`defaults.context_tag`), used for the
     /// injected block when no router-named project has a domain assignment in
-    /// vault.db. Per-domain tags are derived by convention as `{domain}-context`
+    /// vault.db. The tag is constant; the domain rides as an attribute
     /// in the hook, not configured here.
     pub fn default_context_tag(&self) -> &str {
         &self.defaults.context_tag
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn default_context_tag_returns_defaults_value() {
-        // Domain-driven tags (`{domain}-context`) are resolved in the hook from
+        // The domain attribute is resolved in the hook from
         // vault.db; config only supplies the unassigned fallback.
         let cfg = Config::default();
         assert_eq!(cfg.default_context_tag(), "vault-context");

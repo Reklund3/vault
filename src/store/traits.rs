@@ -61,7 +61,7 @@ pub trait Store {
     /// Resolve the domain assigned to the first of `project_names` (in router
     /// order) that has one. Case-insensitive name match. Returns `Ok(None)` when
     /// no named project is assigned a domain — the hook then derives the tag
-    /// from `defaults.context_tag` instead of `{domain}-context`.
+    /// with no `domain` attribute on the block.
     ///
     /// **Provided default returns `Ok(None)`** (every project unassigned).
     /// Backends that persist `projects.domain` override this; test doubles and

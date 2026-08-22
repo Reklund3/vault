@@ -545,10 +545,13 @@ mod tests {
         let Outcome::Injected { block, .. } = out else {
             panic!("expected Injected, got {out:?}");
         };
-        // The assigned domain drives the tag by convention (`{domain}-context`);
-        // the defaults.context_tag fallback ("vault-context") is not used.
-        assert!(block.starts_with("<finance-context>\n"));
-        assert!(block.ends_with("</finance-context>\n"));
+        // The tag is constant; the assigned domain rides as an attribute, so a
+        // new domain needs no new `## {domain}-context` section in
+        // ~/.claude/CLAUDE.md to stay framed.
+        assert!(block.starts_with("<vault-context domain=\"finance\">\n"));
+        assert!(block.ends_with("</vault-context>\n"));
+        // The closing tag carries no attribute — it would not be well-formed.
+        assert!(!block.contains("</vault-context domain"));
     }
 
     #[test]
@@ -784,8 +787,13 @@ mod tests {
     /// `render_block` moved onto `Context`; these tests still assert the exact
     /// bytes `vault hook` writes to stdout, which is the contract that matters.
     fn block(tag: &str, hits: Vec<Hit>) -> String {
+        block_in(tag, None, hits)
+    }
+
+    fn block_in(tag: &str, domain: Option<&str>, hits: Vec<Hit>) -> String {
         Context {
             tag: tag.to_string(),
+            domain: domain.map(str::to_string),
             hits,
             tokens: 0,
         }
@@ -797,6 +805,42 @@ mod tests {
         let chunks = vec![sample_hit("Foo", "body line 1", 0.5)];
         let out = block("tag-x", chunks);
         assert_eq!(out, "<tag-x>\n## Foo [contract]\nbody line 1\n</tag-x>\n");
+    }
+
+    /// An assigned domain becomes an attribute on the opening tag only.
+    #[test]
+    fn render_block_carries_the_domain_as_an_attribute() {
+        let chunks = vec![sample_hit("Foo", "body line 1", 0.5)];
+        let out = block_in("tag-x", Some("software"), chunks);
+        assert_eq!(
+            out,
+            "<tag-x domain=\"software\">\n## Foo [contract]\nbody line 1\n</tag-x>\n"
+        );
+    }
+
+    /// No domain means no attribute — not a placeholder value. Absence of the
+    /// attribute is the encoding of absence; a placeholder would assert
+    /// something, and could collide with a real domain of the same name.
+    #[test]
+    fn render_block_omits_the_attribute_when_no_domain_is_assigned() {
+        let out = block_in("tag-x", None, vec![sample_hit("Foo", "b", 0.5)]);
+        assert!(out.starts_with("<tag-x>\n"), "got {out:?}");
+        assert!(!out.contains("domain="));
+    }
+
+    /// A hostile domain drops the attribute rather than substituting a
+    /// placeholder: the block stays framed, and vault does not report "no
+    /// domain" for what was actually an unusable one.
+    #[test]
+    fn render_block_drops_a_hostile_domain_without_claiming_unassigned() {
+        let out = block_in(
+            "tag-x",
+            Some("\"><script>alert(1)</script"),
+            vec![sample_hit("Foo", "b", 0.5)],
+        );
+        assert!(out.starts_with("<tag-x>\n"), "got {out:?}");
+        assert!(!out.contains("script"));
+        assert!(!out.contains("unassigned"));
     }
 
     #[test]

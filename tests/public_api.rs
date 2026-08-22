@@ -70,13 +70,19 @@ fn context_can_be_built_and_rendered_by_a_consumer() {
     // the chunks reads `hits`. Both must be reachable from outside.
     let context = Context {
         tag: "vault-context".to_string(),
+        domain: Some("software".to_string()),
         hits: Vec::new(),
         tokens: 0,
     };
 
+    // The domain rides as an attribute rather than being baked into the tag, so
+    // one instruction in ~/.claude/CLAUDE.md covers every domain that will ever
+    // exist. A consumer reading `domain` directly does not have to parse it back
+    // out of a `{domain}-context` string.
+    assert_eq!(context.domain.as_deref(), Some("software"));
     assert_eq!(
         context.render_block(),
-        "<vault-context>\n</vault-context>\n"
+        "<vault-context domain=\"software\">\n</vault-context>\n"
     );
     assert!(context.hits.is_empty());
 }
@@ -134,7 +140,8 @@ fn retrieval_can_be_matched_by_a_consumer() {
     assert_eq!(described, "router-skip");
 
     let with_context = Retrieval::Context(Context {
-        tag: "software-context".to_string(),
+        tag: "vault-context".to_string(),
+        domain: Some("software".to_string()),
         hits: Vec::new(),
         tokens: 0,
     });

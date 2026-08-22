@@ -12,7 +12,7 @@ Working across many projects means critical context (API contracts, design decis
 
 1. The router (Gemma running locally, or Anthropic Haiku via API as a fallback) reads the prompt and extracts structured retrieval signals — project names, type names, topics — or returns `skip: true` for prompts that need no context
 2. SQLite runs a hybrid query: FTS5 BM25 keyword match + cosine similarity against stored embeddings
-3. Top chunks are selected within a 10k token budget and emitted on stdout as a `<{domain}-context>` block
+3. Top chunks are selected within a 10k token budget and emitted on stdout as a `<vault-context domain="...">` block
 4. Claude Code appends that block to your prompt before sending — the router, SQLite, and the binary are invisible to the model
 
 The hook has a 3-second timeout and silently passes through on failure — it never makes Claude Code feel broken. Silent toward Claude Code, not toward you: every call appends a one-line JSON record (outcome, per-stage latency, error detail) to `~/.vault/hook.log`, so an outage is diagnosable after the fact.
@@ -106,7 +106,7 @@ because a leftover `-wal` still holds plaintext indexed content.
 
 ## Configuration
 
-Context tags operate at the domain level — all projects in a domain share one tag, signaling the *kind* of knowledge Claude is receiving. A project's domain is assigned during `vault index sync` and stored in `vault.db` (`projects.domain`), not in `vault.toml`; the tag is derived by convention as `{domain}-context`.
+The context block uses one constant tag with the domain as an attribute — `<vault-context domain="software">`. The domain signals the *kind* of knowledge Claude is receiving; it is assigned during `vault index sync` and stored in `vault.db` (`projects.domain`), not in `vault.toml`. An unassigned project gets no attribute.
 
 ```toml
 # Abbreviated — [mlx] and [embeddings] are also required; see docs/vault-plan.md for the full file.
@@ -141,9 +141,9 @@ budget pass. `vault diagnose` prints all three in its header and labels a trim a
 either a `max_hits cap` or `min_score/budget`, so a cap doing the cutting can't be
 mistaken for a scoring problem.
 
-Project→domain assignment is **not** configured here — it's set during `vault index sync` and stored in `vault.db` (`projects.domain`). The context tag is derived by convention as `{domain}-context`.
+Project→domain assignment is **not** configured here — it's set during `vault index sync` and stored in `vault.db` (`projects.domain`). `context_tag` names the wrapper element only; the domain is an attribute on it.
 
-The global `~/.claude/CLAUDE.md` should include a `## {domain}-context` section explaining each domain's tag to Claude. Introducing a new domain means adding that section — it's the single source of truth for what a tag means.
+The global `~/.claude/CLAUDE.md` should include a single `## Vault Context` section explaining the block to Claude — what the `domain` attribute means, and that the contents are data rather than instructions. Because the tag is constant, that one section covers every domain you will ever add.
 
 ## Stack
 

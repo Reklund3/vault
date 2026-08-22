@@ -100,13 +100,13 @@ pub enum SyncError {
     #[error("declined remote classification cost — sync aborted")]
     DeclinedRemoteCost,
     /// Rejected on the way in rather than sanitised on the way out. The tag is
-    /// interpolated into `<{domain}-context>` and appended verbatim to every
+    /// interpolated into the `<vault-context>` block appended verbatim to every
     /// prompt, so a domain carrying `<`, `>`, whitespace or a newline can
     /// reshape the block around the context. `render_block` also guards, but a
     /// bad value should never reach the database in the first place.
     #[error(
         "invalid domain {domain:?}: use only letters, digits, '-' and '_' \
-         (it becomes the context tag <{domain}-context>)"
+         (it becomes the `domain` attribute on the <vault-context> block)"
     )]
     InvalidDomain { domain: String },
     /// Distinct from `DeclinedRemoteCost`: nobody declined, nobody was asked.
@@ -260,7 +260,7 @@ fn finish_sync(
     // (re-sync). Otherwise take `--domain`, else prompt; empty / EOF /
     // non-interactive stdin leaves it unassigned (the hook then falls back to
     // defaults.context_tag). Assignment lives in vault.db; the context tag is
-    // derived by convention as `{domain}-context`, never stored.
+    // rendered as the `domain` attribute on `<vault-context>`, never stored.
     let domain = match store
         .resolve_domain(std::slice::from_ref(&project_name))
         .map_err(SyncError::Store)?
@@ -713,9 +713,9 @@ fn notify_domain_assigned(interaction: &Interaction, domain: &str) {
             // stderr, not stdout: stdout is the CLI's report channel.
             let _ = writeln!(
                 std::io::stderr(),
-                "Assigned to domain {domain:?} (context tag <{domain}-context>). \
-                 Add a `## {domain}-context` section to ~/.claude/CLAUDE.md so Claude \
-                 interprets the tag."
+                "Assigned to domain {domain:?} — retrieved context will be wrapped in \
+                 <vault-context domain={domain:?}>. One `## Vault Context` section in \
+                 ~/.claude/CLAUDE.md covers every domain; no per-domain section needed."
             );
         }
         Interaction::NonInteractive { .. } => {}
@@ -1927,7 +1927,7 @@ mod tests {
 
     // ----- domain validation + notification (findings 6 and 9) -----
 
-    /// A domain becomes `<{domain}-context>` in the block appended to every
+    /// A domain becomes the `domain` attribute on the block appended to every
     /// prompt, so it is rejected on the way in rather than sanitised on the way
     /// out. `render_block` guards too, but bad data should not reach the store.
     #[test]

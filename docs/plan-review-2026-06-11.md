@@ -45,7 +45,7 @@ Three structural problems keep this from being only a model-choice issue:
 Candidates: a dedicated small routing model (or Haiku for the hook), a per-role MLX
 model key, a diagnose-side timeout override, a hook-side hard clamp.
 
-### P3. The injection-framing contract is unsatisfied.
+### ~~P3. The injection-framing contract is unsatisfied.~~ — CLOSED 2026-08-22
 
 `~/.claude/settings.json` has a `UserPromptSubmit` entry; `~/.claude/CLAUDE.md`
 does not exist. Vault deliberately never sanitises chunk text, so that file is the
@@ -57,18 +57,32 @@ are failures (`router-build` ×7 for a missing key, `stdin` ×3, `config` ×1, 2
 with no `router_ms` sample. The exposure opens when the router starts working —
 i.e. when P1 is fixed.
 
-- **Coverage drifts by construction.** One `## {domain}-context` section per domain
-  means each new domain is uncovered until a second file is edited, and the fallback
-  `vault-context` tag needs its own section. Decide: one constant tag with a domain
-  attribute (`<vault-context domain="software">`), written once.
-- **The contract describes output vault does not produce.** It says the block is
-  "grouped by project"; `Context::render_block` (`src/retrieve/mod.rs:107`) emits a
-  flat `## label [doc_type]` list — no grouping, no language. Implement grouping or
-  fix the text.
+Two of this finding's three parts closed on 2026-08-22:
 
-Related — **B4**: cross-domain tag selection is first-assigned-project-wins via
+- ~~**Coverage drifts by construction.**~~ The tag is now constant and the domain
+  is an attribute — `<vault-context domain="software">` — so one section covers
+  every domain, including ones that do not exist yet, and the unassigned case
+  (no attribute) needs no special mention.
+- ~~**The contract describes output vault does not produce.**~~ The template in
+  `vault-plan.md` no longer claims the block is "grouped by project"; it describes
+  the flat `## label [doc_type]` list `render_block` actually emits. It also no
+  longer says the block appears "at the start of a message" — hook stdout is
+  appended, not prepended.
+
+~~**What is left is writing the section.**~~ Written 2026-08-22. `~/.claude/CLAUDE.md`
+now exists (0600) holding a single `## Vault Context` section, byte-identical to the
+template in `vault-plan.md` under "CLAUDE.md Strategy" — checked with `diff`, so the
+doc and the deployed file cannot silently disagree about what was installed.
+
+The defence is in place. **What is not in place is anything that keeps it there** —
+see C3. One concrete hole it should close: the section names `<vault-context>`
+literally, while `defaults.context_tag` is configurable, so changing that key in
+`vault.toml` silently stops the instruction matching the tag being emitted.
+
+Related — **B4**: which domain wins is first-assigned-project-wins via
 `Store::resolve_domain`, so it is sensitive to router output ordering, and mixed
-domains are unspecified. Subsumed by the single-tag proposal.
+domains are unspecified. Less severe now that a wrong domain attribute still
+lands inside a correctly-framed block, but still unspecified.
 
 ### P4. Long prompts break query-time embedding.
 
@@ -125,10 +139,16 @@ pointing at.
   A golden-prompt fixture set (prompt → expected chunk labels) would anchor alpha
   and budget tuning. Unblocked; blocks B5.
 
-- **C3. The trust model is unverifiable by the binary.** The only injection defence
-  is a hand-maintained file vault never checks — and which is currently missing
-  (P3). A `vault doctor` check closes it: instruction present, covers every tag
-  vault can emit, hook registered by absolute path.
+- **C3. The trust model is unverifiable by the binary.** The injection defence is a
+  hand-maintained file vault never checks. It now exists (P3), which moves this from
+  "the defence is missing and nothing says so" to "the defence is present and nothing
+  keeps it that way". A `vault doctor` check closes it:
+
+  - `~/.claude/CLAUDE.md` exists and has a `## Vault Context` section;
+  - that section names the tag actually being emitted — `defaults.context_tag` is
+    configurable, so a changed key silently orphans the instruction;
+  - the hook is registered in `settings.json`, by absolute path, in the nested
+    matcher-group shape rather than the flat one that does not load.
 
 ---
 
