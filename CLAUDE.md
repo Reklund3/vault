@@ -67,7 +67,7 @@ vault diagnose "<prompt>" --no-router       # build the QueryPlan from CLI flags
 | Doc | Role |
 |------|---------------|
 | `docs/vault-plan.md` | canonical design spec — the 14-step order, schema DDL, config shape. **Written before Steps 1–14 were built and has drifted; cross-check against the source before trusting it.** |
-| `docs/plan-review-2026-06-11.md` | the recorded drift — findings verified against the tree at `6b08f9d`, each naming where the plan contradicts the code. Read alongside `vault-plan.md`. |
+| `docs/plan-review-2026-06-11.md` | the **open** drift between `vault-plan.md` and the code — pruned 2026-08-21 to unresolved findings only; resolved ones are in git history. Read alongside `vault-plan.md`. |
 | `docs/security.md` | threat model, trust-boundary table, full design constraints |
 | `docs/embeddings.md` | what an embedding is here, and why nomic-embed-text-v1.5 + TEI |
 | `docs/runbook.md` | starting the runtime services by hand — TEI has a launcher, the Gemma/mlx one is not built yet |
