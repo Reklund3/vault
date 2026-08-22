@@ -174,9 +174,17 @@ Haiku impls set `cache_control: ephemeral` on the system block, but the marker i
 
 ```
 ~/.vault/vault.db      # SQLite store — projects (incl. projects.domain assignment), documents, chunks, FTS5, vec, retrieval_log; documents.content_hash is the classification/re-embed cache
+~/.vault/vault.db-wal  # WAL journal — created by SQLite while a connection is open, checkpointed away on clean close
+~/.vault/vault.db-shm  # WAL shared-memory index — same lifetime as the -wal file
 ~/.vault/vault.toml    # context-tag fallback, router/classifier mode, tuning defaults, backend config (hand-authored; vault writes it only via `vault configure` when absent — never otherwise)
 ~/.vault/hook.log      # hook telemetry — one JSONL record per hook call (outcome, stage, latency, backend); rotated to hook.log.1 at 5MB
 ```
+
+The two WAL sidecars are created by SQLite, not by vault: they inherit `vault.db`'s
+mode (measured `0600`) rather than going through `util::fs::harden_file`, and both
+disappear on a clean close. They matter in two places — a full reindex has to remove
+them alongside `vault.db` (`rm ~/.vault/vault.db*`), and a backup that copies only
+`vault.db` out from under a live connection is missing committed data.
 
 Nothing is written to indexed repositories.
 
@@ -211,7 +219,7 @@ See `docs/embeddings.md` for the full write-up. Current decisions (subject to ch
 
 - **Backend** — HuggingFace [text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference) (TEI), an official Rust HTTP server. Single binary, no Python deps, OpenAI-compatible `/embeddings` endpoint. Endpoint defaults to `http://localhost:8081`.
 - **Model** — `nomic-ai/nomic-embed-text-v1.5`. Apply the `search_document:` prefix at index time and `search_query:` at query time.
-- **Dimensions** — defaults to **768** (nomic-embed-text-v1.5). `chunks_vec` is created at the dim from `[embeddings].dims`, then **locked per-DB**: the first sync records `(model, dim)` in the `meta` table and later opens must match. Changing the model/dim means a full reindex (delete `~/.vault/vault.db` and re-sync). The schema no longer hardcodes 768 — only the config default does.
+- **Dimensions** — defaults to **768** (nomic-embed-text-v1.5). `chunks_vec` is created at the dim from `[embeddings].dims`, then **locked per-DB**: the first sync records `(model, dim)` in the `meta` table and later opens must match. Changing the model/dim means a full reindex — `rm ~/.vault/vault.db*` and re-sync; the glob is deliberate, since removing only the main file leaves a `-wal` still holding plaintext indexed content (not corrupting — SQLite discards an orphan WAL rather than replaying it — but not erased either). The schema no longer hardcodes 768 — only the config default does.
 
 `vault index sync` requires TEI reachable (hard error if not). At hook time, TEI unreachable falls under the same 3-second silent passthrough as any other backend failure.
 
@@ -240,10 +248,22 @@ Whole-file fallback (`plan` docs and any file no structural parser claims) is **
 
 ```
 final_score = α * bm25_normalized + (1 - α) * cos_sim
-α = 0.6 (initial), MinChunkScore = 0.15, TokenBudget = 10_000
+α = 0.6 (initial), MinChunkScore = 0.15, TokenBudget = 10_000, MaxHits = uncapped
 ```
 
-Tune `alpha` via `vault diagnose "<prompt>" --alpha X` after seeding real data; the token budget is set in `vault.toml` (`defaults.token_budget`), not a diagnose flag. Budget fill is score-descending with `continue` (not `break`) on oversized chunks.
+Three independent limits bound the budget pass, all in `vault.toml` under `[defaults]`:
+
+| Knob | Default | Effect |
+|------|---------|--------|
+| `min_score` | `0.15` | drops a hit outright |
+| `token_budget` | `10000` | stops filling once the running token count would overflow |
+| `max_hits` | absent = uncapped | hard cap on the number of chunks, highest `final_score` first |
+
+`max_hits` is `Option<u16>`, `#[serde(default)]`, so an existing `vault.toml` without
+it keeps the historical uncapped behavior. Set it when you want a *few* strong chunks
+rather than as many as fit — a 10k budget will happily inject twenty mediocre ones.
+
+Tune `alpha` via `vault diagnose "<prompt>" --alpha X` after seeding real data; the other three are config-only, not diagnose flags. `vault diagnose` prints all four in its header and labels a trim `max_hits cap` or `min_score/budget` (`trim_cause`) — it separates the cap from the scoring limits, not `min_score` from `token_budget` — so a cap doing the cutting can't be mistaken for a scoring problem. Budget fill is score-descending with `continue` (not `break`) on oversized chunks, but `break`s once `max_hits` is reached, since nothing later can outrank what is already selected.
 
 ## Global Hook Registration
 

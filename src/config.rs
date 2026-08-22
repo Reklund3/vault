@@ -710,6 +710,24 @@ dims = 768
         }
     }
 
+    /// `max_hits` is optional, so a `vault.toml` that never heard of it must keep
+    /// loading — and the seeded template advertises the key in a comment, which
+    /// is worth nothing if the name it shows does not actually deserialize.
+    #[test]
+    fn max_hits_is_optional_and_parses_under_the_advertised_name() {
+        let cfg: Config = toml::from_str(MINIMAL_TOML).expect("pre-max_hits toml still loads");
+        assert_eq!(cfg.max_hits(), None, "absent means uncapped");
+
+        // Same file with the key the template comments out, in the same block.
+        let with = MINIMAL_TOML.replace("min_score = 0.15", "min_score = 0.15\nmax_hits = 4");
+        assert_ne!(
+            with, MINIMAL_TOML,
+            "fixture drifted: the anchor line is gone"
+        );
+        let cfg: Config = toml::from_str(&with).expect("max_hits parses");
+        assert_eq!(cfg.max_hits(), Some(4));
+    }
+
     /// A container configured entirely from defaults still has to say where
     /// `vault.db` goes, and it has no toml for `from_path` to read.
     #[test]

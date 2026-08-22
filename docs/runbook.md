@@ -33,9 +33,11 @@ hook time is "no new context injection until it's back."
 
 The dimension defaults to **768** (nomic-embed-text-v1.5). `chunks_vec` is built
 at whatever `[embeddings].dims` declares, then locked per-DB — the first sync
-records `(model, dim)` in the `meta` table and changing it means deleting
-`vault.db` and re-syncing. Verifying the server's dim matches your configured
-`dims` before any real indexing is the Step 0 prerequisite.
+records `(model, dim)` in the `meta` table and changing it means wiping the store
+and re-syncing: `rm ~/.vault/vault.db*`, where the glob matters because a bare
+`rm vault.db` leaves the WAL sidecars behind still holding plaintext content.
+Verifying the server's dim matches your configured `dims` before any real indexing
+is the Step 0 prerequisite.
 
 ### One-time install (Arch Linux / NVIDIA)
 

@@ -7,6 +7,9 @@ context_tag  = "vault-context"   # fallback tag if a project has no domain assig
 token_budget = 10000             # max tokens of context injected per prompt
 alpha        = 0.6               # BM25/cosine weight — 0.0 = pure semantic, 1.0 = pure keyword
 min_score    = 0.15              # drop hits scoring below this
+# max_hits   = 4                 # optional hard cap on how many chunks are injected,
+                                 # best final_score first. Omitted = uncapped: only
+                                 # token_budget and min_score bound the selection.
 
 [router]
 mode    = "auto"                 # "auto" | "gemma" | "haiku" | "openai" (alias "gemini")
@@ -34,7 +37,7 @@ router_model = "REPLACE_ME"              # your mlx_lm model name or path, e.g. 
 [embeddings]
 endpoint = "http://localhost:8081"       # HuggingFace text-embeddings-inference (TEI)
 model    = "nomic-ai/nomic-embed-text-v1.5"
-dims     = 768                           # chunks_vec is built at this dim, then locked per-DB (change ⇒ delete vault.db + re-sync)
+dims     = 768                           # chunks_vec is built at this dim, then locked per-DB (change ⇒ rm ~/.vault/vault.db* + re-sync)
 
 [indexer.exclude]
 # Appended to the built-in defaults (.env*, *.pem, .ssh/**, .aws/**,

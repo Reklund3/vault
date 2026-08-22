@@ -590,6 +590,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// The WAL sidecars are created by SQLite, not by `open()`, so `harden_file`
+    /// never runs on them — they take whatever mode SQLite gives them, which is
+    /// the main database's. `docs/security.md` states that inheritance as fact;
+    /// this is what keeps the statement true. It has to hold the store open,
+    /// because a clean close checkpoints both sidecars away.
+    #[cfg(unix)]
+    #[test]
+    fn wal_sidecars_inherit_the_hardened_db_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("vault-wal-mode-{}-{nanos}", std::process::id()));
+        let db = base.join("vault.db");
+
+        let store = SqliteStore::open(&db, &Config::default()).expect("open");
+        let wal = base.join("vault.db-wal");
+        let shm = base.join("vault.db-shm");
+        assert!(
+            wal.is_file(),
+            "WAL journal must exist while the store is open"
+        );
+        assert!(shm.is_file(), "WAL shared-memory index must exist too");
+
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&db), 0o600, "db must be 0600");
+        assert_eq!(
+            mode(&wal),
+            0o600,
+            "-wal leaks indexed content if it is not 0600"
+        );
+        assert_eq!(mode(&shm), 0o600, "-shm must not be looser than the db");
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     fn create_project(store: &SqliteStore, name: &str) -> i64 {
         store
             .conn
