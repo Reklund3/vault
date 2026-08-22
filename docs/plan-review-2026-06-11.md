@@ -171,10 +171,6 @@ and falls through to silent passthrough — exactly when context would help most
 
 ## Loose ends
 
-- **No `cargo audit` job.** With the incident-response sweep deliberately untracked,
-  `--locked` is the only standing supply-chain gate: it stops resolution being
-  rewritten, but nothing reads a maintained advisory database.
-
 - **`e2b7c12` does not compile standalone**, so `git bisect` dies on it — `lib.rs`
   declared `pub mod vault;` while `src/vault.rs` was untracked, and `8b1805e` fixed
   it forward. Both pushed, so correcting it means rewriting shared history. Use

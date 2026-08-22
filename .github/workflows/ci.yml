@@ -6,6 +6,11 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
     branches: ["main"]
+  # An advisory can land against an unchanged lockfile, so the audit job needs a
+  # trigger that does not depend on someone opening a PR. Every job runs on this
+  # schedule, which also catches toolchain rot for free.
+  schedule:
+    - cron: "0 7 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -86,6 +91,32 @@ jobs:
       # that does not contain the code.
       - name: Assert the library touches no stdin/stdout
         run: ./scripts/check-library-io.sh
+
+  audit:
+    name: Advisory audit
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      # Built from source rather than pulled from a third-party action. The whole
+      # point of this job is supply-chain hygiene, and `cargo install --locked`
+      # resolves against cargo-audit's own committed lockfile — one less
+      # unpinned dependency in the pipeline that is supposed to catch those.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # Reads the RustSec advisory database, which is maintained — the durable
+      # complement to `--locked`. `--locked` stops resolution being silently
+      # rewritten; this catches a crate that was fine when we pinned it and is
+      # not fine now. Expect this to go red without any code change: that is the
+      # job working, not a flake.
+      - name: Audit the dependency graph
+        run: cargo audit
 
   clippy:
     name: Clippy

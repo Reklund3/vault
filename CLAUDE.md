@@ -38,12 +38,18 @@ cargo silently rewrites `Cargo.lock` when resolution would change, which is prec
 2026-08-20 `arrayref`/`proc-macro1` attack propagated (the attacker yanked the good versions to force
 resolution onto a malicious one). `--locked` turns that into a failed build.
 
-`--locked` is the only *standing* supply-chain gate. Sweeping history for known-bad crates is
-incident response, not CI: the tooling for it (`scripts/supply-chain-audit.sh` and its test) is
-deliberately **untracked and local-only**, because its indicator lists are one advisory's IoCs and a
-committed copy would pin a frozen list that passes forever — false assurance, which is worse than no
-check. When an advisory lands, write the sweep against *that* advisory's indicators. A `cargo audit`
-job reading a maintained database is the durable complement and is not wired up yet.
+There are two *standing* supply-chain gates — `--locked` and the `audit` job below. Sweeping history
+for known-bad crates is neither; it is incident response. The tooling for that
+(`scripts/supply-chain-audit.sh` and its test) is deliberately **untracked and local-only**, because
+its indicator lists are one advisory's IoCs and a committed copy would pin a frozen list that passes
+forever — false assurance, which is worse than no check. When an advisory lands, write the sweep
+against *that* advisory's indicators.
+
+The durable complement is the `audit` CI job: `cargo audit` against the RustSec database. `--locked`
+stops resolution from being silently rewritten; `cargo audit` catches a crate that was fine when it
+was pinned and is not fine now. It can go red with no code change — that is the job working, not a
+flake. It builds `cargo-audit` from source with `--locked` rather than pulling a third-party action,
+since a job about supply-chain hygiene should not add an unpinned dependency to the pipeline.
 
 Both gates are enforced — run them before pushing:
 
