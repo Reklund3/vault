@@ -1,7 +1,7 @@
 # Plan: lib + CLI split
 
 **Status:** Steps 1–9 done and committed — the migration is complete
-**Tracking:** this file is intentionally untracked — see `.gitignore` · **Target:** single package, `src/lib.rs` + `src/main.rs`
+**Tracking:** committed as the record of this branch · **Target:** single package, `src/lib.rs` + `src/main.rs`
 
 Vault is a binary-only crate today (no `src/lib.rs`, no `[lib]` in `Cargo.toml`).
 This plan turns it into a library with a thin CLI over it, so the retrieval and
@@ -298,6 +298,15 @@ make vault unusable for a benefit the current single-process CLI doesn't need.
 The connection keeps working in whatever mode SQLite chose; `busy_timeout` still
 applies. Revisit if a concurrent consumer ever needs to *depend* on WAL.
 
+*The code only actually honoured that decision from the post-migration review
+onward.* `apply_pragmas` propagated the pragma's error with `?`, which covered the
+case the paragraph above describes — SQLite declining and reporting another mode,
+a row and no error — but not the case where the pragma itself fails. A read-only
+`vault.db` is the reachable one: the switch rewrites the file header, so SQLite
+answers "attempt to write a readonly database" even though every query the hook
+runs is a read, and the open failed outright. Now best-effort, with
+`open_succeeds_on_a_read_only_database_that_cannot_take_wal` holding it.
+
 ### Step 4 detail
 
 **Done.** `PlannedQuery`, `Retrieval`, `Context` and `SkipReason` live in
@@ -460,8 +469,9 @@ builds without `cli`.
 ## Test split
 
 Starting state: **364 tests**, all in inline `#[cfg(test)] mod tests` blocks
-across 32 files, no `tests/` directory. As of Step 9: **404 inline + 21 across
-three `tests/` binaries**.
+across 32 files, no `tests/` directory. At the close of Step 9: **404 inline + 21
+across three `tests/` binaries**; the post-migration review pass took that to
+**426 inline + 23**.
 
 The split follows from what each test actually exercises:
 
@@ -492,9 +502,16 @@ half. It cost more machinery than expected — see the Step 9 detail.
 | File | Holds |
 |---|---|
 | `public_api.rs` | 14 tests — the types a consumer needs are nameable and usable |
-| `pipeline.rs` | 6 tests — the pipeline *works* when driven from outside the crate |
+| `pipeline.rs` | 8 tests — the pipeline *works* when driven from outside the crate |
 | `no_stdout.rs` | 1 test — design rule 3, alone in its binary by necessity |
-| `common/mod.rs` | `TmpDir`, `config_in`, `plan_for` — no tests |
+| `common/mod.rs` | `TmpDir`, `config_in`, `offline_config_in`, `plan_for` — no tests |
+
+Two of `pipeline.rs`'s tests were added at Step 9 but did not assert anything until
+the review pass: they needed a `Vault`, auto mode probes `localhost:8080` and then
+demands a key, and the `let Ok(..) else { return }` they used to skip on made them
+silently vacuous on any machine without a backend — CI included.
+`offline_config_in` is the fix: a real `vault.toml` pinning gemma mode, loaded
+through `Config::from_path`, which constructs without a probe or a key.
 
 `pipeline.rs` runs with no network and no services. That is possible because
 `PlannedQuery`'s fields are public, so a consumer builds one directly instead of
