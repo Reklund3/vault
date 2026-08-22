@@ -36,8 +36,14 @@ behind it.
 dependencies and rejects the flag. This is a supply-chain control, not a style choice: without it
 cargo silently rewrites `Cargo.lock` when resolution would change, which is precisely how the
 2026-08-20 `arrayref`/`proc-macro1` attack propagated (the attacker yanked the good versions to force
-resolution onto a malicious one). `--locked` turns that into a failed build. `scripts/supply-chain-audit.sh`
-sweeps history for known-bad crates when an advisory lands.
+resolution onto a malicious one). `--locked` turns that into a failed build.
+
+`--locked` is the only *standing* supply-chain gate. Sweeping history for known-bad crates is
+incident response, not CI: the tooling for it (`scripts/supply-chain-audit.sh` and its test) is
+deliberately **untracked and local-only**, because its indicator lists are one advisory's IoCs and a
+committed copy would pin a frozen list that passes forever — false assurance, which is worse than no
+check. When an advisory lands, write the sweep against *that* advisory's indicators. A `cargo audit`
+job reading a maintained database is the durable complement and is not wired up yet.
 
 Both gates are enforced — run them before pushing:
 
