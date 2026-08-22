@@ -82,10 +82,10 @@ and falls through to silent passthrough — exactly when context would help most
 
 | # | Plan says | Reality |
 |---|-----------|---------|
-| A5 | `index add/remove`, `list`, `reindex`, `serve` exist | None do. **`index remove` is the load-bearing one**: the `documents` FK has no CASCADE, so it needs explicit child deletes plus a `chunks_vec` sweep (fold in **B8**) |
+| A5 | `plan:461` — "Project removed. Covered by `vault index remove --project <name>`", present tense | The command does not exist. `plan:971-979` correctly lists it as planned, so the plan contradicts itself. **The code gap is the load-bearing part**: the `documents` FK has no CASCADE, so `index remove` needs explicit child deletes plus a `chunks_vec` sweep (fold in **B8**) |
 | A5b | — | **README was never reconciled.** `vault-plan.md` was (2026-06-21); README has no planned-not-implemented section, and its examples omit `--name` for sync and `--top` plus all five plan-override flags for diagnose |
-| A9 | Re-embed skip + byte-compare collision defence | Per-chunk `content_hash` is stored but never compared, so a one-line edit re-embeds every chunk in the file. (The unchanged-*file* gate does work.) |
-| A10 | `retrieval_log` drives alpha tuning | Zero producers. `Store::log_retrieval` exists and `SqliteStore` implements it; only test stubs and one unit test call it |
+| A9 | `plan:459` — "matching labels with unchanged body hash skip the re-embed round-trip"; schema comment `plan:204` says the same | Per-chunk `content_hash` is stored but never compared, so a one-line edit re-embeds every chunk in the file. `plan:439` already admits this, so the plan contradicts itself in three places. (The unchanged-*file* gate does work.) |
+| A10 | `plan:631` — "α = 0.6 (initial — tune via retrieval_log + vault diagnose)" | Zero producers, so that loop cannot run. `Store::log_retrieval` exists and `SqliteStore` implements it; only test stubs and one unit test call it. (`plan:1154` is honest — an unchecked box) |
 
 ---
 
@@ -178,8 +178,8 @@ and falls through to silent passthrough — exactly when context would help most
 
 ## Doc-sync checklist
 
-- [ ] `vault-plan.md` indexing section: note the per-chunk incremental skip is open
-      (A9); add the `chunks_vec` cleanup rationale (B8).
+- [ ] `vault-plan.md` indexing section: reconcile `:204`/`:459` with `:439` (A9),
+      and `:461` with `:971-979` (A5); add the `chunks_vec` rationale (B8).
 - [ ] `vault-plan.md:132` latency table still claims Gemma is "~100–300ms" and
       Haiku "~400–800ms (still under 3s hook timeout)". The measured local figure
       is ~15s/call, which is P1. The table is the source of the 3s invariant.
