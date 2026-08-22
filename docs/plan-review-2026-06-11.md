@@ -82,8 +82,6 @@ and falls through to silent passthrough — exactly when context would help most
 
 | # | Plan says | Reality |
 |---|-----------|---------|
-| A2 | `retrieve/hybrid.rs` absorbed into `sqlite_store::hybrid_search`, "skip Step 11"; `Store` = 5 methods | The trait exposes `bm25_search`/`cosine_search` primitives, and `hybrid_search` is a *provided* method calling `hybrid::merge(…, alpha, TOP_K)`; `SqliteStore` has no override. Trait also has `get_or_create_project`, `get_document_content_hash` |
-| A3 | Token estimation is "tiktoken cl100k_base, accurate counts" (a *Confirmed* decision) | chars/4 (`estimate_tokens`, `src/parse/mod.rs:194`). cl100k is OpenAI's tokenizer and never matched Claude |
 | A5 | `index add/remove`, `list`, `reindex`, `serve` exist | None do. **`index remove` is the load-bearing one**: the `documents` FK has no CASCADE, so it needs explicit child deletes plus a `chunks_vec` sweep (fold in **B8**) |
 | A5b | — | **README was never reconciled.** `vault-plan.md` was (2026-06-21); README has no planned-not-implemented section, and its examples omit `--name` for sync and `--top` plus all five plan-override flags for diagnose |
 | A9 | Re-embed skip + byte-compare collision defence | Per-chunk `content_hash` is stored but never compared, so a one-line edit re-embeds every chunk in the file. (The unchanged-*file* gate does work.) |
@@ -182,8 +180,9 @@ and falls through to silent passthrough — exactly when context would help most
 
 - [ ] `vault-plan.md` indexing section: note the per-chunk incremental skip is open
       (A9); add the `chunks_vec` cleanup rationale (B8).
-- [ ] `vault-plan.md` decisions table: token estimation → chars/4 (A3); hybrid
-      placement → extracted, not absorbed (A2); latency table → real 31B numbers.
+- [ ] `vault-plan.md:132` latency table still claims Gemma is "~100–300ms" and
+      Haiku "~400–800ms (still under 3s hook timeout)". The measured local figure
+      is ~15s/call, which is P1. The table is the source of the 3s invariant.
 - [ ] `vault-plan.md` tracking items: P1, P3, P4, B1/B3, C1, C2.
 - [ ] `vault-plan.md` on `vault tei start|status`: neither reports on the service,
       only on a TCP socket (D4), and `start` does not verify the child lived (D3).
