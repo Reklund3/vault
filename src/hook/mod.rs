@@ -220,6 +220,16 @@ fn retrieve_with(
     vault: &Vault,
     tel: &mut log::Telemetry,
 ) -> Result<Retrieval, VaultError> {
+    // `QueryPlanner::route` folds an empty prompt into the same `Ok(None)` it
+    // uses for "the router saw no need for context", so the `else` arm below
+    // cannot tell the two apart and would report every blank prompt as a
+    // `RouterSkip`. `Vault::retrieve` guards first for exactly this reason;
+    // this is the hook's copy of that guard, keeping the two entry points
+    // agreed on which `SkipReason` a blank prompt produces.
+    if prompt.trim().is_empty() {
+        return Ok(Retrieval::Skip(SkipReason::EmptyPrompt));
+    }
+
     let planner = vault.planner();
     tel.backend = Some(planner.backend());
 
@@ -722,6 +732,53 @@ mod tests {
             dir.is_none(),
             "no config is loaded on the empty-prompt path"
         );
+    }
+
+    /// The guard in `pipeline` covers the real hook, but `pipeline_with` is the
+    /// seam a test — or a future in-process caller — drives directly, and it
+    /// used to disagree with `Vault::retrieve` about what a blank prompt is.
+    ///
+    /// `QueryPlanner::route` returns `Ok(None)` for both "prompt was blank" and
+    /// "router saw no need for context", so without its own guard
+    /// `retrieve_with` reported every blank prompt as a `RouterSkip`. The two
+    /// call for different follow-up: one is a caller bug, the other is the
+    /// system working.
+    #[test]
+    fn pipeline_with_reports_a_blank_prompt_as_empty_not_a_router_skip() {
+        let config = Config::default();
+        for prompt in ["", "   ", "\n\t "] {
+            let embedder = StubEmbedder::from_config(&config);
+            let store = StubStore {
+                hits: vec![sample_hit("BuildRequest", "message BuildRequest {}", 0.9)],
+                domain: None,
+            };
+            let mut tel = log::Telemetry::default();
+            let out = pipeline_with(
+                prompt,
+                &vault_of(
+                    &config,
+                    Box::new(StubRouter),
+                    Box::new(embedder),
+                    Box::new(store),
+                ),
+                &mut tel,
+            );
+            assert!(
+                matches!(
+                    out,
+                    Outcome::Skip {
+                        reason: SkipReason::EmptyPrompt
+                    }
+                ),
+                "expected EmptyPrompt for {prompt:?}, got {out:?}"
+            );
+            // The store here would happily return a hit, so a wrong answer
+            // shows up as `Injected` rather than a subtler mislabel.
+            assert!(
+                tel.backend.is_none() && tel.router_ms.is_none(),
+                "a blank prompt must not reach the planner at all"
+            );
+        }
     }
 
     /// `render_block` moved onto `Context`; these tests still assert the exact

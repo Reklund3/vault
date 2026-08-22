@@ -42,6 +42,19 @@ BAD_STRINGS=(
 # Files the payload drops.
 BAD_PATHS=( /tmp/rust-setup /tmp/rust-setup.ps1 /tmp/rust-setup-launch.vbs )
 
+# Where a crate name can appear *as a dependency*. Everywhere else — a comment,
+# a doc, a commit message quoting the advisory — it is prose.
+MANIFESTS="Cargo.lock Cargo.toml */Cargo.toml"
+
+# The shapes a dependency actually takes, for scanning raw blobs where there is
+# no path to filter on:
+#   Cargo.lock          name = "arrayref"
+#   Cargo.toml          arrayref = "0.3"   /   arrayref.workspace = true
+#   Cargo.toml, table   [dependencies.arrayref]
+# Anchored at line start, so prose mentioning the name never matches.
+crate_alt=$(IFS='|'; echo "${BAD_CRATES[*]}")
+MANIFEST_PAT="^name = \"($crate_alt)\"\$|^($crate_alt)(\.[a-z-]+)? *=|^\[[^]]*dependencies[^]]*\.($crate_alt)\]\$"
+
 cd "$(dirname "$0")/.." || exit 1
 fail=0
 note() { printf '  %s\n' "$*"; }
@@ -69,12 +82,25 @@ echo "=== 2. pickaxe: did an indicator ever enter or leave history? ==="
 # Exclude this script from its own search. Once it is committed, its BAD_*
 # lists are repo content, and without this every run flags its own definitions
 # — a detector that cries wolf on itself gets ignored, which is the real danger.
-for s in "${BAD_CRATES[@]}" "${BAD_STRINGS[@]}"; do
+#
+# The two indicator classes need different scopes, and conflating them was the
+# same wolf-crying bug one level up. A crate name is only evidence when it names
+# a *dependency*, which can only happen in a manifest; in prose it is someone
+# writing about the incident, which this repo's own docs do in four places. So
+# crate names are pickaxed over manifests only, while the payload strings (an
+# IP, a dropper filename) stay scoped to everything — those have no legitimate
+# reason to appear in any file.
+for s in "${BAD_CRATES[@]}"; do
+  n=$(git log --all --oneline -S"$s" -- $MANIFESTS 2>/dev/null | wc -l)
+  [ "$n" -gt 0 ] && bad "'$s' touched by $n commit(s) in a manifest" && \
+    git log --all --oneline -S"$s" -- $MANIFESTS | sed 's/^/       /'
+done
+for s in "${BAD_STRINGS[@]}"; do
   n=$(git log --all --oneline -S"$s" -- . ":(exclude)$SELF" 2>/dev/null | wc -l)
   [ "$n" -gt 0 ] && bad "'$s' touched by $n commit(s)" && \
     git log --all --oneline -S"$s" -- . ":(exclude)$SELF" | sed 's/^/       /'
 done
-note "searched $(( ${#BAD_CRATES[@]} + ${#BAD_STRINGS[@]} )) indicators"
+note "searched ${#BAD_CRATES[@]} crate names over manifests, ${#BAD_STRINGS[@]} strings over all paths"
 
 echo
 echo "=== 3. every git object, including unreachable ==="
@@ -92,9 +118,16 @@ self_blobs=$(for b in $all_blobs; do
              done)
 objs=$(echo "$all_blobs" | grep -vxF "${self_blobs:-__none__}" || true)
 note "blobs scanned: $(echo "$objs" | grep -c .) (excluded $(echo "$self_blobs" | grep -c .) revisions of this script)"
-found=$(echo "$objs" | git cat-file --batch 2>/dev/null \
-        | grep -aiE "$(IFS='|'; echo "${BAD_STRINGS[*]}")|proc-macro1" | head)
+# Two greps, for the same reason section 2 has two loops. The payload strings
+# are matched anywhere in a blob; the crate names only in the shapes a manifest
+# uses. The previous single grep folded a bare `proc-macro1` into the loose set
+# and so flagged every doc that named the incident.
+blob_text=$(echo "$objs" | git cat-file --batch 2>/dev/null)
+found=$(echo "$blob_text" | grep -aiE "$(IFS='|'; echo "${BAD_STRINGS[*]}")" | head)
 [ -n "$found" ] && bad "indicator inside a git object:" && echo "$found" | sed 's/^/       /'
+found=$(echo "$blob_text" | grep -aiE "$MANIFEST_PAT" | head)
+[ -n "$found" ] && bad "dependency on a listed crate inside a git object:" && \
+  echo "$found" | sed 's/^/       /'
 
 echo
 echo "=== 4. cached .crate files vs Cargo.lock checksums ==="

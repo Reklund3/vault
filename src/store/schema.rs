@@ -141,9 +141,22 @@ fn apply_pragmas(conn: &Connection, wal: bool) -> Result<(), StoreError> {
     if wal {
         // `PRAGMA journal_mode` reports the resulting mode as a result row, so
         // `pragma_update` (which expects no rows back) cannot be used here.
-        let _mode: String = conn
-            .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        //
+        // The result is deliberately discarded, errors included. Two different
+        // failures live here and neither should stop the open:
+        //
+        //   * SQLite declines the switch and reports the mode it kept — a row,
+        //     no error. That was always tolerated.
+        //   * SQLite errors outright. A read-only `vault.db` is the reachable
+        //     case: the pragma has to write the file header, so it fails with
+        //     `attempt to write a readonly database` even though every query
+        //     the hook runs is a read.
+        //
+        // Propagating the second turned a *less concurrent* store into *no*
+        // store, which contradicts the paragraph above — WAL is an availability
+        // property, not a correctness one. A genuinely broken database still
+        // fails, just at the first real query, with an error about that query.
+        let _ = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0));
     }
     Ok(())
 }
@@ -470,6 +483,63 @@ mod tests {
         assert_eq!(timeout, BUSY_TIMEOUT.as_millis() as i64);
 
         drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// WAL is an availability property, so failing to get it must not fail the
+    /// open — the paragraph on `apply_pragmas` says so, and the code used to
+    /// contradict it by propagating the pragma's error.
+    ///
+    /// A read-only database file is the reachable case: `PRAGMA journal_mode=WAL`
+    /// rewrites the file header, so SQLite answers "attempt to write a readonly
+    /// database" even though every query `vault hook` issues is a read. Under
+    /// the old code that turned a *less concurrent* store into *no* store, and
+    /// the hook silently injected nothing.
+    #[cfg(unix)]
+    #[test]
+    fn open_succeeds_on_a_read_only_database_that_cannot_take_wal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // root ignores the permission bits, so the premise would not hold.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: running as root, read-only mode is not enforced");
+            return;
+        }
+
+        let path = temp_db_path("readonly-wal");
+        {
+            let conn = open(&path).expect("initial open");
+            conn.execute("CREATE TABLE probe (x INTEGER)", []).unwrap();
+            conn.execute("INSERT INTO probe (x) VALUES (42)", [])
+                .unwrap();
+            // Land the WAL back in the main file, then leave rollback-journal
+            // mode behind so the reopen below genuinely attempts the switch.
+            conn.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get::<_, String>(0))
+                .unwrap();
+        }
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let conn = open(&path).expect("a read-only db must still open");
+        let x: i64 = conn
+            .query_row("SELECT x FROM probe", [], |r| r.get(0))
+            .expect("reads must work without WAL");
+        assert_eq!(x, 42);
+
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .expect("read journal_mode");
+        assert_ne!(
+            mode.to_lowercase(),
+            "wal",
+            "premise check: the switch has to have actually failed"
+        );
+
+        drop(conn);
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o600);
+        let _ = std::fs::set_permissions(&path, perms);
         let _ = std::fs::remove_file(&path);
     }
 

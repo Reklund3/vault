@@ -45,7 +45,14 @@ pub fn select_within_budget(
         if tokens_used.saturating_add(hit.token_est) > token_budget {
             continue;
         }
-        tokens_used += hit.token_est;
+        // Saturating, to match the guard directly above. The guard lets a hit
+        // through when the saturated sum is not *greater* than the budget, so a
+        // budget at `u32::MAX` admits a hit that then overflows a plain `+=` —
+        // a debug-build panic on the hook's hot path. Unreachable while
+        // `token_budget` is a `u16` in config, which is exactly why the two
+        // lines are worth keeping in agreement: the day the budget widens, the
+        // bug would arrive with no code change here.
+        tokens_used = tokens_used.saturating_add(hit.token_est);
         chunks.push(hit);
         if max_hits.is_some_and(|cap| chunks.len() >= cap) {
             break;
@@ -172,6 +179,10 @@ mod tests {
         );
     }
 
+    /// Covers the *guard* only: with a budget of 100 the huge hit is rejected
+    /// before the accumulator ever sees it, so this passed throughout the window
+    /// when `tokens_used += ...` could overflow. The accumulator is covered by
+    /// `a_budget_at_the_type_ceiling_saturates_instead_of_panicking` below.
     #[test]
     fn saturating_add_does_not_panic_on_overflow() {
         // token_est of u32::MAX shouldn't crash; it just fails the budget check.
@@ -213,6 +224,29 @@ mod tests {
 
         assert_eq!(sel.chunks.len(), 2);
         assert_eq!(sel.tokens_used, 100);
+    }
+
+    // ----- accumulator overflow -----
+
+    /// The budget guard saturates; the accumulator has to as well.
+    ///
+    /// `saturating_add(x) > budget` is false when the sum saturates at exactly
+    /// `u32::MAX` and the budget *is* `u32::MAX`, so the hit is admitted — and a
+    /// plain `tokens_used += ...` then panics in a debug build. Nothing reaches
+    /// this today: `Config::token_budget` is a `u16`, so the widest real budget
+    /// is 65_535. The test exists because the function is `pub` and takes a
+    /// `u32`, which is the contract a future caller will read.
+    #[test]
+    fn a_budget_at_the_type_ceiling_saturates_instead_of_panicking() {
+        let hits = vec![hit(1, 0.9, u32::MAX), hit(2, 0.8, 10)];
+        let sel = select_within_budget(hits, u32::MAX, 0.0, None);
+
+        assert_eq!(sel.chunks.len(), 2, "both hits fit a u32::MAX budget");
+        assert_eq!(
+            sel.tokens_used,
+            u32::MAX,
+            "the sum saturates at the ceiling rather than wrapping"
+        );
     }
 
     /// The cap counts *selected* chunks, not candidates examined. An oversized

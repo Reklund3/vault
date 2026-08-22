@@ -49,6 +49,54 @@ pub fn config_in(dir: &Path) -> Config {
     Config::default().with_vault_dir(dir)
 }
 
+/// A config whose router is pinned to local Gemma, written to a real
+/// `vault.toml` and loaded back through the public `Config::from_path`.
+///
+/// `config_in` leaves the router on its `auto` default, which probes
+/// `localhost:8080` and then needs `ANTHROPIC_API_KEY` — so on a machine with
+/// neither (CI, most laptops) `QueryPlanner::new` returns `Err` and any test
+/// built on it can only skip. Forcing `gemma` mode makes construction
+/// deterministic everywhere: `build_router` goes straight to
+/// `GemmaRouter::from_config`, which needs a parseable endpoint and a model
+/// name and makes no network call.
+///
+/// The endpoints point at port 1 on purpose. Nothing here should ever send a
+/// request; if something does, it fails loudly instead of quietly reaching a
+/// service the developer happens to be running.
+///
+/// `allow(dead_code)` because cargo compiles this module separately into every
+/// test binary that declares `mod common;`, and only `pipeline.rs` needs this
+/// one — an unused-function error in `no_stdout.rs` would otherwise be the
+/// result. The other helpers here happen to be used by both.
+#[allow(dead_code)]
+pub fn offline_config_in(dir: &Path) -> Config {
+    std::fs::write(
+        dir.join("vault.toml"),
+        r#"
+[defaults]
+context_tag  = "vault-context"
+token_budget = 10000
+alpha        = 0.6
+min_score    = 0.15
+
+[router]
+mode  = "gemma"
+model = "unused-in-gemma-mode"
+
+[mlx]
+endpoint     = "http://127.0.0.1:1"
+router_model = "test-model"
+
+[embeddings]
+endpoint = "http://127.0.0.1:1"
+model    = "nomic-ai/nomic-embed-text-v1.5"
+dims     = 768
+"#,
+    )
+    .expect("write vault.toml");
+    Config::from_path(dir).expect("config loads")
+}
+
 /// A plan a consumer can build without a router or an embedder. The embedding is
 /// zeroed rather than random: cosine scores are irrelevant to these tests, and a
 /// fixed vector keeps them deterministic.

@@ -14,7 +14,7 @@
 
 mod common;
 
-use common::{TmpDir, config_in, plan_for};
+use common::{TmpDir, config_in, offline_config_in, plan_for};
 use vault::{Interaction, QueryPlanner, Retrieval, SkipReason, SyncOptions, VaultStore};
 
 /// Opening a store creates and migrates the database, in the directory the
@@ -168,12 +168,12 @@ fn a_non_interactive_sync_derives_a_name_instead_of_prompting() {
 #[test]
 fn a_consumer_gets_empty_prompt_rather_than_a_billable_round_trip() {
     let tmp = TmpDir::new("empty-prompt");
-    let config = config_in(tmp.path());
+    let config = offline_config_in(tmp.path());
 
-    let Ok(vault) = vault::Vault::open(&config) else {
-        eprintln!("skipped: no router backend configured on this machine");
-        return;
-    };
+    // `expect`, not a skip: `offline_config_in` pins the router to gemma mode,
+    // which constructs without probing or needing a key. If this ever fails it
+    // is a real regression in `Vault::open`, not a machine that lacks a backend.
+    let vault = vault::Vault::open(&config).expect("gemma-mode vault opens offline");
 
     for prompt in ["", "   ", "\n\t "] {
         match vault.retrieve(prompt).expect("must not error") {
@@ -192,14 +192,14 @@ fn a_consumer_gets_empty_prompt_rather_than_a_billable_round_trip() {
 #[test]
 fn a_blank_prompt_never_reaches_the_router() {
     let tmp = TmpDir::new("blank-route");
-    let config = config_in(tmp.path());
+    let config = offline_config_in(tmp.path());
 
-    // `QueryPlanner::new` resolves a backend, which may legitimately fail on a
-    // machine with no Gemma and no API key — that is not what is under test.
-    let Ok(planner) = QueryPlanner::new(&config) else {
-        eprintln!("skipped: no router backend available on this machine");
-        return;
-    };
+    // Gemma mode resolves a backend without probing or needing a key, so the
+    // planner constructs on any machine. The endpoint it holds points at a dead
+    // port: if the guard under test regressed, `route` would try to reach it and
+    // return `Err`, which the `expect` below turns into a failure rather than
+    // the `Ok(None)` this asserts.
+    let planner = QueryPlanner::new(&config).expect("gemma-mode planner builds offline");
 
     for prompt in ["", "   ", "\n\t "] {
         assert!(

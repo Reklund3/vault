@@ -87,6 +87,29 @@ jobs:
       - name: Assert the library touches no stdin/stdout
         run: ./scripts/check-library-io.sh
 
+  audit-script:
+    name: Supply-chain audit script
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # The audit walks every object in the store, including unreachable
+          # ones, so a shallow clone would hand it an empty denominator and a
+          # confident "clean".
+          fetch-depth: 0
+
+      # Tests the detector, not this repo: it builds throwaway git repos and
+      # checks that a listed crate is found in each place it can hide, and that
+      # documentation naming the incident is not. The script used to flag its
+      # own repo's docs and always exit 1, which is how a detector gets ignored.
+      - name: Verify the audit script still detects
+        run: ./scripts/test-supply-chain-audit.sh
+
+      - name: Audit this repository
+        run: ./scripts/supply-chain-audit.sh
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
