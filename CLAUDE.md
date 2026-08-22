@@ -70,8 +70,14 @@ vault index sync <repo> --dry-run           # walk + cache lookup only: no TEI, 
 
 vault diagnose "<prompt>"                   # full retrieval trace
 vault diagnose "<prompt>" --alpha 0.75      # override the BM25/cosine weight for this run
+vault diagnose "<prompt>" --top 20          # results to display (default 10)
 vault diagnose "<prompt>" --stub            # StubEmbedder instead of TEI (plumbing only, cosine meaningless)
 vault diagnose "<prompt>" --no-router       # build the QueryPlan from CLI flags; isolates the store from routing
+
+# Plan overrides — each *replaces* the router's list rather than merging, and each
+# is comma-delimited. Useful with --no-router to drive the store directly.
+vault diagnose "<prompt>" --projects a,b --type-names BuildRequest --topics auth \
+                          --doc-types contract,plan --languages proto,rust
 ```
 
 ## Docs & Project Skills

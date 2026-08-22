@@ -129,9 +129,19 @@ The same trait pattern applies to `Classifier` (used by `vault index sync`). Tra
 |-------------------|--------------------------|-------------------------------------------|
 | Cost / hook call  | $0                       | ~$0.0002 (tiny prompt; cache marker inert <4096 tok) |
 | Cost / index sync | $0                       | ~$0.01–0.05 per 200-file repo             |
-| Latency           | ~100–300ms               | ~400–800ms (still under 3s hook timeout)  |
+| Latency           | see note below           | unmeasured                                |
 | Privacy           | Prompts stay local       | Routing prompts go to Anthropic           |
 | Setup             | `mlx_lm.server` running  | `ANTHROPIC_API_KEY` set                   |
+
+**The latency row used to read "~100–300ms" for Gemma and "~400–800ms (still under
+3s hook timeout)" for Haiku. Both were estimates written before either backend ran,
+and the Gemma one is wrong by two orders of magnitude.** The deployed
+`gemma-4-31b-bf16` was reported at ~15s/call warm, which is where the 3s hook
+timeout stops being an invariant and becomes a guarantee of silent passthrough —
+see P1 in `plan-review-2026-06-11.md`. Haiku has never been measured here at all:
+`~/.vault/hook.log` holds no `router_ms` sample, because no hook call has yet got
+past router construction. Put real numbers in this row once either backend has
+served traffic; until then it should say so rather than guess.
 
 `vault index sync` shows a one-time cost-estimate confirmation the first time a session
 falls back to Haiku for classification, e.g. *"Gemma not detected. Use Haiku for
@@ -201,7 +211,7 @@ CREATE TABLE chunks (
                  ('go','rust','scala','proto','openapi','helm','markdown','unknown')),
   label        TEXT NOT NULL,              -- "message BuildRequest [build-service]"
   content      TEXT NOT NULL,
-  content_hash TEXT NOT NULL,              -- sha256 of chunk body; skip re-embed when label survives unchanged
+  content_hash TEXT NOT NULL,              -- sha256 of chunk body; for a future re-embed skip, not compared yet
   token_est    INTEGER NOT NULL,           -- chars/4 heuristic (estimate_tokens), not a real tokenizer
   chunk_index  INTEGER NOT NULL,
   created_at   INTEGER NOT NULL,
@@ -453,13 +463,16 @@ Three deletion levels are handled:
   `source_path` not in the seen set is dropped. Chunks cascade out via
   `ON DELETE CASCADE`.
 - **Chunk removed inside a still-present file.** When a file's
-  `content_hash` changes, it is re-parsed into a new set of
-  `(label, content)` pairs. Within that document, labels not in the new
-  set are deleted; new labels are inserted; matching labels with
-  unchanged body hash skip the re-embed round-trip; matching labels with
-  changed content are re-embedded and updated.
-- **Project removed.** Covered by `vault index remove --project <name>`.
-  Sync never implicitly removes a project.
+  `content_hash` changes, it is re-parsed and the document's entire chunk
+  set is replaced — every chunk row is deleted and re-inserted from the new
+  `(label, content)` pairs. Removed labels disappear, new ones appear, and
+  surviving ones are re-embedded unconditionally: the per-chunk
+  `content_hash` is stored but not yet compared, so there is no
+  unchanged-body skip today.
+- **Project removed.** Not yet implemented — planned as
+  `vault index remove --project <name>` (listed with the other planned
+  commands in the CLI surface block below). Sync never implicitly removes
+  a project; that stays an explicit, separate operation.
 
 #### Stable chunk identity
 
@@ -474,14 +487,18 @@ label would collide (e.g. two `## Auth` headings in one markdown file),
 the parser disambiguates by suffix or parent path before the chunk
 reaches the writer.
 
-#### Re-embed skip with collision defense
+#### Re-embed skip with collision defense — planned, not implemented
 
 `chunks.content_hash` is the sha256 of the chunk body (distinct from
-`documents.content_hash`, which is the sha256 of the whole file). When a
-label survives a re-parse with the same body hash, the embedding is
-reused verbatim — no TEI call.
+`documents.content_hash`, which is the sha256 of the whole file). It is
+written on every insert and **read by nothing**; what follows is what it
+was recorded for, not what runs today. See the bullet above — a changed
+document has its whole chunk set replaced unconditionally.
 
-For defense in depth, the writer also byte-compares the stored content
+Once built: when a label survives a re-parse with the same body hash, the
+embedding will be reused verbatim — no TEI call.
+
+For defense in depth, the writer will also byte-compare the stored content
 against the new content when hashes match. A mismatch (real-world
 impossible for SHA-256, but possible from our own bugs — wrong hashing
 scope, normalization drift, encoding mismatch) logs a warning and forces
@@ -628,7 +645,7 @@ ORDER BY vec_distance_cosine(v.embedding, ?1) LIMIT 50;
 ```
 final_score = α * bm25_normalized + (1 - α) * cos_sim
 
-α = 0.6  (initial — tune via retrieval_log + vault diagnose)
+α = 0.6  (initial — tune via vault diagnose)
 MinChunkScore = 0.15
 TokenBudget = 10_000
 ```
@@ -907,10 +924,10 @@ vault never writes to it. The classification cache is *not* stored here; it live
 in **vault.db** as the `documents` row for each file (`doc_type` keyed
 `UNIQUE(project_id, source_path)` with a `content_hash`). A later sync skips any
 file whose hash is unchanged — no re-classify, no re-embed — and to force
-re-classification you change the file or run `vault index remove` for the
-project. Because the key is the logical project + repo-relative path (never an
-absolute path), the cache survives a clone on another device or a shared Postgres
-backend.
+re-classification you change the file (a project-level `vault index remove` is
+planned, not built). Because the key is the logical project + repo-relative path
+(never an absolute path), the cache survives a clone on another device or a shared
+Postgres backend.
 
 The assembled context block for a software session:
 
@@ -1107,7 +1124,7 @@ No session state lives in vault.db. The hook binary is read-only at runtime.
 | Plan chunks | Whole file | Plans are coherent units, fragmentation loses intent |
 | Scala chunks | Whole file for v1 | Deterministic chunking requires AST; defer to v1+ |
 | Re-index trigger | Manual explicit sync | Avoids WIP branch state and teammate branch pollution |
-| Sync pruning | Always-on; `UNIQUE(document_id, label)` for chunk identity; per-chunk `content_hash` with byte-compare to skip re-embeds | Deletions in source repos must propagate to the vault, otherwise removed routes/messages linger as authoritative chunks |
+| Sync pruning | Always-on; `UNIQUE(document_id, label)` for chunk identity; per-chunk `content_hash` recorded for a future re-embed skip, not compared yet | Deletions in source repos must propagate to the vault, otherwise removed routes/messages linger as authoritative chunks |
 | Indexing primary | Explicit CLI sync | No per-project config files; no files written to indexed repos |
 | Indexing classification | Gemma content classification | Classifies on first sync; cached in vault.db (`documents.doc_type`) for subsequent syncs |
 | Cold start / missing project | Silent no-op | Partial vault is normal state; no error warranted |

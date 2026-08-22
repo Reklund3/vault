@@ -78,20 +78,24 @@ and falls through to silent passthrough — exactly when context would help most
 
 ---
 
-## A. Plan contradicts the implemented system
+## A. Code gaps the plan used to paper over
 
-| # | Plan says | Reality |
-|---|-----------|---------|
-| A5 | `plan:461` — "Project removed. Covered by `vault index remove --project <name>`", present tense | The command does not exist. `plan:971-979` correctly lists it as planned, so the plan contradicts itself. **The code gap is the load-bearing part**: the `documents` FK has no CASCADE, so `index remove` needs explicit child deletes plus a `chunks_vec` sweep (fold in **B8**) |
-| A5b | — | **README was never reconciled.** `vault-plan.md` was (2026-06-21); README has no planned-not-implemented section, and its examples omit `--name` for sync and `--top` plus all five plan-override flags for diagnose |
-| A9 | `plan:459` — "matching labels with unchanged body hash skip the re-embed round-trip"; schema comment `plan:204` says the same | Per-chunk `content_hash` is stored but never compared, so a one-line edit re-embeds every chunk in the file. `plan:439` already admits this, so the plan contradicts itself in three places. (The unchanged-*file* gate does work.) |
-| A10 | `plan:631` — "α = 0.6 (initial — tune via retrieval_log + vault diagnose)" | Zero producers, so that loop cannot run. `Store::log_retrieval` exists and `SqliteStore` implements it; only test stubs and one unit test call it. (`plan:1154` is honest — an unchecked box) |
+The documentation half of every A finding was fixed on 2026-08-22 — `vault-plan.md`
+and README now describe what the code does. **A5b closed entirely** (it was
+doc-only) and **A10 merged into B1/B3**, since what is left of it is the
+`retrieval_log` decision. What remains here is the code these findings were
+pointing at.
+
+| # | Gap |
+|---|-----|
+| A5 | **`vault index remove` does not exist.** Load-bearing for cleanup: the `documents` FK has no CASCADE, so it needs explicit child deletes plus a `chunks_vec` sweep. Fold in **B8** while writing it |
+| A9 | **Per-chunk `content_hash` is written and never read.** A one-line edit re-embeds every chunk in that file — `upsert_document` deletes and re-inserts the whole set unconditionally. The design for the skip, including the byte-compare collision defence, is recorded in `vault-plan.md` under a heading now marked planned-not-implemented. (The unchanged-*file* gate does work.) |
 
 ---
 
 ## B. Internal contradictions / underspecification
 
-- **B1 / B3 — `retrieval_log`'s fate is undecided.** "Hook runtime access:
+- **B1 / B3 / A10 — `retrieval_log`'s fate is undecided.** "Hook runtime access:
   read-only" (plan line 904) contradicts its stated purpose of collecting hook
   prompts for replay (line 965). It could not serve replay anyway: `prompt_hash`
   but no prompt text or embedding, no alpha or budget columns, aggregate counts
@@ -178,12 +182,8 @@ and falls through to silent passthrough — exactly when context would help most
 
 ## Doc-sync checklist
 
-- [ ] `vault-plan.md` indexing section: reconcile `:204`/`:459` with `:439` (A9),
-      and `:461` with `:971-979` (A5); add the `chunks_vec` rationale (B8).
-- [ ] `vault-plan.md:132` latency table still claims Gemma is "~100–300ms" and
-      Haiku "~400–800ms (still under 3s hook timeout)". The measured local figure
-      is ~15s/call, which is P1. The table is the source of the 3s invariant.
+- [ ] `vault-plan.md` indexing section: add the `chunks_vec` delete-trigger
+      rationale (B8) — the A5/A9 reconciliations are done.
 - [ ] `vault-plan.md` tracking items: P1, P3, P4, B1/B3, C1, C2.
 - [ ] `vault-plan.md` on `vault tei start|status`: neither reports on the service,
       only on a TCP socket (D4), and `start` does not verify the child lived (D3).
-- [ ] README: the A5b gaps above.

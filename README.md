@@ -36,11 +36,17 @@ vault tei stop
 # Index a repo before starting a cross-service session
 vault index sync ~/repos/build-service                # first sync prompts for project name + domain
 vault index sync ~/repos/auth-lib --domain software   # or pass --domain to skip the prompt
+vault index sync ~/repos/auth-lib --name shared-auth  # override the inferred project name
 vault index sync ~/repos/build-service --dry-run      # preview: walk + counts only, no writes
 
 # Diagnose retrieval quality
 vault diagnose "what does BuildRequest need for auth?"
 vault diagnose "what does BuildRequest need for auth?" --alpha 0.75
+vault diagnose "what does BuildRequest need for auth?" --top 20
+vault diagnose "..." --projects auth-lib --doc-types contract
+                                   # ^ override the router's plan. Also --type-names,
+                                   #   --topics, --languages; all comma-delimited, and
+                                   #   they replace the router's values rather than merge.
 vault diagnose "..." --no-router   # build the plan from flags; isolates the store from routing
 vault diagnose "..." --stub        # StubEmbedder instead of TEI: plumbing only, cosine meaningless
 ```
@@ -65,6 +71,10 @@ not load. Use an absolute path rather than relying on `PATH`:
 Sync is always explicit — you choose when to index and from what branch. This prevents WIP branch state from polluting the vault. Always sync from main/trunk.
 
 Sync also prunes: chunks for files removed from the repo are dropped on the next sync, and chunks for definitions removed within a file (a deleted proto message, a removed exported function) are dropped when that file is re-parsed. There is no separate prune command — deletion reconciliation is part of every sync.
+
+### Not Yet Implemented
+
+A few subcommands were sketched during design and never built: `vault index add` (add a single file without a full sync), `vault index remove` (drop a project), `vault list` (list indexed projects/documents), `vault reindex` (force a full re-index past the content-hash cache), and `vault serve` (expose retrieval as an MCP tool). None of them exist — the commands above, plus `vault hook` (invoked by Claude Code, not by hand), are the complete current CLI.
 
 ## What Gets Indexed
 
