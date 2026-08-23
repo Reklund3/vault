@@ -54,6 +54,11 @@ pub fn run() -> ! {
 #[derive(Deserialize)]
 struct HookInput {
     prompt: String,
+    /// The directory Claude Code was invoked from. Optional so a client that
+    /// omits it — or an older one — still parses; the cwd bias simply does not
+    /// apply. See `QueryPlan::prefer_project` (review C1).
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 /// Everything a hook invocation can resolve to. `Skip` and `Failed` both end
@@ -190,13 +195,21 @@ fn pipeline(stdin: &str, tel: &mut log::Telemetry) -> (Outcome, Option<PathBuf>)
         Ok(v) => v,
         Err(e) => return (Outcome::from_vault_error(&e), vault_dir),
     };
-    (pipeline_with(&event.prompt, &vault, tel), vault_dir)
+    (
+        pipeline_with(&event.prompt, event.cwd.as_deref(), &vault, tel),
+        vault_dir,
+    )
 }
 
 /// Inner pipeline with an injected `Vault` — testable with stub backends.
 /// Adapts the library-shaped `retrieve_with` to the hook's fail-open `Outcome`.
-fn pipeline_with(prompt: &str, vault: &Vault, tel: &mut log::Telemetry) -> Outcome {
-    match retrieve_with(prompt, vault, tel) {
+fn pipeline_with(
+    prompt: &str,
+    cwd: Option<&str>,
+    vault: &Vault,
+    tel: &mut log::Telemetry,
+) -> Outcome {
+    match retrieve_with(prompt, cwd, vault, tel) {
         Ok(Retrieval::Skip(reason)) => Outcome::Skip { reason },
         Ok(Retrieval::Context(context)) => Outcome::Injected {
             chunks: context.hits.len(),
@@ -217,6 +230,7 @@ fn pipeline_with(prompt: &str, vault: &Vault, tel: &mut log::Telemetry) -> Outco
 /// failure still reports the timing that preceded it.
 fn retrieve_with(
     prompt: &str,
+    cwd: Option<&str>,
     vault: &Vault,
     tel: &mut log::Telemetry,
 ) -> Result<Retrieval, VaultError> {
@@ -246,12 +260,18 @@ fn retrieve_with(
     tel.embed_ms = Some(ms_since(t));
     let embedding = embedded?;
 
-    let planned = PlannedQuery { plan, embedding };
-
     // --- phase 2: store-bound ---
     // `query_ms` spans the whole store phase, which is exactly how long a
     // concurrent caller would hold the store.
     let t = Instant::now();
+    // The cwd bias (C1). Errors are swallowed rather than propagated: this is
+    // a hint that improves a plan, and a store hiccup resolving it must not
+    // fail a retrieval the router and embedder already paid for.
+    let mut plan = plan;
+    if let Some(project) = cwd.and_then(|c| vault.store().project_for_path(c).ok().flatten()) {
+        plan.prefer_project(project);
+    }
+    let planned = PlannedQuery { plan, embedding };
     let result = vault.store().search(&planned);
     tel.query_ms = Some(ms_since(t));
     result
@@ -439,6 +459,123 @@ mod tests {
         }
     }
 
+    /// `cwd` is optional on the wire: a client that omits it must still parse,
+    /// and simply contributes no bias.
+    #[test]
+    fn hook_input_parses_with_and_without_cwd() {
+        let with: HookInput =
+            serde_json::from_str(r#"{"prompt":"q","cwd":"/home/u/git/vault"}"#).expect("with cwd");
+        assert_eq!(with.cwd.as_deref(), Some("/home/u/git/vault"));
+
+        let without: HookInput = serde_json::from_str(r#"{"prompt":"q"}"#).expect("without cwd");
+        assert_eq!(without.cwd, None);
+
+        // Unknown fields Claude Code may add must not fail the parse — the hook
+        // fails open, but a parse error is a `Stage::Stdin` failure that
+        // suppresses context for every prompt until someone reads hook.log.
+        let extra: HookInput =
+            serde_json::from_str(r#"{"prompt":"q","cwd":"/x","session_id":"abc"}"#)
+                .expect("extra fields");
+        assert_eq!(extra.cwd.as_deref(), Some("/x"));
+    }
+
+    /// A store that records the plan it was asked to search, so the cwd bias
+    /// can be observed where it actually matters. The recording handle is
+    /// shared, because `vault_of` takes the store by value.
+    struct RecordingStore {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Store for RecordingStore {
+        fn migrate(&mut self) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn get_or_create_project(&mut self, _n: &str, _r: &str) -> Result<i64, StoreError> {
+            Ok(1)
+        }
+        fn get_document_content_hash(
+            &self,
+            _p: i64,
+            _s: &str,
+        ) -> Result<Option<String>, StoreError> {
+            Ok(None)
+        }
+        fn project_for_path(&self, path: &str) -> Result<Option<String>, StoreError> {
+            Ok((path == "/home/u/git/vault/src").then(|| "vault".to_string()))
+        }
+        fn upsert_document(
+            &mut self,
+            _d: &Document,
+            _c: &[ChunkWithEmbedding],
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn prune_orphans(&mut self, _p: i64, _k: &[String]) -> Result<usize, StoreError> {
+            Ok(0)
+        }
+        fn bm25_search(&self, plan: &QueryPlan, _k: usize) -> Result<Vec<Hit>, StoreError> {
+            *self.seen.lock().unwrap() = plan.projects.clone();
+            Ok(Vec::new())
+        }
+        fn cosine_search(
+            &self,
+            _p: &QueryPlan,
+            _e: &[f32],
+            _k: usize,
+        ) -> Result<Vec<Hit>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn log_retrieval(&mut self, _e: &RetrievalLogEntry) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    fn projects_seen_for(cwd: Option<&str>) -> Vec<String> {
+        let config = Config::default();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let vault = vault_of(
+            &config,
+            Box::new(StubRouter),
+            Box::new(StubEmbedder::from_config(&config)),
+            Box::new(RecordingStore {
+                seen: std::sync::Arc::clone(&seen),
+            }),
+        );
+        let mut tel = log::Telemetry::default();
+        let _ = pipeline_with("q", cwd, &vault, &mut tel);
+        let guard = seen.lock().unwrap();
+        guard.clone()
+    }
+
+    /// End-to-end: `cwd` from stdin reaches the plan the store is queried with.
+    /// `StubRouter` returns an empty `projects`, so anything present came from
+    /// the cwd bias and nowhere else.
+    #[test]
+    fn cwd_biases_the_plan_the_store_receives() {
+        assert_eq!(
+            projects_seen_for(Some("/home/u/git/vault/src")),
+            vec!["vault".to_string()]
+        );
+    }
+
+    /// The three ways cwd contributes nothing must all leave the plan alone
+    /// rather than failing the retrieval — it is a hint, not a requirement.
+    #[test]
+    fn an_unresolvable_cwd_leaves_the_plan_untouched() {
+        assert!(
+            projects_seen_for(None).is_empty(),
+            "absent cwd must not bias"
+        );
+        assert!(
+            projects_seen_for(Some("/tmp/not-indexed")).is_empty(),
+            "a directory outside every indexed repo must not bias"
+        );
+        assert!(
+            projects_seen_for(Some("")).is_empty(),
+            "an empty cwd must not bias"
+        );
+    }
+
     /// Assemble a `Vault` from stub backends. The facade is what production
     /// uses, so the pipeline tests go through it too rather than around it.
     fn vault_of(
@@ -499,6 +636,7 @@ mod tests {
         let mut tel = log::Telemetry::default();
         let out = pipeline_with(
             "what is BuildRequest?",
+            None,
             &vault_of(
                 &config,
                 Box::new(StubRouter),
@@ -534,6 +672,7 @@ mod tests {
         let mut tel = log::Telemetry::default();
         let out = pipeline_with(
             "q",
+            None,
             &vault_of(
                 &config,
                 Box::new(StubRouter),
@@ -565,6 +704,7 @@ mod tests {
         let mut tel = log::Telemetry::default();
         let _ = pipeline_with(
             "q",
+            None,
             &vault_of(
                 &config,
                 Box::new(StubRouter),
@@ -590,6 +730,7 @@ mod tests {
         let mut tel = log::Telemetry::default();
         let out = pipeline_with(
             "hi",
+            None,
             &vault_of(
                 &config,
                 Box::new(SkipRouter),
@@ -621,6 +762,7 @@ mod tests {
         let mut tel = log::Telemetry::default();
         let out = pipeline_with(
             "q",
+            None,
             &vault_of(
                 &config,
                 Box::new(ErrRouter),
@@ -649,6 +791,7 @@ mod tests {
         let mut tel = log::Telemetry::default();
         let out = pipeline_with(
             "anything",
+            None,
             &vault_of(
                 &config,
                 Box::new(StubRouter),
@@ -678,6 +821,7 @@ mod tests {
         let mut tel = log::Telemetry::default();
         let out = pipeline_with(
             "x",
+            None,
             &vault_of(
                 &config,
                 Box::new(StubRouter),
@@ -758,6 +902,7 @@ mod tests {
             let mut tel = log::Telemetry::default();
             let out = pipeline_with(
                 prompt,
+                None,
                 &vault_of(
                     &config,
                     Box::new(StubRouter),

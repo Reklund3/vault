@@ -303,11 +303,20 @@ The remaining open knobs are empirical, not blocking:
 | contract | proto | per message/service/enum |
 | contract | openapi | per path+method, per schema component |
 | plan | any | whole file, unless over the embed ceiling → windowed (see below) |
-| convention | go/rust | per exported symbol + doc comment |
+| convention | go/rust | per top-level item and impl method, with its doc comment — **all visibilities**, not just `pub` |
 | convention/meta | markdown | per `##` heading block |
 | convention | scala | whole file (v1) |
 
-Whole-file fallback (`plan` docs and any file no structural parser claims) is **windowed**: content under `MAX_FALLBACK_CHUNK_TOKENS` (1500, well under nomic's 8192-token context) stays a single chunk — identical to the historical behavior — while larger content is greedily packed by whole lines into ordered, embeddable chunks. This keeps a large file from exceeding the embedder's input limit and aborting the whole document. A single line longer than the ceiling (minified blob, one-line log) is truncated head-only rather than char-split, so the per-chunk secret scan can't be bisected. The sync report counts windowed files and truncated lines.
+Rust chunking covers private items too. Gating on `pub` indexed the API
+surface, which is the wrong premise here: the questions asked of vault are about
+implementation, and 241 of this crate's 348 top-level items are private —
+`build_match_query` and `build_filter_clause` among them, invisible to
+retrieval. A private `mod` matches as well, which is what keeps the change safe:
+`ItemKind::Mod` emits the declaration and lets depth tracking skip the body, so
+`#[cfg(test)] mod tests` yields one small chunk rather than ~620 test fns.
+
+Whole-file fallback (`plan` docs, any file no structural parser claims, **and
+any file a parser claims but extracts nothing from**) is **windowed**: content under `MAX_FALLBACK_CHUNK_TOKENS` (1500, well under nomic's 8192-token context) stays a single chunk — identical to the historical behavior — while larger content is greedily packed by whole lines into ordered, embeddable chunks. This keeps a large file from exceeding the embedder's input limit and aborting the whole document. A single line longer than the ceiling (minified blob, one-line log) is truncated head-only rather than char-split, so the per-chunk secret scan can't be bisected. The sync report counts windowed files and truncated lines.
 
 ## Scoring & Tuning
 

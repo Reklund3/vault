@@ -131,7 +131,13 @@ impl Parser for RustParser {
                             body_depth,
                         } => {
                             if let Some(method) = parse_method_header(raw_line) {
-                                let emit = *trait_impl || method.is_pub;
+                                // Was `*trait_impl || method.is_pub`. Trait-impl
+                                // methods were always emitted (they cannot be
+                                // marked `pub`), so the rule dropped exactly the
+                                // private *inherent* ones — among them
+                                // `SqliteStore::existing_project_ids`.
+                                let _ = (trait_impl, method.is_pub);
+                                let emit = true;
                                 let start = preamble_start.take().unwrap_or(i);
                                 open = Some(OpenItem {
                                     label: format!("{ty}::{}", method.name),
@@ -504,12 +510,22 @@ fn parse_impl_target(text: &str) -> (String, bool) {
     }
 }
 
+/// Recognize a top-level item header, **regardless of visibility**.
+///
+/// This used to require `pub`, on the theory that the index should hold the
+/// public API surface. That is the wrong premise for vault: the questions asked
+/// of it are about implementation. `build_match_query`, `build_filter_clause`
+/// and `escape_fts_token` — the three functions a whole tuning session was
+/// spent inside — are private free functions, and none of them were indexed at
+/// all. 241 of this crate's 348 top-level items are private.
+///
+/// Dropping the gate also makes a private `mod` match, which is load-bearing:
+/// `ItemKind::Mod` emits the declaration and lets depth tracking skip the body,
+/// so `#[cfg(test)] mod tests` contributes one small chunk instead of leaking
+/// ~620 indented test fns into the index.
 fn parse_pub_item(line: &str) -> Option<PubItem> {
     let t = line.trim_start();
-    let (is_pub, t) = strip_visibility(t);
-    if !is_pub {
-        return None;
-    }
+    let (_is_pub, t) = strip_visibility(t);
     let t = strip_modifiers(t);
     let kinds = [
         ("fn", ItemKind::Fn),
@@ -713,13 +729,26 @@ pub fn build(req: Request) -> Result<(), Error> {
     }
 
     #[test]
-    fn skips_private_fn() {
+    fn indexes_a_private_free_function() {
+        // Was `skips_private_fn`. The visibility gate meant `build_match_query`,
+        // `build_filter_clause` and `escape_fts_token` — private free functions
+        // central enough to spend a tuning session inside — produced zero
+        // chunks and could not be retrieved at all.
         let src = "\
+/// Doc comment on a private helper.
 fn helper() -> i32 {
     1
 }
 ";
-        assert!(parse(src).is_empty());
+        let chunks = parse(src);
+        assert_eq!(labels(&chunks), ["fn helper"]);
+        assert!(
+            chunks[0]
+                .content
+                .contains("Doc comment on a private helper"),
+            "the preamble must travel with it: {}",
+            chunks[0].content
+        );
     }
 
     #[test]
@@ -838,7 +867,7 @@ pub struct Point {
     }
 
     #[test]
-    fn inherent_impl_emits_only_pub_methods() {
+    fn inherent_impl_emits_private_methods_too() {
         let src = "\
 pub struct Server;
 
@@ -853,7 +882,42 @@ impl Server {
 }
 ";
         let chunks = parse(src);
-        assert_eq!(labels(&chunks), ["struct Server", "Server::build"]);
+        assert_eq!(
+            labels(&chunks),
+            ["struct Server", "Server::build", "Server::helper"]
+        );
+    }
+
+    /// The hazard that makes dropping the visibility gate safe rather than
+    /// catastrophic. Item headers match after `trim_start`, so without special
+    /// handling every indented `#[test] fn` — ~620 in this crate — would become
+    /// a chunk. A private `mod` now matches `ItemKind::Mod`, which emits the
+    /// declaration only and lets depth tracking skip the body.
+    #[test]
+    fn a_private_test_module_body_is_not_indexed() {
+        let src = "\
+pub fn real() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_test_that_must_not_be_a_chunk() {
+        assert!(true);
+    }
+
+    fn a_helper_that_must_not_be_a_chunk() {}
+}
+";
+        let chunks = parse(src);
+        let got = labels(&chunks);
+        assert!(got.contains(&"fn real"), "{got:?}");
+        assert!(got.contains(&"mod tests"), "{got:?}");
+        assert!(
+            !got.iter().any(|l| l.contains("must_not_be_a_chunk")),
+            "test-module bodies must stay out of the index: {got:?}"
+        );
     }
 
     #[test]

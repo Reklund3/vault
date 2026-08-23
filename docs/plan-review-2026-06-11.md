@@ -93,11 +93,39 @@ Related — **B4**: which domain wins is first-assigned-project-wins via
 domains are unspecified. Less severe now that a wrong domain attribute still
 lands inside a correctly-framed block, but still unspecified.
 
-### P4. Long prompts break query-time embedding.
+### P4. Long prompts silently truncate query-time embedding.
 
-`embed_query` sends the prompt untruncated, so a pasted diff or log fails the embed
-and falls through to silent passthrough — exactly when context would help most.
-(Index-side windowing is done.)
+`embed_query` is `self.embed(&format!("search_query: {text}"))` with no length
+guard. The index side has one (`whole_file_chunks` windows at
+`MAX_FALLBACK_CHUNK_TOKENS`); the query side has none.
+
+**Correction (2026-08-23).** This finding said the embed *fails* and falls
+through to silent passthrough. Measured against the live server, it does not:
+TEI 1.9.3 reports `auto_truncate: true`, so an over-long prompt returns a
+perfectly good vector computed from **only the first 8192 tokens**. Nothing
+errors and nothing is reported. That is worse in one respect — a failure is at
+least visible in `hook.log` as `embed-query`, whereas this produces confident
+retrieval against the head of a pasted diff while the actual question, if it sat
+at the bottom, was never embedded. It is also deployment-dependent: a TEI
+started with auto-truncate off fails as originally described.
+
+Design notes for the fix:
+
+- **Head-only truncation is wrong here.** The index truncates head-only so the
+  per-chunk secret scan cannot be bisected. A query yields *one* vector, so
+  truncating is not windowing — it is choosing what the query means. A prompt
+  ending in "why does this fail?" after 400 lines of stack trace loses the
+  question. Head+tail is the better default.
+- **The ceiling should be read, not hardcoded.** `/info` reports
+  `max_input_length` (8192 here). `verify_against_server` already calls the
+  server, so the handshake can learn it.
+- **The router has the same exposure.** `build_user_prompt` ends with
+  `out.push_str(prompt)`, untruncated. Haiku's 200k context will not error, but
+  the whole paste is billed on every long prompt, and a local Gemma with a
+  smaller window would fail outright. The same guard belongs there.
+- **The BM25 arm is unaffected** — it is built from the router's `type_names`
+  and `topics`, not the raw prompt — so a truncated query still gets full
+  keyword retrieval. That lowers the stakes on getting the split perfect.
 
 ---
 
@@ -139,10 +167,25 @@ pointing at.
 
 ## C. Structural weaknesses
 
-- **C1. `cwd` is an unused free signal.** `HookInput` ignores it while
-  `projects.repo_path` exists. cwd → project → domain would give deterministic
-  project bias, deterministic tag resolution, and a degraded-but-useful path when
-  the router is down. Design after P1 settles.
+- ~~**C1. `cwd` is an unused free signal.**~~ — **mostly closed 2026-08-22.**
+  `HookInput` now carries `cwd` (optional, so a client that omits it still
+  parses), `Store::project_for_path` resolves it to an indexed project by
+  longest-prefix match at a component boundary, and `QueryPlan::prefer_project`
+  moves that project to the front. The bias is additive — the router's projects
+  survive, since a prompt asked from one repo about a sibling service is
+  ordinary — and cwd-first makes `resolve_domain` deterministic rather than
+  dependent on router output ordering, which closes the practical half of
+  **B4**. Resolution failures are swallowed: a hint must not fail a retrieval
+  the router and embedder already paid for.
+
+  The note to "design after P1 settles" was wrong and is dropped: P1 is about
+  router *latency*, and the whole value of cwd is that it needs no router.
+
+  **What is left** is the third clause — *"a degraded-but-useful path when the
+  router is down"*. Today a router failure is still total passthrough. Falling
+  back to "everything from this project, cosine-only" would change the hook's
+  failure semantics and needs its own design pass; it also only helps when the
+  router is down *and* TEI is up.
 
 - **C2. No eval ground truth.** The tuning loop optimises retrieval against itself.
   A golden-prompt fixture set (prompt → expected chunk labels) would anchor alpha
@@ -164,7 +207,8 @@ pointing at.
 ## D. Findings from the code, not from the plan
 
 **D1** and **D2** are left over from the `lib-cli-split` code review; **D3** and
-**D4** were found on 2026-08-22 starting TEI for the test suite.
+**D4** were found on 2026-08-22 starting TEI for the test suite, and both were
+reproduced live on 2026-08-23. **D5** was found the same day, by hitting it.
 
 - **D1. `Vault::open` still builds a router an indexing-only consumer never
   calls.** *Half-fixed 2026-08-22.* The ordering half is done — router grounding
@@ -193,6 +237,12 @@ pointing at.
   `--rm` had not cleaned up; the real error was only in `~/.vault/tei.log`.
   Fix: check liveness before claiming success, and tail the log when it fails.
 
+  **`vault tei status` has the same blind spot** (observed 2026-08-23): it
+  printed `pidfile: ~/.vault/tei.pid (pid 33619)` for a process that did not
+  exist and a container that was gone. It reports the pidfile's *contents*, not
+  whether the pid is alive. Whatever liveness check `start` gains, `status`
+  needs too.
+
 - **D4. Reachability probes are TCP-only, so "reachable" precedes "serving".**
   `util::probe::port_reachable` is a TCP connect; Docker publishes the port at
   container start, ~28s before TEI binds its HTTP server. Measured: `tei start` and
@@ -201,7 +251,34 @@ pointing at.
   it is P1's probe bullet. Fix: probe the health endpoint — `tei_reachable` already
   takes the URL, so it is a change of method, not signature.
 
+  **Reproduced 2026-08-23.** `vault tei start` printed *"TEI is reachable on
+  http://localhost:8081"* while `/info` still refused the connection; it took a
+  further poll loop before the HTTP server answered. The tool declared healthy a
+  server that could not have served a single embed.
+
 ---
+
+- **D5. Parser behaviour is unversioned, so a parser change yields a silently
+  stale index.** The unchanged-file gate compares a file's hash against
+  `documents.content_hash`. That is the right key for *content* drift and the
+  wrong one for *parser* drift: when the rust parser stopped requiring `pub`
+  (2026-08-23), every already-indexed file still hashed the same, so `index
+  sync` reported `Unchanged: 67` and kept chunks the current parser would never
+  produce. The index was left in a mix — three reparsed files chunked per
+  private item, sixty-seven still holding pub-only chunks — with nothing on
+  screen indicating it.
+
+  The recovery is `rm ~/.vault/vault.db*` plus a full re-sync, which costs a
+  full reclassification pass against the remote backend. Worse, the failure is
+  silent: retrieval keeps working, just against chunk boundaries that no longer
+  match the code.
+
+  The embedding side already solved this — `meta` records `(embedding_model,
+  embedding_dim)` and every open verifies it, so a model change is a loud error
+  with an explicit remedy. Parsers have no equivalent. Fix: a `parser_version`
+  in `meta`, bumped when any parser's chunk boundaries change, that invalidates
+  the `content_hash` gate for affected languages — or, at minimum, refuses the
+  open with the same "full re-index needed" error the dim lock produces.
 
 ## Loose ends
 
@@ -217,5 +294,11 @@ pointing at.
 - [ ] `vault-plan.md` indexing section: add the `chunks_vec` delete-trigger
       rationale (B8) — the A5/A9 reconciliations are done.
 - [ ] `vault-plan.md` tracking items: P1, P3, P4, B1/B3, C1, C2.
+- [ ] `vault-plan.md` chunking section: rust chunks all visibilities now, not
+      just exported symbols, and a parser that extracts nothing takes the
+      whole-file fallback rather than skipping the file. `CLAUDE.md` is updated;
+      the plan is not.
+- [ ] `docs/embeddings.md` / `runbook.md`: TEI reports `auto_truncate: true`, so
+      an over-long input is silently truncated rather than rejected (P4).
 - [ ] `vault-plan.md` on `vault tei start|status`: neither reports on the service,
       only on a TCP socket (D4), and `start` does not verify the child lived (D3).

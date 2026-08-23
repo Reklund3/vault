@@ -88,6 +88,20 @@ pub trait Store {
         Ok(Inventory::default())
     }
 
+    /// Resolve the indexed project whose `repo_path` contains `path`, if any.
+    ///
+    /// `path` is the `cwd` Claude Code sends with every prompt — the one signal
+    /// on the hook's input that is *certain* rather than inferred, and the only
+    /// one that costs nothing to obtain. Matching is a longest-prefix test at a
+    /// component boundary, so a nested repo wins over its parent and
+    /// `/src/vault-old` never matches a project rooted at `/src/vault`.
+    ///
+    /// **Provided default returns `Ok(None)`** — a backend that does not persist
+    /// `repo_path` simply contributes no cwd bias.
+    fn project_for_path(&self, _path: &str) -> Result<Option<String>, StoreError> {
+        Ok(None)
+    }
+
     /// Assign `domain` to a project row, overwriting any existing assignment.
     /// Used by the first-run domain prompt in `vault index sync`.
     ///

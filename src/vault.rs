@@ -160,6 +160,12 @@ impl VaultStore {
         self.store.inventory().map_err(VaultError::DbOpen)
     }
 
+    /// Resolve the indexed project containing `path` — the cwd bias (C1).
+    /// `Ok(None)` when no indexed repo contains it.
+    pub fn project_for_path(&self, path: &str) -> Result<Option<String>, VaultError> {
+        self.store.project_for_path(path).map_err(VaultError::Query)
+    }
+
     /// Run a planned query. This is the only segment a concurrent caller has to
     /// serialise, and it is milliseconds of SQLite — the expensive network work
     /// already happened in [`QueryPlanner`].
@@ -232,6 +238,17 @@ impl Vault {
 
     /// Plan and search in one call.
     pub fn retrieve(&self, prompt: &str) -> Result<Retrieval, VaultError> {
+        self.retrieve_in(prompt, None)
+    }
+
+    /// Plan and search, biased toward the project containing `cwd`.
+    ///
+    /// `cwd` is a hint, never a filter: the resolved project is moved to the
+    /// front of the plan (see [`QueryPlan::prefer_project`]) and the router's
+    /// projects are kept. A `cwd` that resolves to nothing, or a store that
+    /// fails to answer, leaves the plan untouched — a bias signal must not be
+    /// able to fail a retrieval that would otherwise have succeeded.
+    pub fn retrieve_in(&self, prompt: &str, cwd: Option<&str>) -> Result<Retrieval, VaultError> {
         // Checked here as well as in `route` so the caller gets the *reason*.
         // `route` can only say "no plan"; these two skips call for different
         // follow-up, and `SkipReason::EmptyPrompt` was a public variant no
@@ -241,7 +258,14 @@ impl Vault {
         }
         match self.planner.plan(prompt)? {
             None => Ok(Retrieval::Skip(SkipReason::RouterSkip)),
-            Some(planned) => self.store.search(&planned),
+            Some(mut planned) => {
+                if let Some(project) =
+                    cwd.and_then(|c| self.store.project_for_path(c).ok().flatten())
+                {
+                    planned.plan.prefer_project(project);
+                }
+                self.store.search(&planned)
+            }
         }
     }
 }

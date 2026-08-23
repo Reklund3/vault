@@ -168,6 +168,46 @@ impl Store for SqliteStore {
         Ok(None)
     }
 
+    fn project_for_path(&self, path: &str) -> Result<Option<String>, StoreError> {
+        let needle = path.trim_end_matches('/');
+        if needle.is_empty() {
+            return Ok(None);
+        }
+        // Prefix matching happens in Rust, not SQL. `LIKE` would need the
+        // pattern metacharacters in `path` escaped — and `path` arrives from
+        // the hook's stdin JSON — while `GLOB` has the same problem. Comparing
+        // in Rust keeps untrusted input out of pattern position entirely.
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, repo_path FROM projects WHERE repo_path IS NOT NULL")
+            .map_err(backend_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(backend_err)?;
+
+        let mut best: Option<(usize, String)> = None;
+        for row in rows {
+            let (name, repo_path) = row.map_err(backend_err)?;
+            let root = repo_path.trim_end_matches('/');
+            if root.is_empty() {
+                continue;
+            }
+            // Equal, or `path` sits under `root` at a component boundary. The
+            // boundary check is what stops `/src/vault-old` matching a project
+            // rooted at `/src/vault`.
+            let under = needle == root
+                || needle
+                    .strip_prefix(root)
+                    .is_some_and(|rest| rest.starts_with('/'));
+            // Longest root wins, so a repo nested inside another resolves to
+            // the inner one.
+            if under && best.as_ref().is_none_or(|(len, _)| root.len() > *len) {
+                best = Some((root.len(), name));
+            }
+        }
+        Ok(best.map(|(_, name)| name))
+    }
+
     fn inventory(&self) -> Result<Inventory, StoreError> {
         // Three cheap DISTINCT scans over `chunks`. Only values with at least
         // one chunk are reported: a language whose every chunk was dropped by
@@ -732,6 +772,110 @@ mod tests {
             content_hash: format!("hash-{label}"),
             token_est: 10,
             chunk_index: idx,
+        }
+    }
+
+    fn project_at(store: &SqliteStore, name: &str, repo_path: &str) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO projects (name, repo_path, created_at) VALUES (?1, ?2, ?3)",
+                params![name, repo_path, now_secs()],
+            )
+            .unwrap();
+    }
+
+    /// The cwd bias resolves from any directory inside the repo, not just its
+    /// root — you are almost never sitting at the top of a checkout.
+    #[test]
+    fn project_for_path_matches_a_subdirectory_of_the_repo() {
+        let config = Config::default();
+        let store = SqliteStore::open_in_memory(&config).unwrap();
+        project_at(&store, "vault", "/home/u/git/vault");
+
+        for cwd in [
+            "/home/u/git/vault",
+            "/home/u/git/vault/",
+            "/home/u/git/vault/src/store",
+        ] {
+            assert_eq!(
+                store.project_for_path(cwd).unwrap().as_deref(),
+                Some("vault"),
+                "should resolve from {cwd}"
+            );
+        }
+    }
+
+    /// The boundary check. A plain `starts_with` would match a sibling whose
+    /// name merely extends the project's — and silently bias every prompt in it
+    /// toward the wrong project.
+    #[test]
+    fn project_for_path_does_not_match_a_sibling_with_a_longer_name() {
+        let config = Config::default();
+        let store = SqliteStore::open_in_memory(&config).unwrap();
+        project_at(&store, "vault", "/home/u/git/vault");
+
+        assert_eq!(
+            store.project_for_path("/home/u/git/vault-old").unwrap(),
+            None
+        );
+        assert_eq!(
+            store.project_for_path("/home/u/git/vaultx/src").unwrap(),
+            None
+        );
+    }
+
+    /// A repo checked out inside another must resolve to the inner one —
+    /// longest root wins.
+    #[test]
+    fn project_for_path_prefers_the_innermost_repo() {
+        let config = Config::default();
+        let store = SqliteStore::open_in_memory(&config).unwrap();
+        project_at(&store, "outer", "/home/u/git");
+        project_at(&store, "inner", "/home/u/git/vault");
+
+        assert_eq!(
+            store
+                .project_for_path("/home/u/git/vault/src")
+                .unwrap()
+                .as_deref(),
+            Some("inner")
+        );
+        assert_eq!(
+            store
+                .project_for_path("/home/u/git/other")
+                .unwrap()
+                .as_deref(),
+            Some("outer")
+        );
+    }
+
+    /// An unindexed directory contributes no bias rather than guessing.
+    #[test]
+    fn project_for_path_returns_none_outside_every_indexed_repo() {
+        let config = Config::default();
+        let store = SqliteStore::open_in_memory(&config).unwrap();
+        project_at(&store, "vault", "/home/u/git/vault");
+
+        assert_eq!(store.project_for_path("/tmp/scratch").unwrap(), None);
+        assert_eq!(store.project_for_path("").unwrap(), None);
+    }
+
+    /// `path` arrives from the hook's stdin JSON, so it is untrusted input.
+    /// Matching happens in Rust precisely so pattern metacharacters are inert
+    /// rather than needing `LIKE`/`GLOB` escaping.
+    #[test]
+    fn project_for_path_treats_pattern_metacharacters_as_literal() {
+        let config = Config::default();
+        let store = SqliteStore::open_in_memory(&config).unwrap();
+        project_at(&store, "vault", "/home/u/git/vault");
+
+        for hostile in ["%", "/home/%/git/vault", "/home/u/git/vau*", "_"] {
+            assert_eq!(
+                store.project_for_path(hostile).unwrap(),
+                None,
+                "{hostile:?} must not match as a pattern"
+            );
         }
     }
 

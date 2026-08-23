@@ -80,6 +80,12 @@ pub struct SyncReport {
     pub files_parsed_via_parser: usize, // 0 in dry-run
     pub files_parsed_as_whole: usize, // 0 in dry-run
     pub files_windowed: usize,   // whole-file fallback that split into >1 chunk
+    /// Whole-file fallbacks that happened because a structural parser claimed
+    /// the file and extracted nothing — as opposed to no parser claiming it.
+    /// Counted separately because it is the signal that a parser has a gap
+    /// (the rust parser skipping non-`pub` items, say), and folding it into
+    /// `files_parsed_as_whole` would hide that.
+    pub files_parser_found_nothing: usize,
     pub oversize_lines_truncated: usize, // single lines over the ceiling, truncated head-only
     // Label distribution: "doc_type/language" → count, over every file the
     // classifier (or ext fallback) labeled this run. Surfaces a systematic
@@ -441,35 +447,62 @@ fn process_file(
         }
     };
 
-    let mut chunks =
-        match select_parser(classification.doc_type, classification.language, &extension) {
-            Some(parser) => match parser.parse(&content_str) {
-                Ok(chunks) => {
-                    report.files_parsed_via_parser += 1;
-                    chunks
-                }
-                Err(e) => {
-                    report
-                        .files_skipped
-                        .push((w.relative_path.clone(), format!("parse error: {e}")));
-                    return Ok(());
-                }
-            },
-            None => {
-                report.files_parsed_as_whole += 1;
-                // Whole-file fallback (plan docs + anything no parser claims) is
-                // windowed so a large file can't exceed the embedder input limit
-                // and abort the whole document (finding 5B). Small files still
-                // yield a single chunk, identical to the prior behavior.
-                let (fallback_chunks, truncated) =
-                    parse::whole_file_chunks(&content_str, classification.language, &filename);
-                if fallback_chunks.len() > 1 {
-                    report.files_windowed += 1;
-                }
-                report.oversize_lines_truncated += truncated;
-                fallback_chunks
+    // A structural parser that claims a file can still find nothing in it. The
+    // rust parser chunks per *exported* symbol, so `src/main.rs` — the only
+    // place execution modes are wired — yielded zero chunks and was skipped
+    // entirely: its clap `Cli`/`Command` definitions are private to the binary.
+    // Same for a re-export module, a markdown file with no `##` heading, or a
+    // proto file of bare imports.
+    //
+    // An empty parse means "this parser did not fit this file", which is the
+    // same situation as no parser claiming it — so it takes the same
+    // whole-file fallback rather than the file contributing nothing.
+    let parsed = match select_parser(classification.doc_type, classification.language, &extension) {
+        Some(parser) => match parser.parse(&content_str) {
+            Ok(chunks) => Some(chunks),
+            Err(e) => {
+                report
+                    .files_skipped
+                    .push((w.relative_path.clone(), format!("parse error: {e}")));
+                return Ok(());
             }
-        };
+        },
+        None => None,
+    };
+
+    let parser_found_nothing = parsed.as_ref().is_some_and(|c| c.is_empty());
+    let mut chunks = match parsed {
+        Some(chunks) if !chunks.is_empty() => {
+            report.files_parsed_via_parser += 1;
+            chunks
+        }
+        _ => {
+            // Blank content has nothing to fall back *to*: `whole_file_chunks`
+            // would happily emit one empty chunk, which embeds to noise and
+            // pollutes retrieval. Report it instead.
+            if content_str.trim().is_empty() {
+                report
+                    .files_skipped
+                    .push((w.relative_path.clone(), "file is empty".to_string()));
+                return Ok(());
+            }
+            report.files_parsed_as_whole += 1;
+            if parser_found_nothing {
+                report.files_parser_found_nothing += 1;
+            }
+            // Whole-file fallback (plan docs + anything no parser claims) is
+            // windowed so a large file can't exceed the embedder input limit
+            // and abort the whole document (finding 5B). Small files still
+            // yield a single chunk, identical to the prior behavior.
+            let (fallback_chunks, truncated) =
+                parse::whole_file_chunks(&content_str, classification.language, &filename);
+            if fallback_chunks.len() > 1 {
+                report.files_windowed += 1;
+            }
+            report.oversize_lines_truncated += truncated;
+            fallback_chunks
+        }
+    };
 
     let before = chunks.len();
     chunks.retain(|c| !secrets::looks_like_secret(&c.content));
@@ -508,15 +541,16 @@ fn process_file(
         .map(|(chunk, embedding)| ChunkWithEmbedding { chunk, embedding })
         .collect();
 
-    // Nothing to store. Two distinct causes, reported distinctly so the user can
-    // tell them apart: either the parser produced no chunks at all (the file
-    // isn't being parsed into anything indexable — e.g. a binary entrypoint with
-    // no exported symbols, or a re-export module), or it produced chunks that
-    // were all dropped by the secret scan. Conflating these as "secrets" hides
-    // files that silently contribute nothing to the index.
+    // Nothing to store. The ordinary cause is the secret scan dropping every
+    // chunk. `before == 0` used to mean "no parser found anything indexable"
+    // (a binary entrypoint with no exported symbols, a re-export module) — that
+    // path now takes the whole-file fallback above, and blank files return
+    // earlier still, so reaching it means a parser or the fallback broke its
+    // own contract. Reported rather than silently swallowed.
     if chunks_with_emb.is_empty() {
         let reason = if before == 0 {
-            "produced no chunks — nothing indexable parsed".to_string()
+            "produced no chunks — unexpected: the whole-file fallback should have caught this"
+                .to_string()
         } else {
             "all chunks dropped as secrets".to_string()
         };
@@ -599,14 +633,24 @@ pub fn format_report(report: &SyncReport) -> String {
             report.project, report.project_id
         );
         let _ = writeln!(out);
+        // Describes the *attribute*, not the tag. The tag is
+        // `defaults.context_tag` — configurable, and not visible from here —
+        // so naming it would be a guess. This line used to print
+        // `tag <{d}-context>`, which was the pre-P3 derived-tag shape and had
+        // been wrong since the domain moved into an attribute: it told the user
+        // to expect `<software-context>` while the hook emitted
+        // `<vault-context domain="software">`.
         match &report.domain {
             Some(d) => {
-                let _ = writeln!(out, "  Domain:                 {d} (tag <{d}-context>)");
+                let _ = writeln!(
+                    out,
+                    "  Domain:                 {d} (emitted as domain={d:?} on the context block)"
+                );
             }
             None => {
                 let _ = writeln!(
                     out,
-                    "  Domain:                 unassigned (uses defaults.context_tag)"
+                    "  Domain:                 unassigned (context block carries no domain attribute)"
                 );
             }
         }
@@ -636,6 +680,13 @@ pub fn format_report(report: &SyncReport) -> String {
             "  Parsed as whole-file:   {}",
             report.files_parsed_as_whole
         );
+        if report.files_parser_found_nothing > 0 {
+            let _ = writeln!(
+                out,
+                "    of which parser-empty:{} (a parser claimed it and extracted nothing)",
+                format_args!(" {}", report.files_parser_found_nothing)
+            );
+        }
         if report.files_windowed > 0 {
             let _ = writeln!(
                 out,
@@ -1328,10 +1379,61 @@ mod tests {
     // 5b. Parser produces zero chunks: reported as unparsed, not as a secret drop,
     // so the user can spot files that silently contribute nothing to the index.
     #[test]
-    fn file_with_no_indexable_chunks_is_reported_as_unparsed() {
-        let tmp = Tmp::new("no-chunks");
-        // .rs with no exported (pub) symbols → rust parser yields zero chunks.
-        tmp.write("empty.rs", b"// only a comment, no exported symbols\n");
+    fn a_file_a_parser_finds_nothing_in_falls_back_to_whole_file() {
+        let tmp = Tmp::new("parser-empty");
+        // A .rs the rust parser claims but finds no *items* in — only comments
+        // and `use` lines, neither of which is an `ItemKind`. Before the
+        // fallback this skipped the file outright.
+        //
+        // The original motivating case was `src/main.rs`, whose clap
+        // `Cli`/`Command` definitions are private to the binary. That one is
+        // now handled a layer earlier, by the parser indexing private items —
+        // this fallback is the floor beneath it, not the fix for it.
+        tmp.write(
+            "prelude.rs",
+            b"// re-export shim, nothing declared here\nuse std::fmt;\nuse std::io;\n",
+        );
+        let canonical = tmp.canonical();
+
+        let config = Config::default();
+        let mut store = StubStore::new();
+        let embedder = StubEmbedder::from_config(&config);
+        let classifier = ExtClassifier;
+
+        let walked = walk_repo(&canonical, &WalkOptions::default()).unwrap();
+        let report = sync_with(
+            1,
+            "p".to_string(),
+            &walked,
+            &mut store,
+            &embedder,
+            &classifier,
+        )
+        .unwrap();
+
+        assert!(
+            report.files_skipped.is_empty(),
+            "must be indexed, not skipped: {:?}",
+            report.files_skipped
+        );
+        assert!(
+            !store.upserts.borrow().is_empty(),
+            "the file's content must reach the store"
+        );
+        assert_eq!(report.files_parsed_as_whole, 1);
+        assert_eq!(
+            report.files_parser_found_nothing, 1,
+            "counted separately so a parser gap stays visible"
+        );
+        assert_eq!(report.files_parsed_via_parser, 0);
+    }
+
+    /// The one case with nothing to fall back to. `whole_file_chunks` would
+    /// emit a single empty chunk, which embeds to noise and pollutes retrieval.
+    #[test]
+    fn a_blank_file_is_skipped_rather_than_indexed_as_an_empty_chunk() {
+        let tmp = Tmp::new("blank");
+        tmp.write("blank.rs", b"   \n\t\n");
         let canonical = tmp.canonical();
 
         let config = Config::default();
@@ -1351,16 +1453,9 @@ mod tests {
         .unwrap();
 
         assert!(store.upserts.borrow().is_empty());
-        assert_eq!(
-            report.chunks_dropped_secret, 0,
-            "no secret was involved — must not be attributed to the secret scan"
-        );
         assert_eq!(report.files_skipped.len(), 1);
-        assert_eq!(report.files_skipped[0].0, "empty.rs");
-        assert_eq!(
-            report.files_skipped[0].1,
-            "produced no chunks — nothing indexable parsed"
-        );
+        assert_eq!(report.files_skipped[0].1, "file is empty");
+        assert_eq!(report.files_parsed_as_whole, 0);
     }
 
     // 6. Dry-run: stubs / classifier / embedder never touched; correct counters.
@@ -1697,6 +1792,49 @@ mod tests {
         assert!(s.contains("contract/proto"));
         // Widest key (convention/rust) needs no padding, so the count abuts it.
         assert!(s.contains("convention/rust  12"));
+    }
+
+    /// The sync report must not name a tag it cannot see.
+    ///
+    /// It printed `tag <software-context>` — the derived-tag shape P3 replaced —
+    /// so it promised a block the hook never emits. `format_report` has no
+    /// `Config`, so it cannot know `defaults.context_tag`; the domain attribute
+    /// is the part that is actually constant, and the part worth reporting.
+    #[test]
+    fn format_real_sync_reports_the_domain_attribute_not_a_derived_tag() {
+        let r = SyncReport {
+            project: "vault".into(),
+            dry_run: false,
+            domain: Some("software".into()),
+            ..SyncReport::default()
+        };
+        let s = format_report(&r);
+
+        assert!(
+            s.contains(r#"domain="software""#),
+            "should name the attribute it actually emits: {s}"
+        );
+        assert!(
+            !s.contains("software-context"),
+            "the pre-P3 derived tag must not reappear: {s}"
+        );
+    }
+
+    /// Unassigned means the attribute is *absent*, not that a different tag is
+    /// used — the earlier wording pointed at `defaults.context_tag` as though
+    /// the domain changed it.
+    #[test]
+    fn format_real_sync_says_an_unassigned_domain_emits_no_attribute() {
+        let r = SyncReport {
+            project: "vault".into(),
+            dry_run: false,
+            domain: None,
+            ..SyncReport::default()
+        };
+        let s = format_report(&r);
+
+        assert!(s.contains("no domain attribute"), "{s}");
+        assert!(!s.contains("-context>"), "{s}");
     }
 
     #[test]

@@ -58,6 +58,31 @@ impl QueryPlan {
     ///
     /// An empty `inventory` means "unknown" and prunes nothing — see
     /// [`Inventory::is_empty`].
+    /// Move `name` to the front of `projects`, inserting it if absent.
+    ///
+    /// This is the cwd bias (review C1). The hook receives Claude Code's `cwd`
+    /// on every prompt and used to discard it, while `projects.repo_path` sat
+    /// in the store unread — so the one signal that is *certain* about which
+    /// project you are in went unused, and the router's guess was the only
+    /// input.
+    ///
+    /// Deliberately additive. The router's projects are kept, because a prompt
+    /// asked from one repo about a sibling service is ordinary in a monorepo
+    /// and forcing it to the current directory would be worse than the guess.
+    /// Since `build_filter_clause` emits `project_id IN (...)`, order does not
+    /// affect *which* chunks match at all.
+    ///
+    /// What order does affect is `Store::resolve_domain`, which takes the first
+    /// named project that has a domain. Putting cwd first makes that resolution
+    /// deterministic rather than dependent on router output ordering — which is
+    /// the concrete half of review B4.
+    pub fn prefer_project(&mut self, name: String) {
+        // Case-insensitive, matching `existing_project_ids`' COLLATE NOCASE, so
+        // a router that returns "Vault" cannot produce a duplicate row here.
+        self.projects.retain(|p| !p.eq_ignore_ascii_case(&name));
+        self.projects.insert(0, name);
+    }
+
     pub fn retain_indexed(&mut self, inventory: &Inventory) {
         if inventory.is_empty() {
             return;
@@ -354,6 +379,52 @@ mod tests {
             doc_types,
             languages,
         }
+    }
+
+    /// The cwd bias is additive: the router's projects survive, because a
+    /// prompt asked from one repo about a sibling service is ordinary.
+    #[test]
+    fn prefer_project_prepends_without_dropping_the_routers_guesses() {
+        let mut plan = plan_with(vec![], vec![]);
+        plan.projects = vec!["build-service".into()];
+
+        plan.prefer_project("vault".into());
+
+        assert_eq!(
+            plan.projects,
+            vec!["vault".to_string(), "build-service".to_string()]
+        );
+    }
+
+    /// Already-present names move to the front rather than duplicating, and the
+    /// comparison is case-insensitive to match `existing_project_ids`' COLLATE
+    /// NOCASE — otherwise a router returning "Vault" would produce two rows for
+    /// one project and make domain resolution order-dependent again.
+    #[test]
+    fn prefer_project_dedupes_case_insensitively() {
+        let mut plan = plan_with(vec![], vec![]);
+        plan.projects = vec!["build-service".into(), "Vault".into()];
+
+        plan.prefer_project("vault".into());
+
+        assert_eq!(
+            plan.projects,
+            vec!["vault".to_string(), "build-service".to_string()],
+            "the existing casing variant must be replaced, not kept alongside"
+        );
+    }
+
+    /// The point of putting it first: `Store::resolve_domain` takes the first
+    /// named project that has a domain, so cwd-first makes that deterministic
+    /// instead of dependent on router output ordering (review B4).
+    #[test]
+    fn prefer_project_puts_cwd_first_for_domain_resolution() {
+        let mut plan = plan_with(vec![], vec![]);
+        plan.projects = vec!["a".into(), "b".into()];
+
+        plan.prefer_project("vault".into());
+
+        assert_eq!(plan.projects.first().map(String::as_str), Some("vault"));
     }
 
     /// The bug this exists for. `Language::Go` is a valid enum variant, so
