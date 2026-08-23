@@ -1,5 +1,6 @@
 use crate::retrieve::QueryPlan;
 use crate::store::types::{ChunkWithEmbedding, Document, Hit, RetrievalLogEntry};
+use crate::types::Inventory;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -68,6 +69,23 @@ pub trait Store {
     /// the Postgres placeholder inherit the no-domain default.
     fn resolve_domain(&self, _project_names: &[String]) -> Result<Option<String>, StoreError> {
         Ok(None)
+    }
+
+    /// Snapshot the distinct project names, languages, and doc_types that
+    /// actually have chunks, so the router can be told what exists instead of
+    /// guessing from the example list in its system prompt.
+    ///
+    /// Reads the `chunks` table, not `projects`/`documents`: a project row whose
+    /// every chunk was dropped by the secret pre-scan is not retrievable, and
+    /// naming it to the router would reintroduce exactly the phantom-value
+    /// problem this exists to close.
+    ///
+    /// **Provided default returns an empty [`Inventory`]**, which every consumer
+    /// reads as "unknown" and ignores — so test doubles and the Postgres
+    /// placeholder keep the pre-existing ungrounded behavior rather than having
+    /// all their filters pruned.
+    fn inventory(&self) -> Result<Inventory, StoreError> {
+        Ok(Inventory::default())
     }
 
     /// Assign `domain` to a project row, overwriting any existing assignment.

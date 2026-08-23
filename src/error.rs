@@ -46,7 +46,8 @@ pub enum VaultError {
     #[error("embedder construction failed: {0}")]
     EmbedderBuild(#[source] EmbedError),
 
-    /// Opening or migrating the store, including the embedding model/dim lock.
+    /// Opening or migrating the store, including the embedding model/dim lock
+    /// and the corpus snapshot `Vault::open` reads to ground the router.
     #[error("opening the store failed: {0}")]
     DbOpen(#[source] StoreError),
 

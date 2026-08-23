@@ -23,22 +23,33 @@ use crate::error::VaultError;
 use crate::index::sync::{self, SyncOptions, SyncReport};
 use crate::retrieve::{self, PlannedQuery, QueryPlan, Retrieval, Router, RouterOutput, SkipReason};
 use crate::store::{SqliteStore, Store};
+use crate::types::Inventory;
 
 /// The network-bound half of retrieval: decide what to look for, and vectorise
 /// the prompt. Shareable across threads.
 pub struct QueryPlanner {
     router: Box<dyn Router + Send + Sync>,
     embedder: Box<dyn Embedder + Send + Sync>,
+    inventory: Inventory,
 }
 
 impl QueryPlanner {
-    /// Build the configured router and embedder.
-    pub fn new(config: &Config) -> Result<Self, VaultError> {
+    /// Build the configured router and embedder around a corpus snapshot.
+    ///
+    /// `inventory` is what the store actually holds — see [`Inventory`]. It is
+    /// taken by value at construction rather than read per call because this
+    /// type is the `Send + Sync` half of the pipeline: holding a `Store` to
+    /// re-read it would drag a rusqlite `Connection` in and cost the shareable
+    /// property the whole split exists for. Pass [`Inventory::default`] when
+    /// there is no store to ask; the router then behaves exactly as it did
+    /// before grounding existed.
+    pub fn new(config: &Config, inventory: Inventory) -> Result<Self, VaultError> {
         let router = retrieve::build_router(config).map_err(VaultError::RouterBuild)?;
         let embedder = TeiEmbedder::from_config(config).map_err(VaultError::EmbedderBuild)?;
         Ok(Self {
             router,
             embedder: Box::new(embedder),
+            inventory,
         })
     }
 
@@ -50,8 +61,18 @@ impl QueryPlanner {
     pub(crate) fn from_parts(
         router: Box<dyn Router + Send + Sync>,
         embedder: Box<dyn Embedder + Send + Sync>,
+        inventory: Inventory,
     ) -> Self {
-        Self { router, embedder }
+        Self {
+            router,
+            embedder,
+            inventory,
+        }
+    }
+
+    /// The corpus snapshot this planner grounds the router with.
+    pub fn inventory(&self) -> &Inventory {
+        &self.inventory
     }
 
     /// Which backend the router resolved to — `"gemma"`, `"haiku"`, … Stable
@@ -74,9 +95,20 @@ impl QueryPlanner {
         if prompt.trim().is_empty() {
             return Ok(None);
         }
-        match self.router.plan(prompt).map_err(VaultError::RouterPlan)? {
+        match self
+            .router
+            .plan(prompt, &self.inventory)
+            .map_err(VaultError::RouterPlan)?
+        {
             RouterOutput::Skip => Ok(None),
-            RouterOutput::Plan(plan) => Ok(Some(plan)),
+            RouterOutput::Plan(mut plan) => {
+                // Grounding the prompt makes a phantom filter unlikely; this
+                // makes it impossible. The model is still a model, and a
+                // `languages: ["go"]` against a Rust-only vault is enum-valid,
+                // so nothing upstream of here would drop it.
+                plan.retain_indexed(&self.inventory);
+                Ok(Some(plan))
+            }
         }
     }
 
@@ -123,6 +155,11 @@ impl VaultStore {
         Self { store, config }
     }
 
+    /// Snapshot what is indexed, for grounding the router — see [`Inventory`].
+    pub fn inventory(&self) -> Result<Inventory, VaultError> {
+        self.store.inventory().map_err(VaultError::DbOpen)
+    }
+
     /// Run a planned query. This is the only segment a concurrent caller has to
     /// serialise, and it is milliseconds of SQLite — the expensive network work
     /// already happened in [`QueryPlanner`].
@@ -160,10 +197,14 @@ pub struct Vault {
 
 impl Vault {
     pub fn open(config: &Config) -> Result<Self, VaultError> {
-        Ok(Self {
-            planner: QueryPlanner::new(config)?,
-            store: VaultStore::open(config)?,
-        })
+        // Store first, planner second: the planner needs the corpus snapshot to
+        // ground the router, so the dependency now runs store -> planner. That
+        // also means a store-open failure is reported as a store-open failure
+        // rather than being masked by a router-build error for a backend the
+        // caller may not even reach (review D1).
+        let store = VaultStore::open(config)?;
+        let planner = QueryPlanner::new(config, store.inventory()?)?;
+        Ok(Self { planner, store })
     }
 
     /// Inject backends directly. Test-only on purpose: production always builds
@@ -211,6 +252,7 @@ mod tests {
     use crate::embed::StubEmbedder;
     use crate::retrieve::{RouterError, StubRouter};
     use crate::store::SqliteStore;
+    use crate::types::{DocType, Language};
 
     fn assert_send<T: Send>() {}
     fn assert_send_sync<T: Send + Sync>() {}
@@ -238,6 +280,7 @@ mod tests {
             QueryPlanner::from_parts(
                 Box::new(StubRouter),
                 Box::new(StubEmbedder::from_config(config)),
+                Inventory::default(),
             ),
             VaultStore::from_store(Box::new(store), config.clone()),
         )
@@ -265,7 +308,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "skip-stub"
         }
-        fn plan(&self, _prompt: &str) -> Result<RouterOutput, RouterError> {
+        fn plan(&self, _prompt: &str, _inventory: &Inventory) -> Result<RouterOutput, RouterError> {
             Ok(RouterOutput::Skip)
         }
     }
@@ -278,6 +321,7 @@ mod tests {
         let planner = QueryPlanner::from_parts(
             Box::new(SkipRouter),
             Box::new(StubEmbedder::from_config(&config)),
+            Inventory::default(),
         );
 
         assert!(planner.route("hi").expect("route").is_none());
@@ -292,6 +336,7 @@ mod tests {
         let planner = QueryPlanner::from_parts(
             Box::new(StubRouter),
             Box::new(StubEmbedder::from_config(&config)),
+            Inventory::default(),
         );
 
         let routed = planner.route("q").expect("route").expect("some plan");
@@ -305,12 +350,85 @@ mod tests {
         assert_eq!(combined.embedding, embedded);
     }
 
+    /// A router that names a language the vault does not hold — the exact
+    /// output the live Haiku router produced against this repo.
+    struct GoRouter;
+    impl Router for GoRouter {
+        fn name(&self) -> &'static str {
+            "go-stub"
+        }
+        fn plan(&self, _prompt: &str, _inventory: &Inventory) -> Result<RouterOutput, RouterError> {
+            Ok(RouterOutput::Plan(QueryPlan {
+                projects: vec!["vault".into()],
+                type_names: vec![],
+                topics: vec![],
+                doc_types: vec![DocType::Convention],
+                languages: vec![Language::Go],
+            }))
+        }
+    }
+
+    /// End-to-end proof of the backstop, at the seam that matters: whatever the
+    /// router says, the plan leaving `route` names only languages the store can
+    /// actually match.
+    ///
+    /// Grounding the prompt makes this unlikely; pruning makes it impossible.
+    /// Both are needed — the first is a model instruction, and a model can
+    /// ignore an instruction.
+    #[test]
+    fn route_prunes_a_language_the_store_does_not_have() {
+        let config = Config::default();
+        let planner = QueryPlanner::from_parts(
+            Box::new(GoRouter),
+            Box::new(StubEmbedder::from_config(&config)),
+            Inventory {
+                projects: vec!["vault".into()],
+                languages: vec![Language::Rust],
+                doc_types: vec![DocType::Convention],
+            },
+        );
+
+        let plan = planner
+            .route("how does the router work?")
+            .expect("route")
+            .expect("a plan");
+
+        assert!(
+            plan.languages.is_empty(),
+            "go has no chunks here and must not reach the store: {:?}",
+            plan.languages
+        );
+        assert_eq!(
+            plan.doc_types,
+            vec![DocType::Convention],
+            "the doc_type filter is real and must survive"
+        );
+    }
+
+    /// The same router against a planner with no inventory keeps the historical
+    /// behavior. A consumer that builds a `QueryPlanner` without a store must
+    /// not have its filters silently emptied.
+    #[test]
+    fn route_without_an_inventory_prunes_nothing() {
+        let config = Config::default();
+        let planner = QueryPlanner::from_parts(
+            Box::new(GoRouter),
+            Box::new(StubEmbedder::from_config(&config)),
+            Inventory::default(),
+        );
+
+        let plan = planner.route("q").expect("route").expect("a plan");
+
+        assert_eq!(plan.languages, vec![Language::Go]);
+    }
+
     #[test]
     fn backend_name_is_reported_for_telemetry() {
         let config = Config::default();
         let planner = QueryPlanner::from_parts(
             Box::new(StubRouter),
             Box::new(StubEmbedder::from_config(&config)),
+            Inventory::default(),
         );
         assert_eq!(planner.backend(), "stub");
     }

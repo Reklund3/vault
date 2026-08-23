@@ -17,7 +17,7 @@ pub(crate) use router::StubRouter;
 use crate::config::Config;
 use crate::error::VaultError;
 use crate::store::{Hit, Store};
-use crate::types::{DocType, Language};
+use crate::types::{DocType, Inventory, Language};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
@@ -33,6 +33,42 @@ pub struct QueryPlan {
     pub topics: Vec<String>,
     pub doc_types: Vec<DocType>,
     pub languages: Vec<Language>,
+}
+
+impl QueryPlan {
+    /// Drop `languages` and `doc_types` values that have no chunks in the store.
+    ///
+    /// `QueryPlan::from_raw` already drops labels outside the enums, but that
+    /// guard cannot see the corpus: `Go` is a valid `Language`, so a router that
+    /// guesses `go` against a Rust-only vault produces an enum-valid filter
+    /// matching zero rows. Today that is caught downstream by the relax-retry in
+    /// `Store::hybrid_search` — but only after a wasted filtered pass, and the
+    /// retry clears `languages` **and** `doc_types` together, so one hallucinated
+    /// language also discards a `doc_types` the router got right.
+    ///
+    /// Pruning here makes that trap deterministic instead of result-shaped: the
+    /// bad value never reaches SQL, and a good sibling filter survives. The
+    /// retry stays as the backstop for the case this cannot see — each field
+    /// individually populated, but their AND-combination empty.
+    ///
+    /// Scoped to exactly the two fields the retry has to rescue. `projects` is
+    /// deliberately left alone: `existing_project_ids` already degrades unknown
+    /// names at resolution time, case-insensitively, and duplicating that here
+    /// would risk diverging from its `COLLATE NOCASE` matching.
+    ///
+    /// An empty `inventory` means "unknown" and prunes nothing — see
+    /// [`Inventory::is_empty`].
+    pub fn retain_indexed(&mut self, inventory: &Inventory) {
+        if inventory.is_empty() {
+            return;
+        }
+        if !inventory.languages.is_empty() {
+            self.languages.retain(|l| inventory.languages.contains(l));
+        }
+        if !inventory.doc_types.is_empty() {
+            self.doc_types.retain(|d| inventory.doc_types.contains(d));
+        }
+    }
 }
 
 /// Everything the store query needs, and nothing that needs the store.
@@ -309,6 +345,122 @@ fn resolve_domain_label(store: &dyn Store, projects: &[String]) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plan_with(languages: Vec<Language>, doc_types: Vec<DocType>) -> QueryPlan {
+        QueryPlan {
+            projects: vec!["vault".into()],
+            type_names: vec![],
+            topics: vec![],
+            doc_types,
+            languages,
+        }
+    }
+
+    /// The bug this exists for. `Language::Go` is a valid enum variant, so
+    /// `QueryPlan::from_raw`'s drop-unrecognized guard passes it through; only
+    /// the corpus knows the vault holds no Go. Measured on the real store:
+    /// 238 rust / 66 markdown / 13 unknown chunks, zero go, and the router
+    /// still emitted `languages: ["go"]`.
+    #[test]
+    fn retain_indexed_drops_a_language_with_no_chunks() {
+        let inventory = Inventory {
+            projects: vec!["vault".into()],
+            languages: vec![Language::Rust, Language::Markdown],
+            doc_types: vec![DocType::Convention],
+        };
+        let mut plan = plan_with(vec![Language::Go, Language::Rust], vec![]);
+
+        plan.retain_indexed(&inventory);
+
+        assert_eq!(
+            plan.languages,
+            vec![Language::Rust],
+            "an enum-valid language with no chunks must not reach SQL"
+        );
+    }
+
+    /// The collateral damage the backstop removes. `hybrid_search`'s relax-retry
+    /// clears `languages` **and** `doc_types` together, so before this a single
+    /// hallucinated language also threw away a `doc_types` the router got right.
+    /// Pruning is per-field, so the good filter survives.
+    #[test]
+    fn retain_indexed_keeps_a_sibling_filter_the_relax_retry_would_have_cleared() {
+        let inventory = Inventory {
+            projects: vec!["vault".into()],
+            languages: vec![Language::Rust],
+            doc_types: vec![DocType::Contract, DocType::Convention],
+        };
+        let mut plan = plan_with(vec![Language::Go], vec![DocType::Contract]);
+
+        plan.retain_indexed(&inventory);
+
+        assert!(plan.languages.is_empty(), "the phantom language goes");
+        assert_eq!(
+            plan.doc_types,
+            vec![DocType::Contract],
+            "a doc_type that does have chunks must survive the language being pruned"
+        );
+    }
+
+    /// The invariant that keeps this from being a footgun: an empty inventory
+    /// means "unknown", not "nothing is indexed". Reading it the other way would
+    /// strip every filter off every plan the moment a backend does not implement
+    /// `Store::inventory` — which the provided default makes the common case.
+    #[test]
+    fn an_empty_inventory_prunes_nothing() {
+        let mut plan = plan_with(vec![Language::Go], vec![DocType::Contract]);
+        let before = plan.clone();
+
+        plan.retain_indexed(&Inventory::default());
+
+        assert_eq!(plan.languages, before.languages);
+        assert_eq!(plan.doc_types, before.doc_types);
+    }
+
+    /// A partially-populated inventory prunes only the fields it knows about.
+    /// A backend that can report languages but not doc_types must not have its
+    /// doc_types silently emptied.
+    #[test]
+    fn a_field_the_inventory_says_nothing_about_is_left_alone() {
+        let inventory = Inventory {
+            projects: vec![],
+            languages: vec![Language::Rust],
+            doc_types: vec![],
+        };
+        let mut plan = plan_with(vec![Language::Go], vec![DocType::Contract]);
+
+        plan.retain_indexed(&inventory);
+
+        assert!(plan.languages.is_empty(), "languages are known, so pruned");
+        assert_eq!(
+            plan.doc_types,
+            vec![DocType::Contract],
+            "doc_types are unknown to this inventory, so untouched"
+        );
+    }
+
+    /// Deliberate scope boundary. `existing_project_ids` already degrades an
+    /// unknown project name at resolution time, case-insensitively via
+    /// `COLLATE NOCASE`. Pruning here too would duplicate that matching in a
+    /// second place and risk the two drifting apart.
+    #[test]
+    fn retain_indexed_leaves_projects_to_the_store() {
+        let inventory = Inventory {
+            projects: vec!["vault".into()],
+            languages: vec![Language::Rust],
+            doc_types: vec![DocType::Convention],
+        };
+        let mut plan = plan_with(vec![], vec![]);
+        plan.projects = vec!["vault".into(), "not-a-real-project".into()];
+
+        plan.retain_indexed(&inventory);
+
+        assert_eq!(
+            plan.projects,
+            vec!["vault".to_string(), "not-a-real-project".to_string()],
+            "projects are the store's to resolve, not this function's"
+        );
+    }
     use crate::store::{ChunkWithEmbedding, Document, RetrievalLogEntry, SqliteStore, StoreError};
     use crate::types::DocType;
 

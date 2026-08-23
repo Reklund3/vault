@@ -8,6 +8,7 @@ use crate::retrieve::RouterOutput;
 use crate::retrieve::router::{
     ROUTER_SYSTEM, Router, RouterError, build_user_prompt, parse_response,
 };
+use crate::types::Inventory;
 
 // Timeout is configurable via [router].timeout (default 3s per CLAUDE.md).
 /// A handful of small arrays (or the skip shortcut). 1024 is generous headroom;
@@ -82,8 +83,8 @@ impl Router for OpenAiCompatRouter {
         "openai"
     }
 
-    fn plan(&self, prompt: &str) -> Result<RouterOutput, RouterError> {
-        let user = build_user_prompt(prompt);
+    fn plan(&self, prompt: &str, inventory: &Inventory) -> Result<RouterOutput, RouterError> {
+        let user = build_user_prompt(prompt, inventory);
         let request = ChatRequest {
             model: &self.model,
             temperature: 0.0,

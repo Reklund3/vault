@@ -157,13 +157,16 @@ pointing at.
 **D1** and **D2** are left over from the `lib-cli-split` code review; **D3** and
 **D4** were found on 2026-08-22 starting TEI for the test suite.
 
-- **D1. `Vault::open` builds the router before the store** (`src/vault.rs:164`):
-  `planner: QueryPlanner::new(config)?` runs before `store: VaultStore::open(...)`,
-  so a consumer that only wants to index gets `VaultError::RouterBuild` for a
-  backend `sync` never calls. `VaultStore::open` is the undocumented workaround.
-  The library/CLI split exists for a service or MCP consumer, and "index a repo" is
-  the first thing one does. Open the store first and build the planner lazily, or
-  document `VaultStore` as the indexing entry point.
+- **D1. `Vault::open` still builds a router an indexing-only consumer never
+  calls.** *Half-fixed 2026-08-22.* The ordering half is done — router grounding
+  made the planner depend on the store, so `Vault::open` now opens the store
+  first and a store failure is reported as one instead of being masked by a
+  `RouterBuild` error. What remains is that the planner is still built
+  **eagerly**, so a consumer that only wants to index still pays for router
+  construction and still gets `VaultError::RouterBuild` when the backend it
+  never uses is misconfigured. `VaultStore::open` remains the undocumented
+  workaround. Build the planner lazily, or document `VaultStore` as the
+  indexing entry point.
 
 - **D2. Temp-directory helpers are duplicated** — 15 `std::env::temp_dir()` sites
   across 10 files, up two during the review pass, which is the argument for fixing

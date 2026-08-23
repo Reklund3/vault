@@ -109,7 +109,7 @@ Execution modes from one binary, dispatched by subcommand in `main.rs`:
 ### Request Flow (hook mode)
 
 ```
-prompt → vault hook → Router extracts query plan
+prompt → vault hook → Router extracts query plan (grounded in the store's Inventory)
                       ├── primary:  Gemma at localhost:8080 (zero token cost)
                       └── fallback: Haiku via Anthropic API (~$0.0002/call, tiny prompt)
        → SQLite hybrid query (FTS5 BM25 + sqlite-vec cosine)
@@ -128,12 +128,12 @@ The router returns `{ skip: true }` for prompts that need no context — immedia
 | `src/vault.rs` | library facade — `QueryPlanner` (Send+Sync, network half), `VaultStore` (Send, owns the connection), `Vault` (both) |
 | `src/hook/mod.rs` | stdin→stdout hook protocol, full pipeline entry; outcome taxonomy (injected / skip / failed-at-stage) |
 | `src/hook/log.rs` | hook telemetry — one metadata-only JSONL record per call to `~/.vault/hook.log` (5MB rotation) |
-| `src/store/traits.rs` | `Store` trait + `StoreError` — backend abstraction; carries the embedding model/dim lock error |
+| `src/store/traits.rs` | `Store` trait + `StoreError` — backend abstraction; carries the embedding model/dim lock error; `inventory()` snapshots what is actually indexed |
 | `src/store/schema.rs` | embedded SQL, migration runner |
 | `src/store/sqlite_store.rs` | the live (SQLite-only) backend — upsert + sync-time prune (file/document/chunk diff, reconciles deletions every sync) **and** FTS5 + sqlite-vec hybrid retrieval, score merge, budget trim |
 | `src/store/postgresql_store.rs` | `PostgresStore` — `todo!()` placeholder for a future distributed backend (pgvector/tsvector); declared but not exported, not wired up |
 | `src/store/types.rs` | shared store types: `Document`, `Chunk`, `Hit`, `RetrievalLogEntry` |
-| `src/retrieve/router/mod.rs` | Router trait + auto/gemma/haiku/openai mode selection (auto's remote fallback set by `[router].remote`) |
+| `src/retrieve/router/mod.rs` | Router trait + auto/gemma/haiku/openai mode selection (auto's remote fallback set by `[router].remote`); `build_user_prompt` grounds the model in the store's `Inventory` |
 | `src/retrieve/router/gemma.rs` | Local Gemma impl (mlx_lm.server HTTP) |
 | `src/retrieve/router/haiku.rs` | Anthropic Haiku impl (sets `cache_control`; inert at current prompt size) |
 | `src/retrieve/router/openai_compat.rs` | Generic OpenAI-compatible impl (Gemini AI Studio / Vertex express / any `/chat/completions`); static key from `api_key_env`, Bearer or `x-goog-api-key` auth |
@@ -154,8 +154,55 @@ The router returns `{ skip: true }` for prompts that need no context — immedia
 | `src/diagnose/mod.rs` | `vault diagnose "<prompt>"` — full retrieval trace for tuning α and token budget |
 | `src/error.rs` | `VaultError` — the library-boundary error type; variants mirror pipeline failure points so `hook` can derive its telemetry `Stage` from them |
 | `src/config.rs` | `vault.toml` parsing — `Config`, `ConfigError`, context-tag fallback (`default_context_tag`), router/classifier mode + timeout knobs |
-| `src/types.rs` | top-level shared enums — `Language`, `DocType` (orthogonal axes used across parse/classify/router) |
+| `src/types.rs` | top-level shared enums — `Language`, `DocType` (orthogonal axes used across parse/classify/router); `Inventory`, the corpus snapshot that grounds the router |
 | `src/util/` | `fs.rs` (0700/0600 hardening for `~/.vault/`), `json.rs` (balanced-brace extraction from model replies), `path.rs` (`~` expansion), `probe.rs` (200ms loopback TCP probe for auto-mode) |
+
+### Router grounding
+
+The router is told what the store actually holds. `Store::inventory()` snapshots
+the distinct project names, languages, and doc_types that **have chunks**, and
+`build_user_prompt` renders that into the router's *user* turn:
+
+```
+Indexed in this vault:
+  projects:  vault
+  languages: markdown, rust, unknown
+  doc_types: convention, meta, plan
+```
+
+It goes in the user turn, never in `ROUTER_SYSTEM`: the system block is what the
+Haiku backend marks `cache_control: ephemeral`, and a per-machine corpus listing
+there would make the cache key per-machine.
+
+Grounding is an instruction, so it is backed by a deterministic check.
+`QueryPlan::retain_indexed` drops `languages`/`doc_types` values with no chunks
+before the plan reaches SQL. `QueryPlan::from_raw` cannot do this — it only drops
+labels outside the enums, and `Go` *is* a `Language`, so a router guessing `go`
+against a Rust-only vault produced an enum-valid filter matching zero rows. That
+was caught downstream by the relax-retry in `Store::hybrid_search`, but only
+after a wasted filtered pass, and that retry clears `languages` **and**
+`doc_types` together — so one bad language also discarded a good `doc_type`.
+
+Scope and invariants:
+
+- **`projects` is not pruned.** `existing_project_ids` already degrades unknown
+  names case-insensitively (`COLLATE NOCASE`); duplicating that would risk the
+  two matchers drifting apart.
+- **An empty `Inventory` means "unknown", not "nothing is indexed"** — it renders
+  no grounding and prunes nothing. The `Store::inventory` default returns empty,
+  so a backend that does not implement it keeps the old ungrounded behavior
+  instead of having every filter stripped.
+- **The snapshot is read once**, at `Vault::open`, and can go stale against a
+  concurrent sync. Re-reading per call would put SQLite back on `QueryPlanner`,
+  the `Send + Sync` half. Stale only costs plan quality; the store still filters.
+- **`Vault::open` now opens the store before building the planner**, since the
+  planner needs the snapshot.
+- Project names are attacker-influenced (a directory basename), unlike the two
+  enum-backed lists. Names carrying control characters are dropped rather than
+  escaped, and the listing is capped at `MAX_LISTED_PROJECTS`.
+
+`vault diagnose` prints the snapshot on an `indexed:` line, so a pruned filter is
+distinguishable from a filter the router never proposed.
 
 ### Router selection
 

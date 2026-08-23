@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, ToSql, params};
@@ -8,7 +9,7 @@ use crate::retrieve::QueryPlan;
 use crate::store::schema;
 use crate::store::traits::{Store, StoreError};
 use crate::store::types::{ChunkWithEmbedding, Document, Hit, RetrievalLogEntry};
-use crate::types::DocType;
+use crate::types::{DocType, Inventory, Language};
 use crate::util::fs::{harden_dir, harden_file};
 
 pub struct SqliteStore {
@@ -165,6 +166,69 @@ impl Store for SqliteStore {
             }
         }
         Ok(None)
+    }
+
+    fn inventory(&self) -> Result<Inventory, StoreError> {
+        // Three cheap DISTINCT scans over `chunks`. Only values with at least
+        // one chunk are reported: a language whose every chunk was dropped by
+        // the secret pre-scan is not retrievable, so naming it to the router
+        // would be the same phantom-value problem in a new place.
+        //
+        // Unparseable stored labels are skipped rather than failing the call.
+        // This runs on the hook path via `Vault::open`, where the fail-open
+        // contract makes "ground with what parsed" strictly better than
+        // "abort retrieval over one bad row".
+        let mut projects = Vec::new();
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT p.name FROM projects p
+                 JOIN chunks c ON c.project_id = p.id
+                 ORDER BY p.name",
+            )
+            .map_err(backend_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(backend_err)?;
+        for row in rows {
+            projects.push(row.map_err(backend_err)?);
+        }
+        drop(stmt);
+
+        let mut languages = Vec::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT language FROM chunks ORDER BY language")
+            .map_err(backend_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(backend_err)?;
+        for row in rows {
+            if let Ok(lang) = Language::from_str(&row.map_err(backend_err)?) {
+                languages.push(lang);
+            }
+        }
+        drop(stmt);
+
+        let mut doc_types = Vec::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT doc_type FROM chunks ORDER BY doc_type")
+            .map_err(backend_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(backend_err)?;
+        for row in rows {
+            if let Ok(dt) = doc_type_from_str(&row.map_err(backend_err)?) {
+                doc_types.push(dt);
+            }
+        }
+
+        Ok(Inventory {
+            projects,
+            languages,
+            doc_types,
+        })
     }
 
     fn set_project_domain(&mut self, project_id: i64, domain: &str) -> Result<(), StoreError> {
@@ -442,12 +506,31 @@ fn escape_fts_token(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+/// Build the FTS5 `MATCH` expression from the plan's keyword fields.
+///
+/// Each value is emitted as **one quoted string**, so a multi-word topic is an
+/// FTS5 *phrase* and matches only where those words appear adjacently. That
+/// looks like a bug and is not — it was tried the other way and measured worse.
+///
+/// Splitting `"backend selection"` into `"backend" OR "selection"` widened the
+/// BM25 arm from 16 of 317 chunks to 69 and did raise the right chunks' scores,
+/// because they finally matched on both arms. But it *lowered their rank*: the
+/// generic halves of a conceptual phrase match a great deal of unrelated code,
+/// so `fn run`, `get_or_create_project` and `bm25_search` all acquired BM25
+/// scores on the strength of the word "selection" and displaced the answer.
+/// Top-6 precision on the tuning prompt went from 5/6 to 4/6, and the two
+/// intruders cost 883 tokens of budget.
+///
+/// Kept as a phrase, the keyword arm is a precision instrument: it contributes
+/// when the exact concept is present and contributes *nothing* otherwise,
+/// leaving the ranking to cosine — which is the arm that is consistently right.
+/// Widening it is not the fix; `[defaults].alpha` is (see review B5).
+///
+/// The quoting is also what neutralizes FTS5 syntax — a bare `OR`, `NEAR`, `-`,
+/// `*` or `(` from router output would otherwise parse as an operator.
 fn build_match_query(plan: &QueryPlan) -> Option<String> {
     let mut tokens: Vec<String> = Vec::new();
-    for t in &plan.type_names {
-        tokens.push(escape_fts_token(t));
-    }
-    for t in &plan.topics {
+    for t in plan.type_names.iter().chain(plan.topics.iter()) {
         tokens.push(escape_fts_token(t));
     }
     if tokens.is_empty() {
@@ -650,6 +733,129 @@ mod tests {
             token_est: 10,
             chunk_index: idx,
         }
+    }
+
+    /// The grounding snapshot the router is handed. Everything it reports must
+    /// be backed by a real chunk: the whole point is to stop the router naming
+    /// values that match nothing, so a snapshot that itself contains phantoms
+    /// would just move the bug.
+    #[test]
+    fn inventory_reports_only_values_that_have_chunks() {
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+        let vault_id = create_project(&store, "vault");
+        // A project row with no documents at all. It exists, but nothing in it
+        // is retrievable, so naming it to the router would be a phantom filter.
+        create_project(&store, "never-synced");
+
+        store
+            .upsert_document(
+                &Document {
+                    project_id: vault_id,
+                    doc_type: DocType::Convention,
+                    source_path: "src/lib.rs".into(),
+                    title: "lib.rs".into(),
+                    content_hash: "hr".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: lang_chunk(Language::Rust, "Widget", "fn widget", 0),
+                    embedding: unit_embedding(0),
+                }],
+            )
+            .unwrap();
+        store
+            .upsert_document(
+                &Document {
+                    project_id: vault_id,
+                    doc_type: DocType::Plan,
+                    source_path: "docs/plan.md".into(),
+                    title: "plan".into(),
+                    content_hash: "hm".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: lang_chunk(Language::Markdown, "Plan", "# the plan", 0),
+                    embedding: unit_embedding(1),
+                }],
+            )
+            .unwrap();
+
+        let inv = store.inventory().unwrap();
+
+        assert_eq!(
+            inv.projects,
+            vec!["vault".to_string()],
+            "a project with no chunks must not be listed"
+        );
+        assert_eq!(inv.languages, vec![Language::Markdown, Language::Rust]);
+        assert_eq!(inv.doc_types, vec![DocType::Convention, DocType::Plan]);
+        assert!(
+            !inv.languages.contains(&Language::Go),
+            "Go is enum-valid but absent from this store — that is the whole bug"
+        );
+    }
+
+    /// An unindexed store reports an empty inventory, which every consumer
+    /// reads as "unknown": no grounding rendered, no filters pruned. It must not
+    /// be mistaken for "the corpus is genuinely empty".
+    #[test]
+    fn inventory_of_an_empty_store_is_empty() {
+        let config = Config::default();
+        let store = SqliteStore::open_in_memory(&config).unwrap();
+
+        assert!(store.inventory().unwrap().is_empty());
+    }
+
+    fn topic_plan(topics: &[&str]) -> QueryPlan {
+        QueryPlan {
+            projects: vec![],
+            type_names: vec![],
+            topics: topics.iter().map(|t| t.to_string()).collect(),
+            doc_types: vec![],
+            languages: vec![],
+        }
+    }
+
+    /// Pins the phrase behaviour so it is not "fixed" again.
+    ///
+    /// Emitting `"backend selection"` as one quoted phrase requires adjacency,
+    /// which looks like an obvious defect — it was changed to `"backend" OR
+    /// "selection"` and measured worse: top-6 precision on the tuning prompt
+    /// fell from 5/6 to 4/6 as generic word matches displaced the answer. See
+    /// `build_match_query`'s doc comment for the numbers.
+    #[test]
+    fn a_multi_word_topic_stays_one_phrase_deliberately() {
+        let q = build_match_query(&topic_plan(&["backend selection"])).expect("a query");
+
+        assert_eq!(
+            q, r#""backend selection""#,
+            "splitting this into OR-ed words was tried and measured worse"
+        );
+    }
+
+    /// Router output is untrusted-shaped: a bare `OR`/`NEAR`/`-`/`*` must be
+    /// searched for, not parsed as FTS5 syntax. The quoting is what guarantees
+    /// that, and an embedded quote has to be doubled or the expression breaks.
+    #[test]
+    fn fts_operators_from_the_router_stay_inert() {
+        let q = build_match_query(&topic_plan(&["auth OR -admin", "say \"hi\""])).expect("a query");
+
+        assert_eq!(q, r#""auth OR -admin" OR "say ""hi""""#);
+    }
+
+    /// Each keyword value is its own OR-ed term, so one topic matching nothing
+    /// cannot void the others.
+    #[test]
+    fn keyword_values_are_or_ed_not_and_ed() {
+        let q = build_match_query(&topic_plan(&["routing", "backend selection"])).expect("a query");
+
+        assert_eq!(q, r#""routing" OR "backend selection""#);
+    }
+
+    /// A plan with no keyword fields has no BM25 arm at all — the cosine arm
+    /// still runs, so this is a valid state rather than an error.
+    #[test]
+    fn a_plan_with_no_keywords_produces_no_match_query() {
+        assert!(build_match_query(&topic_plan(&[])).is_none());
     }
 
     fn set_domain(store: &SqliteStore, project_id: i64, domain: &str) {

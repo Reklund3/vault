@@ -15,7 +15,7 @@
 mod common;
 
 use common::{TmpDir, config_in, offline_config_in, plan_for};
-use vault::{Interaction, QueryPlanner, Retrieval, SkipReason, SyncOptions, VaultStore};
+use vault::{Interaction, Inventory, QueryPlanner, Retrieval, SkipReason, SyncOptions, VaultStore};
 
 /// Opening a store creates and migrates the database, in the directory the
 /// caller named rather than `~/.vault`.
@@ -199,7 +199,8 @@ fn a_blank_prompt_never_reaches_the_router() {
     // port: if the guard under test regressed, `route` would try to reach it and
     // return `Err`, which the `expect` below turns into a failure rather than
     // the `Ok(None)` this asserts.
-    let planner = QueryPlanner::new(&config).expect("gemma-mode planner builds offline");
+    let planner = QueryPlanner::new(&config, Inventory::default())
+        .expect("gemma-mode planner builds offline");
 
     for prompt in ["", "   ", "\n\t "] {
         assert!(

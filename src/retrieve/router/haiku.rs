@@ -8,6 +8,7 @@ use crate::retrieve::RouterOutput;
 use crate::retrieve::router::{
     ROUTER_SYSTEM, Router, RouterError, build_user_prompt, parse_response,
 };
+use crate::types::Inventory;
 
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -54,8 +55,8 @@ impl Router for HaikuRouter {
         "haiku"
     }
 
-    fn plan(&self, prompt: &str) -> Result<RouterOutput, RouterError> {
-        let user = build_user_prompt(prompt);
+    fn plan(&self, prompt: &str, inventory: &Inventory) -> Result<RouterOutput, RouterError> {
+        let user = build_user_prompt(prompt, inventory);
         let request = MessagesRequest {
             model: &self.model,
             max_tokens: MAX_TOKENS,
@@ -264,7 +265,10 @@ mod tests {
         let config = Config::default();
         let router = HaikuRouter::from_config_with_timeout(&config, LIVE_TIMEOUT).expect("client");
         let out = router
-            .plan("How does the BuildRequest proto handle retries?")
+            .plan(
+                "How does the BuildRequest proto handle retries?",
+                &Inventory::default(),
+            )
             .expect("plan");
         let _ = out;
     }
@@ -278,7 +282,7 @@ mod tests {
         // produces that shape for a trivial prompt, so the skip path fires.
         let config = Config::default();
         let router = HaikuRouter::from_config_with_timeout(&config, LIVE_TIMEOUT).expect("client");
-        let out = router.plan("hi").expect("plan");
+        let out = router.plan("hi", &Inventory::default()).expect("plan");
         assert!(
             matches!(out, RouterOutput::Skip),
             "expected Skip for trivial prompt, got {:?}",

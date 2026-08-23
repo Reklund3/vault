@@ -1,5 +1,6 @@
 use crate::retrieve::router::{Router, RouterError};
 use crate::retrieve::{QueryPlan, RouterOutput};
+use crate::types::Inventory;
 
 /// Test-only router that returns an empty `QueryPlan` for any input. NOT a
 /// production fallback — `auto` mode picks Gemma or Haiku, never this. The
@@ -11,7 +12,7 @@ impl Router for StubRouter {
         "stub"
     }
 
-    fn plan(&self, _prompt: &str) -> Result<RouterOutput, RouterError> {
+    fn plan(&self, _prompt: &str, _inventory: &Inventory) -> Result<RouterOutput, RouterError> {
         Ok(RouterOutput::Plan(QueryPlan {
             projects: vec![],
             type_names: vec![],

@@ -365,7 +365,7 @@ mod tests {
     use crate::retrieve::{Router, RouterOutput};
     use crate::store::Store;
     use crate::store::{ChunkWithEmbedding, Document, Hit, RetrievalLogEntry, StoreError};
-    use crate::types::DocType;
+    use crate::types::{DocType, Inventory};
     use crate::vault::{QueryPlanner, VaultStore};
 
     /// Fake store that returns a canned list of hits regardless of query —
@@ -448,7 +448,7 @@ mod tests {
         store: Box<dyn Store + Send>,
     ) -> Vault {
         Vault::from_parts(
-            QueryPlanner::from_parts(router, embedder),
+            QueryPlanner::from_parts(router, embedder, Inventory::default()),
             VaultStore::from_store(store, config.clone()),
         )
     }
@@ -472,7 +472,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "skip-stub"
         }
-        fn plan(&self, _prompt: &str) -> Result<RouterOutput, RouterError> {
+        fn plan(&self, _prompt: &str, _inventory: &Inventory) -> Result<RouterOutput, RouterError> {
             Ok(RouterOutput::Skip)
         }
     }
@@ -483,7 +483,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "err-stub"
         }
-        fn plan(&self, _prompt: &str) -> Result<RouterOutput, RouterError> {
+        fn plan(&self, _prompt: &str, _inventory: &Inventory) -> Result<RouterOutput, RouterError> {
             Err(RouterError::Transport("connection refused".into()))
         }
     }

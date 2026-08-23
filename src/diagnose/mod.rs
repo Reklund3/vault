@@ -9,8 +9,8 @@ use crate::retrieve::{
     PlannedQuery, QueryPlan, ResolvedBackend, RouterOutput, SearchTrace, build_router,
     resolve_backend, search_traced,
 };
-use crate::store::SqliteStore;
-use crate::types::{DocType, Language};
+use crate::store::{SqliteStore, Store};
+use crate::types::{DocType, Inventory, Language};
 
 type CliResult = Result<(), Box<dyn Error + Send + Sync>>;
 
@@ -73,17 +73,31 @@ pub fn run(args: Args) -> CliResult {
     let cli =
         Overrides::from_args(&args).map_err(|e| -> Box<dyn Error + Send + Sync> { e.into() })?;
 
+    // Opened before the router runs, because the router is grounded with what
+    // this store actually holds. `--no-router` still opens it — the trace prints
+    // store-derived results either way.
+    let db_path = config.db_path()?;
+    let store = SqliteStore::open(&db_path, &config)?;
+    let inventory = store.inventory()?;
+
     let (router_status, plan) = if args.no_router {
         (RouterStatus::Bypassed, Some(cli.clone().into_plan()))
     } else {
         let backend = resolve_backend(&config);
         let router = build_router(&config)?;
-        match router.plan(&args.prompt)? {
+        match router.plan(&args.prompt, &inventory)? {
             RouterOutput::Skip => (RouterStatus::Skip { backend }, None),
-            RouterOutput::Plan(p) => (
-                RouterStatus::Plan { backend },
-                Some(merge_overrides(p, &cli)),
-            ),
+            RouterOutput::Plan(mut p) => {
+                // Prune before merging overrides, never after: an explicit
+                // `--languages go` is the operator deliberately probing a filter
+                // that matches nothing, and silently discarding it would break
+                // the one tool for observing that path.
+                p.retain_indexed(&inventory);
+                (
+                    RouterStatus::Plan { backend },
+                    Some(merge_overrides(p, &cli)),
+                )
+            }
         }
     };
 
@@ -103,6 +117,7 @@ pub fn run(args: Args) -> CliResult {
         budget_tokens,
         min_score,
         max_hits,
+        inventory: &inventory,
         used_stub,
     });
 
@@ -114,9 +129,6 @@ pub fn run(args: Args) -> CliResult {
             return Ok(());
         }
     };
-
-    let db_path = config.db_path()?;
-    let store = SqliteStore::open(&db_path, &config)?;
 
     // The same call `vault hook` makes. Everything below is a view of its
     // result, not a second implementation — see `SearchTrace`.
@@ -221,6 +233,11 @@ struct TraceHeader<'a> {
     /// bounds the result set: without it on screen, a cap doing the trimming
     /// looks exactly like a scoring problem.
     max_hits: Option<usize>,
+    /// What the store actually holds. Printed because it now *shapes* the plan
+    /// twice over — it is rendered into the router's user turn, and it prunes
+    /// enum-valid values the router returns anyway. Without it on screen a
+    /// pruned filter looks like a router that never proposed one.
+    inventory: &'a Inventory,
     used_stub: bool,
 }
 
@@ -256,6 +273,24 @@ fn print_header(h: &TraceHeader<'_>) {
         println!(
             "           doc_types={:?}  languages={:?}",
             doc_types, languages,
+        );
+    }
+    if h.inventory.is_empty() {
+        println!("indexed:   (nothing — router ungrounded, no pruning applied)");
+    } else {
+        println!("indexed:   projects={:?}", h.inventory.projects);
+        println!(
+            "           doc_types={:?}  languages={:?}",
+            h.inventory
+                .doc_types
+                .iter()
+                .map(|d| d.as_str())
+                .collect::<Vec<_>>(),
+            h.inventory
+                .languages
+                .iter()
+                .map(|l| l.as_str())
+                .collect::<Vec<_>>(),
         );
     }
     if h.overrides.is_empty() {

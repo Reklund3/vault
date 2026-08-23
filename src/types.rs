@@ -85,3 +85,38 @@ impl FromStr for Language {
         }
     }
 }
+
+/// A snapshot of what is actually indexed, taken from the store and handed to
+/// the router so it stops guessing.
+///
+/// The router is otherwise blind to the corpus: `QueryPlanner` holds no
+/// connection by design (see `crate::vault`), and the user turn was the prompt
+/// verbatim, so the model picked `languages` off the example list in the system
+/// prompt. Against a Rust-only vault that reliably produced `languages:
+/// ["go"]` — enum-valid, so `QueryPlan::from_raw`'s drop-unrecognized guard let
+/// it through, and it matched zero chunks.
+///
+/// This is a **snapshot**, not a live view. It is read once when the planner is
+/// built and can go stale against a concurrent `index sync`; that is deliberate,
+/// since re-reading it per call would put a SQLite query back on the
+/// `Send + Sync` half of the pipeline. Stale only costs plan quality — every
+/// value is still filtered by the store at query time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Inventory {
+    pub projects: Vec<String>,
+    pub languages: Vec<Language>,
+    pub doc_types: Vec<DocType>,
+}
+
+impl Inventory {
+    /// No inventory available — an unindexed store, a backend that does not
+    /// implement the query, or a planner built without one.
+    ///
+    /// This means **"unknown"**, never "nothing is indexed". Both consumers
+    /// treat it as a no-op: no grounding is added to the router prompt, and
+    /// `QueryPlan::retain_indexed` prunes nothing. Reading it the other way
+    /// would make an empty inventory strip every filter off every plan.
+    pub fn is_empty(&self) -> bool {
+        self.projects.is_empty() && self.languages.is_empty() && self.doc_types.is_empty()
+    }
+}

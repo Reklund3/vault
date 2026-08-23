@@ -9,6 +9,7 @@ use crate::retrieve::RouterOutput;
 use crate::retrieve::router::{
     ROUTER_SYSTEM, Router, RouterError, build_user_prompt, parse_response,
 };
+use crate::types::Inventory;
 
 // Timeout is configurable via [router].timeout (default 3s per CLAUDE.md).
 // The hook caller silences failures (passthrough), so the router's only job is
@@ -52,8 +53,8 @@ impl Router for GemmaRouter {
         "gemma"
     }
 
-    fn plan(&self, prompt: &str) -> Result<RouterOutput, RouterError> {
-        let user = build_user_prompt(prompt);
+    fn plan(&self, prompt: &str, inventory: &Inventory) -> Result<RouterOutput, RouterError> {
+        let user = build_user_prompt(prompt, inventory);
         let request = ChatRequest {
             model: &self.model,
             temperature: 0.0,
@@ -250,7 +251,10 @@ mod tests {
         let config = Config::default();
         let router = GemmaRouter::from_config_with_timeout(&config, LIVE_TIMEOUT).expect("client");
         let out = router
-            .plan("How does the BuildRequest proto handle retries?")
+            .plan(
+                "How does the BuildRequest proto handle retries?",
+                &Inventory::default(),
+            )
             .expect("plan");
         // Don't assert exact shape — model output drifts. Just confirm it parses.
         let _ = out;
@@ -265,7 +269,7 @@ mod tests {
         // produces that shape for a trivial prompt, so the skip path fires.
         let config = Config::default();
         let router = GemmaRouter::from_config_with_timeout(&config, LIVE_TIMEOUT).expect("client");
-        let out = router.plan("hi").expect("plan");
+        let out = router.plan("hi", &Inventory::default()).expect("plan");
         assert!(
             matches!(out, RouterOutput::Skip),
             "expected Skip for trivial prompt, got {:?}",
