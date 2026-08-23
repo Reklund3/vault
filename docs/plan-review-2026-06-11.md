@@ -153,11 +153,34 @@ pointing at.
   only. One decision — add the columns and write to it, or drop the table and log
   to a file.
 
-- **B5 — scoring calibration.** BM25 normalises against the result-set max, so the
-  top keyword hit always scores 1.0 and every final score is ≥ α; scores are not
-  comparable across queries. Candidate replacements are already written up in the
-  plan's Step-3 section. The calculation change is **gated on C2**; raw scores are
-  retained per `Hit`, so no migration is needed.
+- **B5 — scoring calibration.** Two defects, not one. *Across* queries, BM25
+  normalises against the result-set max, so the top keyword hit always scores
+  1.0 and scores are not comparable between prompts. *Within* a query — measured
+  2026-08-23, and the one that actually bites — the arms are wildly
+  incommensurate: `bm25_normalized` spans 0–1 while `cosine` is used **raw**, and
+  its observed range on this corpus is 0.619–0.709. At α=0.3 that is 0.300 of
+  BM25 variation against 0.063 of cosine, so the documented "60/40 blend" is
+  nearer 92/8, and the arms only balance around α≈0.08.
+
+  Now measurable via C2. What the fixture set has already established:
+
+  - **α=0.1 is the optimum** (first-rank total 7, vs 11 at the 0.6 default), and
+    **α=0.0 collapses to 20** — three cases lose their answer entirely. The
+    keyword arm is load-bearing, just weighted ~6× too heavily.
+  - **RRF is not the fix.** Recomputed offline over real scores, k=60 was
+    *identical* to the current linear blend: with only 8 of 46 candidates
+    carrying a BM25 rank it degenerates to cosine-plus-a-nudge. It had been
+    recommended repeatedly on theory before being measured.
+  - **Min-max normalising both arms** is the promising candidate — it moved
+    `fn build_router` from #9 to #1 on the tuning prompt — but it was derived
+    from that *one* prompt, which is the only fixture with headroom. Four of
+    five cases already sit at #1, so it can help one and risk four. Re-run
+    `alpha_sweep` against any change before believing it.
+  - Min-max interacts with `min_score`: once both arms are stretched to 0–1
+    per query, `0.15` stops being an absolute quality bar, since a uniformly
+    irrelevant result set is stretched to fill the range.
+
+  Raw scores are retained per `Hit`, so no migration is needed.
 
 - **B8 — `chunks_vec` has no delete trigger while FTS5 does.** Deliberate — a
   vec0-referencing trigger breaks every delete when the extension is not loaded —
@@ -187,9 +210,24 @@ pointing at.
   failure semantics and needs its own design pass; it also only helps when the
   router is down *and* TEI is up.
 
-- **C2. No eval ground truth.** The tuning loop optimises retrieval against itself.
-  A golden-prompt fixture set (prompt → expected chunk labels) would anchor alpha
-  and budget tuning. Unblocked; blocks B5.
+- ~~**C2. No eval ground truth.**~~ — **closed 2026-08-23.**
+  `src/retrieve/golden.toml` holds the fixture set (9 corpus files, 5 cases) and
+  `src/retrieve/eval.rs` the harness: real files, production parsers, real TEI
+  embeddings, no classifier (`doc_type`/`language` come from an extension rule,
+  so a run costs nothing and cannot drift with a model). Cases assert on chunk
+  **labels**, never content, so ordinary refactors do not break them.
+
+  Three entry points: `golden_prompts_retrieve_their_expected_chunks` is the
+  gate, `alpha_sweep` is the tuning loop, and
+  `fixtures_are_well_formed_and_the_corpus_exists` runs in normal CI without TEI
+  so a deleted corpus path fails immediately. That last one earned its keep on
+  the first run by catching a missing corpus file.
+
+  It unblocked **B5** and immediately corrected two conclusions reached from a
+  single prompt — see there.
+
+  Five cases is a floor. The suite should grow whenever a retrieval bug is
+  found, the same way a regression test does.
 
 - **C3. The trust model is unverifiable by the binary.** The injection defence is a
   hand-maintained file vault never checks. It now exists (P3), which moves this from

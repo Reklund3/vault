@@ -1,4 +1,6 @@
 pub mod budget;
+#[cfg(test)]
+mod eval;
 pub mod hybrid;
 mod router;
 
@@ -36,28 +38,6 @@ pub struct QueryPlan {
 }
 
 impl QueryPlan {
-    /// Drop `languages` and `doc_types` values that have no chunks in the store.
-    ///
-    /// `QueryPlan::from_raw` already drops labels outside the enums, but that
-    /// guard cannot see the corpus: `Go` is a valid `Language`, so a router that
-    /// guesses `go` against a Rust-only vault produces an enum-valid filter
-    /// matching zero rows. Today that is caught downstream by the relax-retry in
-    /// `Store::hybrid_search` — but only after a wasted filtered pass, and the
-    /// retry clears `languages` **and** `doc_types` together, so one hallucinated
-    /// language also discards a `doc_types` the router got right.
-    ///
-    /// Pruning here makes that trap deterministic instead of result-shaped: the
-    /// bad value never reaches SQL, and a good sibling filter survives. The
-    /// retry stays as the backstop for the case this cannot see — each field
-    /// individually populated, but their AND-combination empty.
-    ///
-    /// Scoped to exactly the two fields the retry has to rescue. `projects` is
-    /// deliberately left alone: `existing_project_ids` already degrades unknown
-    /// names at resolution time, case-insensitively, and duplicating that here
-    /// would risk diverging from its `COLLATE NOCASE` matching.
-    ///
-    /// An empty `inventory` means "unknown" and prunes nothing — see
-    /// [`Inventory::is_empty`].
     /// Move `name` to the front of `projects`, inserting it if absent.
     ///
     /// This is the cwd bias (review C1). The hook receives Claude Code's `cwd`
@@ -83,6 +63,28 @@ impl QueryPlan {
         self.projects.insert(0, name);
     }
 
+    /// Drop `languages` and `doc_types` values that have no chunks in the store.
+    ///
+    /// `QueryPlan::from_raw` already drops labels outside the enums, but that
+    /// guard cannot see the corpus: `Go` is a valid `Language`, so a router that
+    /// guesses `go` against a Rust-only vault produces an enum-valid filter
+    /// matching zero rows. Today that is caught downstream by the relax-retry in
+    /// `Store::hybrid_search` — but only after a wasted filtered pass, and the
+    /// retry clears `languages` **and** `doc_types` together, so one hallucinated
+    /// language also discards a `doc_types` the router got right.
+    ///
+    /// Pruning here makes that trap deterministic instead of result-shaped: the
+    /// bad value never reaches SQL, and a good sibling filter survives. The
+    /// retry stays as the backstop for the case this cannot see — each field
+    /// individually populated, but their AND-combination empty.
+    ///
+    /// Scoped to exactly the two fields the retry has to rescue. `projects` is
+    /// deliberately left alone: `existing_project_ids` already degrades unknown
+    /// names at resolution time, case-insensitively, and duplicating that here
+    /// would risk diverging from its `COLLATE NOCASE` matching.
+    ///
+    /// An empty `inventory` means "unknown" and prunes nothing — see
+    /// [`Inventory::is_empty`].
     pub fn retain_indexed(&mut self, inventory: &Inventory) {
         if inventory.is_empty() {
             return;
