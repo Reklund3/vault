@@ -47,10 +47,19 @@ model key, a diagnose-side timeout override, a hook-side hard clamp.
 
 ### ~~P3. The injection-framing contract is unsatisfied.~~ — CLOSED 2026-08-22
 
-`~/.claude/settings.json` has a `UserPromptSubmit` entry; `~/.claude/CLAUDE.md`
-does not exist. Vault deliberately never sanitises chunk text, so that file is the
-whole defence — `docs/security.md` lists it as defence #1 and `CLAUDE.md` states it
-"handles this for Claude".
+As originally written: `~/.claude/CLAUDE.md` did not exist. Vault deliberately
+never sanitises chunk text, so that file is the whole defence — `docs/security.md`
+lists it as defence #1 and `CLAUDE.md` states it "handles this for Claude".
+
+**Correction (2026-08-22).** An earlier revision of this section claimed
+`~/.claude/settings.json` holds a vault `UserPromptSubmit` entry. It does not —
+verified by parsing the file: one matcher group, and its handler is not vault's.
+The claim came from a `grep -c UserPromptSubmit` that counted the event name.
+Nothing has ever been injected on this machine; all retrieval to date has run
+through `vault diagnose`. This does not reopen P3 — the framing file exists and
+is correct — but it does mean the hook-registration check in **C3** currently
+has nothing to pass, and that registering the hook is a prerequisite for P1's
+latency problem to be observable in practice.
 
 Nothing has actually been injected on this machine yet: all 13 `hook.log` records
 are failures (`router-build` ×7 for a missing key, `stdin` ×3, `config` ×1, 2 skips)
