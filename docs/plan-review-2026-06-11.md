@@ -164,9 +164,19 @@ pointing at.
 
   Now measurable via C2. What the fixture set has already established:
 
-  - **α=0.1 is the optimum** (first-rank total 7, vs 11 at the 0.6 default), and
-    **α=0.0 collapses to 20** — three cases lose their answer entirely. The
-    keyword arm is load-bearing, just weighted ~6× too heavily.
+  - **α is now 0.1 by default**, changed in `Config::default()` and the seeded
+    template on 2026-08-23. Rank-of-first-expected summed over five cases:
+
+    | α | 0.6 | 0.4 | 0.3 | 0.2 | 0.15 | 0.1 | 0.05 | 0.0 |
+    |---|-----|-----|-----|-----|------|-----|------|-----|
+    | total | 11 | 9 | 9 | 9 | 8 | **7** | 6 | 20 |
+
+    0.05 scores one point better but is where the first case starts regressing
+    (`score blending` 1 → 2), so it trades an optimal case for one that was
+    already suboptimal. **0.0 collapses to 20** — three cases lose their answer
+    outright, so the keyword arm is load-bearing, just weighted ~6× too heavily.
+    0.1 is the last value at which no case has regressed, with 0.05 as a
+    measured buffer beneath it.
   - **RRF is not the fix.** Recomputed offline over real scores, k=60 was
     *identical* to the current linear blend: with only 8 of 46 candidates
     carrying a BM25 rank it degenerates to cosine-plus-a-nudge. It had been

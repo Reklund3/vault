@@ -5,7 +5,8 @@
 [defaults]
 context_tag  = "vault-context"   # fallback tag if a project has no domain assignment
 token_budget = 10000             # max tokens of context injected per prompt
-alpha        = 0.6               # BM25/cosine weight — 0.0 = pure semantic, 1.0 = pure keyword
+alpha        = 0.1               # BM25/cosine weight — 0.0 = pure semantic, 1.0 = pure keyword
+                                 # 0.1 measured against the golden fixtures; do not set 0.0
 min_score    = 0.15              # drop hits scoring below this
 # max_hits   = 4                 # optional hard cap on how many chunks are injected,
                                  # best final_score first. Omitted = uncapped: only

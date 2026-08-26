@@ -376,7 +376,7 @@ impl Default for Config {
             defaults: Defaults {
                 context_tag: "vault-context".to_string(),
                 token_budget: 10000,
-                alpha: 0.6,
+                alpha: 0.1,
                 min_score: 0.15,
                 max_hits: None,
             },

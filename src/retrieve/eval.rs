@@ -276,7 +276,7 @@ mod tests {
         let (fx, _config, embedder, store) = harness();
 
         println!("\n{:<34}alpha → rank of first expected chunk", "case");
-        let alphas = [0.6_f32, 0.4, 0.3, 0.2, 0.1, 0.0];
+        let alphas = [0.6_f32, 0.4, 0.3, 0.2, 0.15, 0.1, 0.05, 0.0];
         print!("{:<34}", "");
         for a in alphas {
             print!("{a:>7}");

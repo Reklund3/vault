@@ -113,7 +113,7 @@ prompt → vault hook → Router extracts query plan (grounded in the store's In
                       ├── primary:  Gemma at localhost:8080 (zero token cost)
                       └── fallback: Haiku via Anthropic API (~$0.0002/call, tiny prompt)
        → SQLite hybrid query (FTS5 BM25 + sqlite-vec cosine)
-       → score merge (α=0.6 BM25, 0.4 cosine) + token budget (10k)
+       → score merge (α=0.1 BM25, 0.9 cosine) + token budget (10k)
        → emit <{domain-context}> block on stdout → Claude Code appends it → Anthropic API
 ```
 
@@ -290,7 +290,7 @@ See `docs/embeddings.md` for the full write-up. Current decisions (subject to ch
 
 The remaining open knobs are empirical, not blocking:
 
-- α tuning (BM25 vs cosine weight) — start 0.6, validate with `vault diagnose`
+- α tuning (BM25 vs cosine weight) — 0.1, measured with `cargo test --lib alpha_sweep -- --ignored --nocapture`
 - Token budget ceiling — start 10k, validate with `vault diagnose`
 - Context block ordering — score-descending within project grouping for now
 
@@ -322,7 +322,7 @@ any file a parser claims but extracts nothing from**) is **windowed**: content u
 
 ```
 final_score = α * bm25_normalized + (1 - α) * cos_sim
-α = 0.6 (initial), MinChunkScore = 0.15, TokenBudget = 10_000, MaxHits = uncapped
+α = 0.1, MinChunkScore = 0.15, TokenBudget = 10_000, MaxHits = uncapped
 ```
 
 Three independent limits bound the budget pass, all in `vault.toml` under `[defaults]`:
@@ -336,6 +336,29 @@ Three independent limits bound the budget pass, all in `vault.toml` under `[defa
 `max_hits` is `Option<u16>`, `#[serde(default)]`, so an existing `vault.toml` without
 it keeps the historical uncapped behavior. Set it when you want a *few* strong chunks
 rather than as many as fit — a 10k budget will happily inject twenty mediocre ones.
+
+**α defaults to 0.1, and that is measured, not guessed.** The two arms are not
+comparable as written: `bm25_normalized` is divided by the result-set max so it
+spans 0–1, while `cosine` is used raw and its observed range on a real corpus is
+about 0.62–0.71. At α=0.6 that is 0.60 of BM25 variation against 0.04 of cosine
+— a nominal "60/40 blend" that behaves nearer 92/8. The golden fixtures
+(`src/retrieve/golden.toml`) put numbers on it, as rank-of-first-expected-chunk
+summed over five cases:
+
+| α | 0.6 | 0.4 | 0.3 | 0.2 | 0.15 | 0.1 | 0.05 | 0.0 |
+|---|-----|-----|-----|-----|------|-----|------|-----|
+| total | 11 | 9 | 9 | 9 | 8 | **7** | 6 | 20 |
+
+0.05 scores marginally better but is where the first case starts regressing, and
+**0.0 collapses**: with the keyword arm contributing nothing, three of five cases
+lose their answer entirely. The arm is load-bearing — it was just weighted about
+six times too heavily. 0.1 is the last value at which no case has regressed.
+
+Re-run the sweep after any change to scoring, chunking, or the embedding model:
+
+```bash
+cargo test --lib alpha_sweep -- --ignored --nocapture   # needs TEI
+```
 
 Tune `alpha` via `vault diagnose "<prompt>" --alpha X` after seeding real data; the other three are config-only, not diagnose flags. `vault diagnose` prints all four in its header and labels a trim `max_hits cap` or `min_score/budget` (`trim_cause`) — it separates the cap from the scoring limits, not `min_score` from `token_budget` — so a cap doing the cutting can't be mistaken for a scoring problem. Budget fill is score-descending with `continue` (not `break`) on oversized chunks, but `break`s once `max_hits` is reached, since nothing later can outrank what is already selected.
 
