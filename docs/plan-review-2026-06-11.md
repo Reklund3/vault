@@ -182,9 +182,17 @@ pointing at.
 
   Raw scores are retained per `Hit`, so no migration is needed.
 
-- **B8 — `chunks_vec` has no delete trigger while FTS5 does.** Deliberate — a
-  vec0-referencing trigger breaks every delete when the extension is not loaded —
-  but undocumented. Write it down as part of A5.
+- ~~**B8 — `chunks_vec` has no delete trigger while FTS5 does.**~~ — **closed
+  2026-08-23.** The rationale is now on `SCHEMA_V1` in `src/store/schema.rs` and
+  in `vault-plan.md`'s schema section, with a pointer in the DDL itself. It is
+  also *enforced*: `schema::b8::no_trigger_references_the_vec_table` fails if a
+  trigger ever names `chunks_vec`, since the obvious "fix" for the missing
+  trigger is the bug — SQLite compiles trigger bodies when they fire, so one
+  would break every delete in any process without sqlite-vec loaded.
+
+  It did not need to wait for A5. What A5 still inherits is the hand-maintained
+  invariant this documents: `vault index remove` will be a **third** path that
+  deletes chunks, so it needs its own `DELETE FROM chunks_vec` and its own test.
 
 ---
 
@@ -329,8 +337,8 @@ reproduced live on 2026-08-23. **D5** was found the same day, by hitting it.
 
 ## Doc-sync checklist
 
-- [ ] `vault-plan.md` indexing section: add the `chunks_vec` delete-trigger
-      rationale (B8) — the A5/A9 reconciliations are done.
+- [x] `vault-plan.md` indexing section: `chunks_vec` delete-trigger rationale
+      (B8) — done 2026-08-23. The A5/A9 reconciliations were already done.
 - [ ] `vault-plan.md` tracking items: P1, P3, P4, B1/B3, C1, C2.
 - [ ] `vault-plan.md` chunking section: rust chunks all visibilities now, not
       just exported symbols, and a parser that extracts nothing takes the

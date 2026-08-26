@@ -263,6 +263,25 @@ creation, so it can't live in the fixed-text const), and stamps
 new columns (e.g. `projects.domain`) are folded into the base schema rather than
 added as incremental steps.
 
+**`chunks_fts` has insert/update/delete triggers; `chunks_vec` has none.** That
+asymmetry is deliberate, not an oversight (review B8). FTS5 is compiled into the
+bundled SQLite, so a trigger body naming `chunks_fts` always compiles.
+`chunks_vec` is a `vec0` virtual table from sqlite-vec, registered as a *runtime*
+auto-extension — and SQLite compiles a trigger body when the trigger fires, so a
+trigger naming `chunks_vec` would make **every** delete from `chunks` fail in any
+process that has not loaded the extension: the `sqlite3` CLI, a backup script, a
+future migration tool. A missing optional extension would become a database that
+cannot be pruned or repaired, including by the tooling you would reach for to
+repair it.
+
+Vec rows are therefore deleted explicitly, at the two places that remove chunks —
+`SqliteStore::upsert_document` (replacing a document's chunks) and
+`SqliteStore::prune_orphans` (reconciling deletions at sync time). The cost is a
+hand-maintained invariant: a **third** delete path would silently orphan its
+`chunks_vec` rows, so any new one needs its own `DELETE FROM chunks_vec` and its
+own test. `schema::b8::no_trigger_references_the_vec_table` enforces the absence,
+because the obvious "fix" for the missing trigger is the bug.
+
 `chunks_vec` is created at the configured dim and vec0 fixes that dimension at
 table creation, so the embedding stack is locked the first time a DB is opened.
 `verify_or_init_embedding(model, dim)` is the lock: on a fresh DB it writes

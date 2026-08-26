@@ -6,6 +6,31 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::store::traits::StoreError;
 
+/// The v1 DDL every connection runs at open.
+///
+/// **`chunks_fts` has insert/update/delete triggers; `chunks_vec` has none, and
+/// that asymmetry is deliberate (review B8).**
+///
+/// FTS5 is compiled into the bundled SQLite, so a trigger body referencing
+/// `chunks_fts` can always be compiled. `chunks_vec` is a `vec0` virtual table
+/// from sqlite-vec, which this process registers as a *runtime* auto-extension
+/// (see `VEC_INIT` below). SQLite compiles a trigger body when the trigger
+/// fires, so a trigger referencing `chunks_vec` would make **every** delete
+/// from `chunks` fail in any process that has not loaded sqlite-vec — the
+/// `sqlite3` CLI, a backup script, a future migration tool. That turns a
+/// missing optional extension into a database that cannot be pruned or
+/// repaired, including by the tooling you would reach for to fix it.
+///
+/// So vec rows are deleted explicitly instead, at the two places that remove
+/// chunks: `SqliteStore::upsert_document` (replacing a document's chunks) and
+/// `SqliteStore::prune_orphans` (reconciling deletions at sync time). Both are
+/// covered by tests — `upsert_replaces_existing_chunks` asserts no vec row
+/// leaks, and `prune_orphans_cleans_chunks_vec` covers the sync-time path.
+///
+/// The cost is that this is a hand-maintained invariant: a **third** path that
+/// deletes from `chunks` would silently orphan its `chunks_vec` rows, since
+/// nothing in the schema enforces the pairing. Any new delete path needs its own
+/// `DELETE FROM chunks_vec` and its own test.
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
     id         INTEGER PRIMARY KEY,
@@ -90,7 +115,47 @@ CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
     INSERT INTO chunks_fts(chunks_fts, rowid, label, content)
     VALUES ('delete', old.id, old.label, old.content);
 END;
+
+-- There is deliberately NO matching trigger for chunks_vec. See the note in
+-- Rust above `SCHEMA_V1` before adding one (review B8).
 "#;
+
+#[cfg(test)]
+mod b8 {
+    use super::*;
+
+    /// Pins the deliberate asymmetry documented on `SCHEMA_V1` (review B8).
+    ///
+    /// A trigger referencing `chunks_vec` compiles only where sqlite-vec is
+    /// loaded, and SQLite compiles trigger bodies when they fire — so adding one
+    /// would make every delete from `chunks` fail in the `sqlite3` CLI, a backup
+    /// script, or any tool that has not registered the extension. The obvious
+    /// "fix" for the missing trigger is the bug, which is why this is a test and
+    /// not only a comment.
+    #[test]
+    fn no_trigger_references_the_vec_table() {
+        let conn = open_in_memory().expect("open");
+        migrate(&conn, 8).expect("migrate");
+
+        let mut stmt = conn
+            .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'")
+            .expect("prepare");
+        let triggers: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
+
+        assert!(!triggers.is_empty(), "expected the chunks_fts triggers");
+        for (name, sql) in &triggers {
+            assert!(
+                !sql.contains("chunks_vec"),
+                "trigger {name} references chunks_vec; see the note on SCHEMA_V1 \
+                 — vec cleanup is explicit in upsert_document and prune_orphans"
+            );
+        }
+    }
+}
 
 static VEC_INIT: Once = Once::new();
 
