@@ -21,6 +21,10 @@ const READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Last N lines `vault tei logs` prints.
 const LOG_TAIL_LINES: usize = 200;
 
+/// Last N lines printed inline when a start fails. Short on purpose: enough to
+/// carry the actual error, not so much that it buries the message above it.
+const FAILURE_LOG_TAIL_LINES: usize = 15;
+
 #[derive(Debug, thiserror::Error)]
 pub enum LauncherError {
     #[error(transparent)]
@@ -44,6 +48,12 @@ pub enum LauncherError {
 
     #[error("invalid pidfile {path}: {detail}")]
     BadPidFile { path: String, detail: String },
+
+    #[error(
+        "TEI (pid {pid}) exited immediately after starting — see the log tail above, \
+         or run `vault tei logs`"
+    )]
+    ChildDied { pid: u32 },
 }
 
 // ----------------------------------------------------------------------------
@@ -87,13 +97,14 @@ pub(crate) fn start(config: &Config) -> Result<(), LauncherError> {
     command.stderr(Stdio::from(log_err));
     detach(&mut command);
 
-    let child = command.spawn().map_err(|source| LauncherError::Spawn {
+    let mut child = command.spawn().map_err(|source| LauncherError::Spawn {
         program: program.clone(),
         source,
     })?;
     let pid = child.id();
-    // Intentionally do NOT wait on `child`: it is detached and must outlive us.
-    // Dropping the handle leaks it; the OS reparents the process when we exit.
+    // Intentionally do NOT *block* on `child`: it is detached and must outlive
+    // us. The handle is kept so the readiness loop can `try_wait()` it, which
+    // is non-blocking and reaps only a child that has already exited.
 
     let pid_path = vault_dir.join(PID_FILE);
     fs::write(&pid_path, pid.to_string())?;
@@ -109,6 +120,29 @@ pub(crate) fn start(config: &Config) -> Result<(), LauncherError> {
         if tei_reachable(endpoint) {
             println!("TEI is reachable on {endpoint}.");
             return Ok(());
+        }
+        // `spawn()` only proves the *launcher* started. With the Docker
+        // launcher that is the client, not the server — so a failed
+        // `docker run` (image missing, daemon unreachable, port already bound)
+        // exits within a second and every later claim about "the TEI process"
+        // is false (review D3). Check each poll rather than only at the end,
+        // so a dead child is reported in ~250ms instead of after the full
+        // readiness timeout.
+        //
+        // `try_wait`, not `process_alive`: we never block on this child, so an
+        // exited one is a **zombie** until reaped, and `kill -0` reports a
+        // zombie as alive. That is why the first cut of this fix still printed
+        // "TEI process is running" for `/usr/bin/false`. `status` has no handle
+        // and must use `process_alive`, but there the parent is gone and init
+        // has reaped it, so the pid genuinely disappears.
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            println!(
+                "TEI (pid {pid}) exited immediately — it is not running.\n\
+                 The launcher command started but its process died; the real error is in the log."
+            );
+            print_log_tail(&log_path, FAILURE_LOG_TAIL_LINES);
+            let _ = fs::remove_file(&pid_path);
+            return Err(LauncherError::ChildDied { pid });
         }
         std::thread::sleep(READY_POLL_INTERVAL);
     }
@@ -161,10 +195,21 @@ pub(crate) fn status(config: &Config) -> Result<(), LauncherError> {
     let pid = read_pid(&pid_path)?;
 
     println!("endpoint:  {endpoint}");
-    println!("reachable: {}", if reachable { "yes" } else { "no" });
+    // "serving", not "reachable": this is now a GET /health, so a yes means the
+    // server can actually answer rather than that a port is bound (D4).
+    println!("serving:   {}", if reachable { "yes" } else { "no" });
+    // A pidfile is a claim, not a fact. Reporting its contents unchecked is how
+    // `status` came to print `pid 33619` for a process that had not existed for
+    // hours, with its container long gone (review D3).
     match pid {
-        Some(p) => println!("pidfile:   {} (pid {p})", pid_path.display()),
-        None => println!("pidfile:   none ({})", pid_path.display()),
+        Some(p) if process_alive(p) => {
+            println!("process:   running (pid {p})")
+        }
+        Some(p) => println!(
+            "process:   NOT running — stale pidfile at {} (pid {p}); `vault tei stop` clears it",
+            pid_path.display()
+        ),
+        None => println!("process:   no pidfile at {}", pid_path.display()),
     }
     match config.embedding_launcher_cmd() {
         Some(cmd) => println!("launcher:  {cmd}"),
@@ -349,6 +394,69 @@ fn detach(command: &mut Command) {
 #[cfg(not(any(unix, windows)))]
 fn detach(_command: &mut Command) {}
 
+/// Whether `pid` names a live process.
+///
+/// `kill -0` performs the existence and permission checks without sending a
+/// signal — the standard liveness test. Shelling out rather than taking a
+/// `libc` dependency, matching `kill` below: `libc` is a dev-dependency here,
+/// and promoting it to a build dependency for one call would contradict a
+/// decision this file already documents.
+///
+/// Two caveats, both acceptable for the use here. A pid can be recycled, so a
+/// `true` means "some process with this id exists". And a process owned by
+/// another user reports `EPERM`, which we read as dead — irrelevant for a pid
+/// vault spawned itself. Both are strictly better than the previous behaviour,
+/// which was to assume the pidfile was true (review D3).
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_alive(_pid: u32) -> bool {
+    // Unknown platform: assume alive rather than report a false death, which
+    // would turn a working start into an error.
+    true
+}
+
+/// Print the last `n` lines of the log inline. Used when a start fails, because
+/// the real error is in the log and the user should not have to be told to go
+/// look for it — that indirection is what made the original D3 failure opaque.
+fn print_log_tail(log_path: &Path, n: usize) {
+    let Ok(contents) = fs::read_to_string(log_path) else {
+        return;
+    };
+    let lines: Vec<&str> = contents.lines().collect();
+    if lines.is_empty() {
+        return;
+    }
+    let start = lines.len().saturating_sub(n);
+    println!(
+        "\n--- {} (last {} lines) ---",
+        log_path.display(),
+        lines.len() - start
+    );
+    for line in &lines[start..] {
+        println!("{line}");
+    }
+}
+
 /// Terminate a pid. Dep-free by shelling out to the platform's own tool rather
 /// than pulling in `libc` / `windows` for one call. Returns whether the kill
 /// reported success — a `false` typically means the process was already gone,
@@ -383,6 +491,84 @@ fn kill(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D3's core predicate. `start` and `status` both claimed things about "the
+    /// TEI process" on the strength of a pidfile alone; this is what they now
+    /// ask instead.
+    #[test]
+    fn process_alive_distinguishes_a_live_pid_from_a_dead_one() {
+        assert!(
+            process_alive(std::process::id()),
+            "this test's own process must read as alive"
+        );
+
+        // Spawn something trivial, wait for it, then ask about the reaped pid.
+        // Not a made-up number: a pid that was never used and one that has
+        // exited are different states, and it is the second that `start` hit.
+        let mut child = Command::new("true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        child.wait().expect("wait");
+
+        assert!(
+            !process_alive(pid),
+            "a reaped pid ({pid}) must not read as alive — that is the D3 bug"
+        );
+    }
+
+    /// The trap the first cut of the D3 fix fell into.
+    ///
+    /// `start` deliberately never blocks on its child, so an exited child is a
+    /// **zombie** until something reaps it — and `kill -0` reports a zombie as
+    /// alive. A liveness check built on `process_alive` therefore still printed
+    /// "TEI process is running" for a launcher that had already died. `start`
+    /// uses `try_wait` on the handle it owns; `process_alive` is only for
+    /// `status`, which has a pid and no handle.
+    #[test]
+    fn a_zombie_child_reads_as_alive_which_is_why_start_uses_try_wait() {
+        let mut child = Command::new("false")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+
+        // Give it a moment to exit without reaping it.
+        for _ in 0..100 {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // `try_wait` saw the exit — the check `start` actually relies on.
+        assert!(
+            matches!(child.try_wait(), Ok(Some(_)) | Ok(None)),
+            "try_wait must not error on an already-reaped child"
+        );
+    }
+
+    /// The failure path prints the log inline rather than telling the user to go
+    /// find it. The original D3 report was opaque precisely because the real
+    /// error only ever reached `~/.vault/tei.log`.
+    #[test]
+    fn print_log_tail_is_bounded_and_survives_a_missing_file() {
+        let dir = std::env::temp_dir().join(format!("vault-tail-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let log = dir.join("tei.log");
+
+        // Missing file must not panic — it is the normal case for a launcher
+        // that failed before writing anything.
+        print_log_tail(&log, 5);
+
+        let body: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        fs::write(&log, body).expect("write");
+        print_log_tail(&log, FAILURE_LOG_TAIL_LINES);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn split_command_simple() {

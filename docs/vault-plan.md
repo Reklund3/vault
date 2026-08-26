@@ -810,7 +810,7 @@ vault/                           -- source repository
         ├── fs.rs                -- 0700/0600 hardening for ~/.vault/
         ├── json.rs             -- balanced-brace extraction from model replies
         ├── path.rs             -- `~` expansion
-        └── probe.rs            -- 200ms loopback TCP probe for auto-mode
+        └── probe.rs            -- 200ms TCP probe (mlx auto-mode); HTTP /health for TEI
 
 ~/.vault/                        -- runtime data (never in source repo)
 ├── vault.db                     -- SQLite store (projects incl. domain, documents, chunks,
@@ -1001,7 +1001,7 @@ vault diagnose "<prompt>" --top 20       # limit displayed results (default 10)
                                           # (override the router plan); --stub (deterministic embedder); --no-router
 
 # TEI lifecycle (embedding service — runs as a separate process by design)
-vault tei start                           # spawn TEI from [embeddings].launcher_cmd; detach; write PID file; no-op if already reachable
+vault tei start                           # spawn TEI from [embeddings].launcher_cmd; detach; write PID file; no-op if already serving
 vault tei stop                            # terminate the recorded PID (kill on Unix, taskkill /F on Windows); clear pidfile
 vault tei status                          # endpoint reachability, pidfile/PID, configured launcher_cmd
 vault tei logs                            # print the tail of ~/.vault/tei.log
@@ -1026,9 +1026,23 @@ vault tei logs                            # print the tail of ~/.vault/tei.log
   written `0600` and the dir `0700` (best-effort, Unix).
 - Cross-platform detach: `process_group(0)` on Unix (stable std, no `libc`
   dependency), `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS` on Windows.
-- `start` is a no-op when TEI is already reachable, then polls the endpoint
-  for ~20 s and reports readiness (first-run weight downloads can exceed that;
-  the process keeps running — `vault tei logs` shows progress).
+- `start` is a no-op when TEI is already serving, then polls the endpoint for
+  ~20 s and reports readiness (first-run weight downloads can exceed that; the
+  process keeps running — `vault tei logs` shows progress).
+- **"Serving", not "listening."** The TEI probe is an HTTP `GET /health`, not a
+  TCP connect (review D4): Docker publishes a container's port at container
+  start, well before TEI binds its HTTP server, so a TCP probe reports a healthy
+  server that cannot answer a single embed. `vault tei status` prints
+  `serving:` for the same reason. The MLX probe is still TCP-only — it runs at
+  process startup under a 200 ms budget, and is tracked under P1.
+- **`start` verifies the child lived** before claiming success (review D3).
+  `spawn()` only proves the *launcher* started, which for the Docker launcher is
+  the client rather than the server; a failed `docker run` exits within a second.
+  On a dead child `start` prints the log tail inline, clears the pidfile, and
+  exits non-zero. The check is `Child::try_wait`, not a pid liveness test: the
+  child is never waited on, so an exited one is a zombie and `kill -0` would
+  report it alive. `status`, which holds only a pid, uses the liveness test and
+  distinguishes a running process from a stale pidfile.
 - If `[embeddings].launcher_cmd` is unset, `vault tei start` errors clearly,
   printing an example `launcher_cmd` line to copy into `vault.toml`.
 - **The hook never auto-spawns TEI.** Cold-start blows the 3 s budget;

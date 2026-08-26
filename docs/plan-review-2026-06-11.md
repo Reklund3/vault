@@ -283,34 +283,41 @@ reproduced live on 2026-08-23. **D5** was found the same day, by hitting it.
   `PathBuf`, so a panicking test leaks the file and nothing ever removes the
   `-wal`/`-shm` sidecars holding whatever that test indexed.
 
-- **D3. `vault tei start` reports success for a child that has already died.**
-  `spawn()` succeeds when the *launcher* starts — for the Docker launcher that is
-  the client, not the server. `start` writes the pidfile and prints
-  `Started TEI (pid N)` without checking (`src/tei/launcher.rs:90-104`); the
-  readiness loop then prints *"TEI process is running but the endpoint is not
-  answering yet — first run can take minutes"* and returns `Ok(())`. Every clause is
-  false when the client died. Observed with a leftover `Exited (0)` container
-  `--rm` had not cleaned up; the real error was only in `~/.vault/tei.log`.
-  Fix: check liveness before claiming success, and tail the log when it fails.
+- ~~**D3. `vault tei start` reports success for a child that has already
+  died.**~~ — **closed 2026-08-23.** `spawn()` only proves the *launcher*
+  started; with the Docker launcher that is the client, not the server. `start`
+  now checks the child on every readiness poll and, when it has exited, prints
+  the last 15 log lines inline, removes the pidfile, and returns
+  `LauncherError::ChildDied` — exit 1 instead of the previous exit 0 with three
+  false sentences.
 
-  **`vault tei status` has the same blind spot** (observed 2026-08-23): it
-  printed `pidfile: ~/.vault/tei.pid (pid 33619)` for a process that did not
-  exist and a container that was gone. It reports the pidfile's *contents*, not
-  whether the pid is alive. Whatever liveness check `start` gains, `status`
-  needs too.
+  The check is `Child::try_wait`, **not** the `process_alive` helper, and the
+  difference is the whole bug. `start` deliberately never blocks on its child,
+  so an exited child is a *zombie* until reaped — and `kill -0` reports a zombie
+  as alive. The first cut of this fix used `process_alive` and still printed
+  "TEI process is running" for a launcher of `/usr/bin/false`; it was caught
+  only by running it. `status` has a pid and no handle, so it uses
+  `process_alive`, which is correct there because the spawning process is gone
+  and init has reaped the child.
 
-- **D4. Reachability probes are TCP-only, so "reachable" precedes "serving".**
-  `util::probe::port_reachable` is a TCP connect; Docker publishes the port at
-  container start, ~28s before TEI binds its HTTP server. Measured: `tei start` and
-  `tei status` both reported reachable while `/health`, `/info` and `/` all refused
-  connections. False green for TEI (a following `index sync` hard-errors); for MLX
-  it is P1's probe bullet. Fix: probe the health endpoint — `tei_reachable` already
-  takes the URL, so it is a change of method, not signature.
+  `status` also stopped reporting the pidfile's contents as fact. It now prints
+  `process: running (pid N)` or `process: NOT running — stale pidfile …`,
+  which is what it should have said for pid 33619 instead of implying a live
+  process whose container had been gone for hours.
 
-  **Reproduced 2026-08-23.** `vault tei start` printed *"TEI is reachable on
-  http://localhost:8081"* while `/info` still refused the connection; it took a
-  further poll loop before the HTTP server answered. The tool declared healthy a
-  server that could not have served a single embed.
+- ~~**D4. Reachability probes are TCP-only, so "reachable" precedes
+  "serving".**~~ — **closed for TEI 2026-08-23.** `util::probe::tei_reachable`
+  is now an HTTP `GET /health` rather than a TCP connect, and `vault tei status`
+  reports `serving:` rather than `reachable:`. Pinned by
+  `tei_probe_rejects_a_socket_that_accepts_but_never_serves`, which binds a
+  listener and never accepts — the TCP connect succeeds, so the test asserts the
+  old probe's exact false green.
+
+  **The MLX half stays open, under P1.** `mlx_reachable` is still a TCP connect
+  because it runs at process startup in `auto` mode where the 200ms budget is
+  the point, and the question there is not "is it serving" but "is it serving
+  fast enough to meet the hook's timeout" — which no probe of this shape can
+  answer. See P1's third bullet.
 
 ---
 
@@ -356,5 +363,6 @@ reproduced live on 2026-08-23. **D5** was found the same day, by hitting it.
       the plan is not.
 - [ ] `docs/embeddings.md` / `runbook.md`: TEI reports `auto_truncate: true`, so
       an over-long input is silently truncated rather than rejected (P4).
-- [ ] `vault-plan.md` on `vault tei start|status`: neither reports on the service,
-      only on a TCP socket (D4), and `start` does not verify the child lived (D3).
+- [x] `vault-plan.md` on `vault tei start|status`: both fixed 2026-08-23 —
+      `tei_reachable` is an HTTP health check and `start` verifies the child
+      lived. If the plan describes the old TCP behaviour, correct it there too.
