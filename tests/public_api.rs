@@ -124,6 +124,7 @@ fn every_type_reachable_through_a_public_field_is_nameable() {
             languages: vec![Language::Proto],
         },
         embedding: vec![0.0; 8],
+        cwd_project: None,
     };
     assert_eq!(takes_a_plan(&planned.plan), 1);
 }

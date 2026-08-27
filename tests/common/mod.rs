@@ -110,5 +110,6 @@ pub fn plan_for(config: &Config, projects: Vec<String>) -> PlannedQuery {
             languages: vec![],
         },
         embedding: vec![0.0; config.embedding_dim()],
+        cwd_project: None,
     }
 }

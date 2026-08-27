@@ -1202,4 +1202,59 @@ pub fn f() {}
     fn registry_is_extension_case_insensitive() {
         assert!(super::super::parser_for("RS").is_some());
     }
+
+    /// **Known bug, not yet fixed** (PR-13 review). An item whose opening brace
+    /// is on the next line closes on its own header line, because the close
+    /// condition is `group_depth == close_depth` and a header with no `{` never
+    /// raises the depth — so the chunk holds the signature and none of the body.
+    ///
+    /// Left as a failing case rather than deleted: it is the reproduction. The
+    /// fix needs a third state (has the body started?), because closing
+    /// immediately at `close_depth` is *correct* for brace-less items like
+    /// `pub type Id = u64;` — making the naive fix swallow everything after one.
+    ///
+    /// Measured against the live index: zero chunks are affected, since this
+    /// tree is rustfmt-clean. It bites on vendored or generated code.
+    #[test]
+    #[ignore = "known bug: Allman-style braces lose the item body — see doc comment"]
+    fn opening_brace_on_newline_includes_body() {
+        let src = "\
+fn helper()
+{
+    let x = 1;
+}
+
+pub struct Point
+{
+    pub x: i32,
+}
+
+impl Point {
+    pub fn get_x(&self)
+    {
+        println!(\"x\");
+    }
+}
+";
+        let chunks = parse(src);
+        assert_eq!(
+            labels(&chunks),
+            ["fn helper", "struct Point", "Point::get_x"]
+        );
+        assert!(
+            chunks[0].content.contains("let x = 1;"),
+            "fn body missing: {}",
+            chunks[0].content
+        );
+        assert!(
+            chunks[1].content.contains("pub x: i32,"),
+            "struct body missing: {}",
+            chunks[1].content
+        );
+        assert!(
+            chunks[2].content.contains("println!(\"x\");"),
+            "method body missing: {}",
+            chunks[2].content
+        );
+    }
 }

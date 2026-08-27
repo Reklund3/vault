@@ -38,29 +38,35 @@ pub struct QueryPlan {
 }
 
 impl QueryPlan {
-    /// Move `name` to the front of `projects`, inserting it if absent.
+    /// Move `name` to the front of `projects` **when it is already there**.
     ///
-    /// This is the cwd bias (review C1). The hook receives Claude Code's `cwd`
-    /// on every prompt and used to discard it, while `projects.repo_path` sat
-    /// in the store unread — so the one signal that is *certain* about which
-    /// project you are in went unused, and the router's guess was the only
-    /// input.
+    /// This is the cwd bias (review C1), and it deliberately does *not* insert.
+    /// `build_filter_clause` emits `project_id IN (...)` only when the resolved
+    /// id list is non-empty — an empty `projects` is the "search every project"
+    /// path — and `ROUTER_SYSTEM` tells the model to omit `projects` unless the
+    /// prompt names a real one, so empty is the common case. Inserting there
+    /// would convert no-filter into a hard single-project filter and silently
+    /// exclude every other indexed repo, which is the opposite of a bias.
     ///
-    /// Deliberately additive. The router's projects are kept, because a prompt
-    /// asked from one repo about a sibling service is ordinary in a monorepo
-    /// and forcing it to the current directory would be worse than the guess.
-    /// Since `build_filter_clause` emits `project_id IN (...)`, order does not
-    /// affect *which* chunks match at all.
+    /// Reordering is all that is left, and it is not for retrieval: the `IN`
+    /// clause is order-insensitive. It is for `Store::resolve_domain`, which
+    /// takes the first named project that has a domain. When the router *did*
+    /// name projects and cwd is among them, cwd-first makes that deterministic
+    /// instead of dependent on router output ordering (review B4).
     ///
-    /// What order does affect is `Store::resolve_domain`, which takes the first
-    /// named project that has a domain. Putting cwd first makes that resolution
-    /// deterministic rather than dependent on router output ordering — which is
-    /// the concrete half of review B4.
-    pub fn prefer_project(&mut self, name: String) {
-        // Case-insensitive, matching `existing_project_ids`' COLLATE NOCASE, so
-        // a router that returns "Vault" cannot produce a duplicate row here.
-        self.projects.retain(|p| !p.eq_ignore_ascii_case(&name));
-        self.projects.insert(0, name);
+    /// When the router named nothing, the cwd project reaches domain resolution
+    /// through [`PlannedQuery::cwd_project`] instead, which no filter reads.
+    pub fn prefer_project(&mut self, name: &str) {
+        // Case-insensitive, matching `existing_project_ids`' COLLATE NOCASE.
+        let Some(pos) = self
+            .projects
+            .iter()
+            .position(|p| p.eq_ignore_ascii_case(name))
+        else {
+            return;
+        };
+        let existing = self.projects.remove(pos);
+        self.projects.insert(0, existing);
     }
 
     /// Drop `languages` and `doc_types` values that have no chunks in the store.
@@ -109,6 +115,16 @@ impl QueryPlan {
 pub struct PlannedQuery {
     pub plan: QueryPlan,
     pub embedding: Vec<f32>,
+    /// The project containing the caller's `cwd`, when one is indexed.
+    ///
+    /// Deliberately **not** folded into `plan.projects`: that list is a
+    /// retrieval filter, and an empty one means "search everything", so putting
+    /// cwd there would narrow rather than bias (review C1, corrected by the
+    /// PR-13 review). Nothing in the SQL reads this. It exists so
+    /// `resolve_domain` can prefer the project you are actually sitting in over
+    /// whatever the router guessed, which is what makes domain resolution
+    /// deterministic.
+    pub cwd_project: Option<String>,
 }
 
 /// Why retrieval deliberately produced no context.
@@ -304,7 +320,11 @@ pub(crate) fn search_traced(
             // `safe_tag` runs here as well as in `render_block` because
             // `defaults.context_tag` is hand-edited in vault.toml.
             tag: safe_tag(config.default_context_tag()).to_string(),
-            domain: resolve_domain_label(store, &planned.plan.projects),
+            domain: resolve_domain_label(
+                store,
+                planned.cwd_project.as_deref(),
+                &planned.plan.projects,
+            ),
         })
     };
 
@@ -362,7 +382,28 @@ pub(crate) fn safe_domain(domain: Option<&str>) -> Option<&str> {
 ///
 /// A store error degrades to `None` rather than discarding an otherwise-good
 /// result — the framing is metadata, not content.
-fn resolve_domain_label(store: &dyn Store, projects: &[String]) -> Option<String> {
+/// Resolve the domain attribute, preferring the project the caller is actually
+/// in over anything the router guessed.
+///
+/// `cwd_project` is tried first and separately, rather than being prepended to
+/// `projects`: that list is a retrieval filter, and an empty one means "search
+/// every project", so putting cwd there would silently narrow the search
+/// (review C1, corrected by the PR-13 review). This is the seam that lets cwd
+/// make domain resolution deterministic without touching what is retrieved.
+///
+/// Falls back to router order — `Store::resolve_domain` takes the first named
+/// project that has a domain — when cwd resolves to nothing or to a project
+/// with no domain assigned.
+fn resolve_domain_label(
+    store: &dyn Store,
+    cwd_project: Option<&str>,
+    projects: &[String],
+) -> Option<String> {
+    if let Some(cwd) = cwd_project
+        && let Ok(Some(domain)) = store.resolve_domain(std::slice::from_ref(&cwd.to_string()))
+    {
+        return Some(domain);
+    }
     match store.resolve_domain(projects) {
         Ok(Some(domain)) => Some(domain),
         Ok(None) | Err(_) => None,
@@ -383,53 +424,83 @@ mod tests {
         }
     }
 
-    /// The cwd bias is additive: the router's projects survive, because a
-    /// prompt asked from one repo about a sibling service is ordinary.
+    /// The regression the cwd bias introduced (PR-13 review).
+    ///
+    /// `build_filter_clause` emits the `project_id IN (...)` clause **only when
+    /// the resolved id list is non-empty** — an empty `projects` is the
+    /// deliberate "search every project" path. `ROUTER_SYSTEM` tells the model
+    /// to omit `projects` unless the prompt names a real one, so empty is the
+    /// common case, not the edge case.
+    ///
+    /// Inserting the cwd project there therefore does not "bias" anything: it
+    /// converts no-filter into a hard single-project filter, silently excluding
+    /// every other indexed repo for any general prompt asked from inside a
+    /// checkout. That is the multi-project case the tool exists for.
     #[test]
-    fn prefer_project_prepends_without_dropping_the_routers_guesses() {
+    fn prefer_project_must_not_turn_no_filter_into_a_filter() {
         let mut plan = plan_with(vec![], vec![]);
-        plan.projects = vec!["build-service".into()];
+        plan.projects = vec![];
 
-        plan.prefer_project("vault".into());
+        plan.prefer_project("vault");
 
-        assert_eq!(
-            plan.projects,
-            vec!["vault".to_string(), "build-service".to_string()]
+        assert!(
+            plan.projects.is_empty(),
+            "an empty projects list means 'search everything'; cwd must not narrow it to {:?}",
+            plan.projects
         );
     }
 
-    /// Already-present names move to the front rather than duplicating, and the
-    /// comparison is case-insensitive to match `existing_project_ids`' COLLATE
-    /// NOCASE — otherwise a router returning "Vault" would produce two rows for
-    /// one project and make domain resolution order-dependent again.
+    /// When the router *did* name projects, cwd reorders rather than inserts —
+    /// the set is already narrowed, so putting cwd first only changes which
+    /// project `resolve_domain` consults first.
     #[test]
-    fn prefer_project_dedupes_case_insensitively() {
+    fn prefer_project_reorders_a_project_the_router_already_named() {
         let mut plan = plan_with(vec![], vec![]);
-        plan.projects = vec!["build-service".into(), "Vault".into()];
+        plan.projects = vec!["build-service".into(), "vault".into()];
 
-        plan.prefer_project("vault".into());
+        plan.prefer_project("vault");
 
         assert_eq!(
             plan.projects,
             vec!["vault".to_string(), "build-service".to_string()],
-            "the existing casing variant must be replaced, not kept alongside"
+            "cwd's project moves to the front; the router's others survive"
         );
     }
 
-    /// The point of putting it first: `Store::resolve_domain` takes the first
-    /// named project that has a domain, so cwd-first makes that deterministic
-    /// instead of dependent on router output ordering (review B4).
+    /// Matching is case-insensitive, mirroring `existing_project_ids`' COLLATE
+    /// NOCASE — a router returning "Vault" must still be recognised as the cwd
+    /// project rather than treated as a different one.
     #[test]
-    fn prefer_project_puts_cwd_first_for_domain_resolution() {
+    fn prefer_project_matches_case_insensitively() {
         let mut plan = plan_with(vec![], vec![]);
-        plan.projects = vec!["a".into(), "b".into()];
+        plan.projects = vec!["build-service".into(), "Vault".into()];
 
-        plan.prefer_project("vault".into());
+        plan.prefer_project("vault");
 
-        assert_eq!(plan.projects.first().map(String::as_str), Some("vault"));
+        assert_eq!(
+            plan.projects,
+            vec!["Vault".to_string(), "build-service".to_string()],
+            "the router's casing is preserved; only the order changes"
+        );
     }
 
-    /// The bug this exists for. `Language::Go` is a valid enum variant, so
+    /// A cwd project the router did not name must not be added to the filter.
+    /// It still reaches domain resolution through `PlannedQuery::cwd_project`.
+    #[test]
+    fn prefer_project_does_not_add_a_project_the_router_omitted() {
+        let mut plan = plan_with(vec![], vec![]);
+        plan.projects = vec!["build-service".into()];
+
+        plan.prefer_project("vault");
+
+        assert_eq!(
+            plan.projects,
+            vec!["build-service".to_string()],
+            "adding 'vault' here would exclude build-service from the search"
+        );
+    }
+
+    /// The bug this exists for. `Language::Go` is a valid enum variant, so    /// The bug this exists for. `Language::Go` is a valid enum variant, so
     /// `QueryPlan::from_raw`'s drop-unrecognized guard passes it through; only
     /// the corpus knows the vault holds no Go. Measured on the real store:
     /// 238 rust / 66 markdown / 13 unknown chunks, zero go, and the router
@@ -548,7 +619,94 @@ mod tests {
                 languages: vec![],
             },
             embedding: vec![0.0; config.embedding_dim()],
+            cwd_project: None,
         }
+    }
+
+    /// A store that records which names `resolve_domain` was asked about, so the
+    /// cwd-first ordering can be observed directly.
+    struct DomainProbeStore {
+        asked: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl Store for DomainProbeStore {
+        fn migrate(&mut self) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn get_or_create_project(&mut self, _n: &str, _p: &str) -> Result<i64, StoreError> {
+            Ok(1)
+        }
+        fn get_document_content_hash(
+            &self,
+            _p: i64,
+            _s: &str,
+        ) -> Result<Option<String>, StoreError> {
+            Ok(None)
+        }
+        fn resolve_domain(&self, names: &[String]) -> Result<Option<String>, StoreError> {
+            self.asked.lock().unwrap().push(names.to_vec());
+            Ok(names.first().map(|n| format!("domain-of-{n}")))
+        }
+        fn upsert_document(
+            &mut self,
+            _d: &Document,
+            _c: &[ChunkWithEmbedding],
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn prune_orphans(&mut self, _p: i64, _k: &[String]) -> Result<usize, StoreError> {
+            Ok(0)
+        }
+        fn bm25_search(&self, _p: &QueryPlan, _k: usize) -> Result<Vec<Hit>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn cosine_search(
+            &self,
+            _p: &QueryPlan,
+            _e: &[f32],
+            _k: usize,
+        ) -> Result<Vec<Hit>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn log_retrieval(&mut self, _e: &RetrievalLogEntry) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    /// C1's actual win, kept after the filter regression was removed.
+    ///
+    /// The fix stopped cwd from touching `plan.projects`, so it would have been
+    /// easy to "fix" the bug by deleting the feature. `cwd_project` still
+    /// reaches `resolve_domain` first — and crucially it does so even when the
+    /// router named no projects at all, which is the case where the old code
+    /// narrowed the search to get the same answer.
+    #[test]
+    fn cwd_still_decides_the_domain_when_the_router_named_no_projects() {
+        let store = DomainProbeStore {
+            asked: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let domain = resolve_domain_label(&store, Some("vault"), &[]);
+
+        assert_eq!(domain.as_deref(), Some("domain-of-vault"));
+        assert_eq!(
+            store.asked.lock().unwrap()[0],
+            vec!["vault".to_string()],
+            "cwd's project must be consulted first, and on its own"
+        );
+    }
+
+    /// Falling back to router order keeps the previous behaviour for callers
+    /// with no cwd — `diagnose`, and any library consumer using `retrieve`.
+    #[test]
+    fn domain_falls_back_to_router_order_without_a_cwd() {
+        let store = DomainProbeStore {
+            asked: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let domain = resolve_domain_label(&store, None, &["alpha".into(), "beta".into()]);
+
+        assert_eq!(domain.as_deref(), Some("domain-of-alpha"));
     }
 
     /// How the fake store answers `resolve_domain`.

@@ -39,7 +39,15 @@ pub fn select_within_budget(
     let mut chunks = Vec::new();
     let mut tokens_used: u32 = 0;
     for hit in hits {
-        if hit.final_score < min_score {
+        // `>=`, not `!(< min)`: every comparison with NaN is false, so a
+        // `final_score < min_score` test *admits* NaN rather than dropping it.
+        // NaN is reachable — `merge` divides by the result-set max BM25, and a
+        // zero-norm embedding makes cosine `0/0` — and a NaN score then sorts
+        // unpredictably and injects a junk chunk that no threshold can stop.
+        if !matches!(
+            hit.final_score.partial_cmp(&min_score),
+            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+        ) {
             continue;
         }
         if tokens_used.saturating_add(hit.token_est) > token_budget {
@@ -110,6 +118,17 @@ mod tests {
             vec![1, 3]
         );
         assert_eq!(sel.tokens_used, 100);
+    }
+
+    #[test]
+    fn min_score_gate_drops_nan_score() {
+        let hits = vec![hit(1, f32::NAN, 50), hit(2, 0.9, 50)];
+        let sel = select_within_budget(hits, 10_000, 0.15, None);
+        assert_eq!(
+            sel.chunks.iter().map(|h| h.chunk_id).collect::<Vec<_>>(),
+            vec![2],
+            "NaN score must be dropped by min_score gate"
+        );
     }
 
     #[test]

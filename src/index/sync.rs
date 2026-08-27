@@ -267,21 +267,34 @@ fn finish_sync(
     // non-interactive stdin leaves it unassigned (the hook then falls back to
     // defaults.context_tag). Assignment lives in vault.db; the context tag is
     // rendered as the `domain` attribute on `<vault-context>`, never stored.
-    let domain = match store
+    let existing = store
         .resolve_domain(std::slice::from_ref(&project_name))
-        .map_err(SyncError::Store)?
-    {
-        Some(existing) => Some(existing),
-        None => {
-            let chosen = resolve_domain_choice(opts.explicit_domain.clone(), &opts.interaction)?;
-            if let Some(ref d) = chosen {
+        .map_err(SyncError::Store)?;
+
+    // An existing assignment suppresses the *prompt*, not an explicit
+    // `--domain`. Those are different things, and collapsing them meant
+    // `vault index sync . --domain finance` silently kept the old domain and
+    // reported it back as though the flag had applied (PR-13 review).
+    let domain = match (opts.explicit_domain.clone(), existing) {
+        (Some(explicit), previous) => {
+            if previous.as_deref() != Some(explicit.as_str()) {
                 store
-                    .set_project_domain(project_id, d)
+                    .set_project_domain(project_id, &explicit)
                     .map_err(SyncError::Store)?;
                 // A new domain needs matching framing in the user's global
                 // CLAUDE.md or the emitted tag means nothing to Claude — the
                 // taxonomy's single source of truth (see `docs/vault-plan.md`).
-                //
+                notify_domain_assigned(&opts.interaction, &explicit);
+            }
+            Some(explicit)
+        }
+        (None, Some(existing)) => Some(existing),
+        (None, None) => {
+            let chosen = resolve_domain_choice(None, &opts.interaction)?;
+            if let Some(ref d) = chosen {
+                store
+                    .set_project_domain(project_id, d)
+                    .map_err(SyncError::Store)?;
                 notify_domain_assigned(&opts.interaction, d);
             }
             chosen
@@ -2110,6 +2123,63 @@ mod tests {
                 allow_remote_billing: true,
             },
             "software",
+        );
+    }
+
+    #[test]
+    fn an_explicit_domain_updates_existing_project_domain_on_resync() {
+        let tmp = Tmp::new("resync-domain");
+        let canonical = tmp.canonical();
+
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+        let embedder = TeiEmbedder::from_config(&config).unwrap();
+
+        // Project already exists in DB with domain "software"
+        let pid = store
+            .get_or_create_project("test-project", canonical.to_str().unwrap())
+            .unwrap();
+        store.set_project_domain(pid, "software").unwrap();
+        assert_eq!(
+            store
+                .resolve_domain(&["test-project".to_string()])
+                .unwrap()
+                .as_deref(),
+            Some("software")
+        );
+
+        // Re-sync with explicit domain "finance"
+        let opts = SyncOptions {
+            repo: canonical.clone(),
+            explicit_name: Some("test-project".to_string()),
+            explicit_domain: Some("finance".to_string()),
+            dry_run: false,
+            interaction: Interaction::NonInteractive {
+                allow_remote_billing: false,
+            },
+        };
+
+        let live = LiveSync {
+            canonical,
+            project_name: "test-project".to_string(),
+            walked: vec![],
+            embedder,
+            classifier: Box::new(ExtClassifier),
+        };
+
+        let rep = finish_sync(live, &mut store, &opts).expect("finish_sync");
+        assert_eq!(
+            rep.domain.as_deref(),
+            Some("finance"),
+            "explicit domain must update the report"
+        );
+        assert_eq!(
+            store
+                .resolve_domain(&["test-project".to_string()])
+                .unwrap()
+                .as_deref(),
+            Some("finance"),
+            "explicit domain must be saved in the database"
         );
     }
 }

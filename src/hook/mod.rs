@@ -268,10 +268,18 @@ fn retrieve_with(
     // a hint that improves a plan, and a store hiccup resolving it must not
     // fail a retrieval the router and embedder already paid for.
     let mut plan = plan;
+    let mut cwd_project = None;
     if let Some(project) = cwd.and_then(|c| vault.store().project_for_path(c).ok().flatten()) {
-        plan.prefer_project(project);
+        // Reorder only — see `QueryPlan::prefer_project`. The name reaches
+        // domain resolution through `cwd_project`, which is not a filter.
+        plan.prefer_project(&project);
+        cwd_project = Some(project);
     }
-    let planned = PlannedQuery { plan, embedding };
+    let planned = PlannedQuery {
+        plan,
+        embedding,
+        cwd_project,
+    };
     let result = vault.store().search(&planned);
     tel.query_ms = Some(ms_since(t));
     result
@@ -547,14 +555,19 @@ mod tests {
         guard.clone()
     }
 
-    /// End-to-end: `cwd` from stdin reaches the plan the store is queried with.
-    /// `StubRouter` returns an empty `projects`, so anything present came from
-    /// the cwd bias and nowhere else.
+    /// End-to-end: `cwd` must **not** narrow the search.
+    ///
+    /// This test previously asserted the opposite, and the PR-13 review caught
+    /// it locking the bug in. `StubRouter` returns an empty `projects`, which
+    /// `build_filter_clause` reads as "search every project" — the common case,
+    /// since `ROUTER_SYSTEM` tells the model to omit `projects` unless the
+    /// prompt names one. Putting cwd's project there converted no-filter into a
+    /// single-project filter and silently excluded every other indexed repo.
     #[test]
-    fn cwd_biases_the_plan_the_store_receives() {
-        assert_eq!(
-            projects_seen_for(Some("/home/u/git/vault/src")),
-            vec!["vault".to_string()]
+    fn cwd_does_not_narrow_the_plan_the_store_receives() {
+        assert!(
+            projects_seen_for(Some("/home/u/git/vault/src")).is_empty(),
+            "cwd must not add a project filter the router did not ask for"
         );
     }
 
@@ -562,21 +575,15 @@ mod tests {
     /// rather than failing the retrieval — it is a hint, not a requirement.
     #[test]
     fn an_unresolvable_cwd_leaves_the_plan_untouched() {
-        assert!(
-            projects_seen_for(None).is_empty(),
-            "absent cwd must not bias"
-        );
-        assert!(
-            projects_seen_for(Some("/tmp/not-indexed")).is_empty(),
-            "a directory outside every indexed repo must not bias"
-        );
-        assert!(
-            projects_seen_for(Some("")).is_empty(),
-            "an empty cwd must not bias"
-        );
+        for cwd in [None, Some("/tmp/not-indexed"), Some("")] {
+            assert!(
+                projects_seen_for(cwd).is_empty(),
+                "cwd {cwd:?} must not bias the filter"
+            );
+        }
     }
 
-    /// Assemble a `Vault` from stub backends. The facade is what production
+    /// Assemble a `Vault` from stub backends.    /// Assemble a `Vault` from stub backends. The facade is what production
     /// uses, so the pipeline tests go through it too rather than around it.
     fn vault_of(
         config: &Config,

@@ -1,5 +1,7 @@
 use std::str::FromStr;
 
+use serde::Deserialize;
+
 use crate::config::Config;
 use crate::types::{DocType, Language};
 use crate::util::json::extract_json_object;
@@ -123,12 +125,24 @@ pub(crate) fn build_user_prompt(input: &ClassifyInput) -> String {
     )
 }
 
+/// `#[serde(default)]` covers a *missing* key but not an explicit `null`, which
+/// fails deserialization ("invalid type: null, expected a string"). A model
+/// emitting `"language": null` — routine for "I could not tell" — voided the
+/// whole classification, so the file was skipped rather than falling back to
+/// `Language::Unknown`, which `from_strings` is already lenient enough to do.
 #[derive(serde::Deserialize)]
 struct RawClassification {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty_string")]
     doc_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty_string")]
     language: String,
+}
+
+fn null_as_empty_string<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 /// Parse a model's free-text reply into a `Classification`. Tolerates markdown
@@ -386,6 +400,14 @@ dims = 768
     fn parse_response_no_json_is_bad_response() {
         let err = parse_response("I don't know.").unwrap_err();
         assert!(matches!(err, ClassifyError::BadResponse(_)));
+    }
+
+    #[test]
+    fn parse_response_null_fields_fall_back_to_unknown() {
+        let c = parse_response(r#"{"doc_type":"convention","language":null}"#)
+            .expect("null language should deserialize and map to Unknown");
+        assert_eq!(c.doc_type, DocType::Convention);
+        assert_eq!(c.language, Language::Unknown);
     }
 
     #[test]

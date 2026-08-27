@@ -125,7 +125,11 @@ impl QueryPlanner {
             return Ok(None);
         };
         let embedding = self.embed_query(prompt)?;
-        Ok(Some(PlannedQuery { plan, embedding }))
+        Ok(Some(PlannedQuery {
+            plan,
+            embedding,
+            cwd_project: None,
+        }))
     }
 }
 
@@ -259,10 +263,15 @@ impl Vault {
         match self.planner.plan(prompt)? {
             None => Ok(Retrieval::Skip(SkipReason::RouterSkip)),
             Some(mut planned) => {
+                // Two different jobs, deliberately kept apart. `prefer_project`
+                // only reorders a project the router already named, so it can
+                // never narrow the filter; `cwd_project` carries the same name
+                // to domain resolution, which no filter reads.
                 if let Some(project) =
                     cwd.and_then(|c| self.store.project_for_path(c).ok().flatten())
                 {
-                    planned.plan.prefer_project(project);
+                    planned.plan.prefer_project(&project);
+                    planned.cwd_project = Some(project);
                 }
                 self.store.search(&planned)
             }

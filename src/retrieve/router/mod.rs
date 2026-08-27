@@ -5,6 +5,7 @@ use crate::retrieve::{QueryPlan, RouterOutput};
 use crate::types::{DocType, Inventory, Language};
 use crate::util::json::extract_json_object;
 use crate::util::probe::mlx_reachable;
+use serde::Deserialize;
 
 mod gemma;
 mod haiku;
@@ -136,18 +137,32 @@ struct RawSkip {
     skip: bool,
 }
 
+/// `#[serde(default)]` covers a *missing* key; it does not cover an explicit
+/// `null`, which fails deserialization outright ("invalid type: null, expected
+/// a sequence"). Models emit `null` for an empty list routinely, and one such
+/// field voided the whole plan — `parse_response` returned `BadResponse`, the
+/// router call counted as failed, and the hook passed through with no context.
+/// `deserialize_with` maps null to an empty vec, which is what the caller
+/// already does with an omitted key.
 #[derive(serde::Deserialize)]
 struct RawQueryPlan {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     projects: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     type_names: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     topics: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     doc_types: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     languages: Vec<String>,
+}
+
+fn null_as_empty<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(d)?.unwrap_or_default())
 }
 
 impl QueryPlan {
@@ -426,6 +441,19 @@ mod tests {
             RouterOutput::Plan(plan) => {
                 assert_eq!(plan.doc_types, vec![DocType::Contract]);
                 assert_eq!(plan.languages, vec![Language::Go]);
+            }
+            RouterOutput::Skip => panic!("expected Plan"),
+        }
+    }
+
+    #[test]
+    fn parse_response_null_fields_fall_back_to_empty() {
+        let text = r#"{"projects": null, "type_names": null, "topics": null, "doc_types": null, "languages": null}"#;
+        let out = parse_response(text).expect("null fields should deserialize as empty");
+        match out {
+            RouterOutput::Plan(plan) => {
+                assert!(plan.projects.is_empty());
+                assert!(plan.doc_types.is_empty());
             }
             RouterOutput::Skip => panic!("expected Plan"),
         }

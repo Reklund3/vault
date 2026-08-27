@@ -135,6 +135,9 @@ pub fn run(args: Args) -> CliResult {
     let planned = PlannedQuery {
         plan,
         embedding: embedder.embed_query(&args.prompt)?,
+        // `diagnose` has no hook `cwd` to resolve; retrieval is unaffected
+        // either way, since this only steers domain resolution.
+        cwd_project: None,
     };
     let trace = search_traced(&planned, &config, &store, alpha)?;
 
