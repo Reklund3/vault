@@ -776,16 +776,28 @@ mod tests {
             INVENTORY_DOC_TYPES_SQL, INVENTORY_LANGUAGES_SQL, INVENTORY_PROJECTS_SQL,
         };
 
-        for (sql, idx) in [
-            (INVENTORY_LANGUAGES_SQL, "idx_chunks_language"),
-            (INVENTORY_DOC_TYPES_SQL, "idx_chunks_doc_type"),
+        for (sql, idx, col) in [
+            (INVENTORY_LANGUAGES_SQL, "idx_chunks_language", "language"),
+            (INVENTORY_DOC_TYPES_SQL, "idx_chunks_doc_type", "doc_type"),
         ] {
-            let plan: String = conn
-                .query_row(&format!("EXPLAIN QUERY PLAN {sql}"), [], |r| r.get(3))
-                .unwrap();
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let steps: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+
+            // `SEARCH ... (col>?)` is the loose index scan seeking past each
+            // value it has already seen. A plain `SELECT DISTINCT` plans to
+            // `SCAN ... USING COVERING INDEX` instead — also index-only, but it
+            // visits every entry to find a handful of answers. Asserting on
+            // "COVERING INDEX" alone cannot tell those apart.
+            let seek = format!("({col}>?)");
             assert!(
-                plan.contains("COVERING INDEX") && plan.contains(idx),
-                "expected a covering index scan on {idx}, got: {plan}"
+                steps
+                    .iter()
+                    .any(|s| s.contains("SEARCH") && s.contains(idx) && s.contains(&seek)),
+                "expected a seek per distinct value on {idx}, got: {steps:?}"
             );
         }
 

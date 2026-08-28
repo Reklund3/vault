@@ -93,10 +93,35 @@ impl SqliteStore {
 pub(crate) const INVENTORY_PROJECTS_SQL: &str = "SELECT p.name FROM projects p
      WHERE EXISTS (SELECT 1 FROM chunks c WHERE c.project_id = p.id)
      ORDER BY p.name";
-pub(crate) const INVENTORY_LANGUAGES_SQL: &str =
-    "SELECT DISTINCT language FROM chunks ORDER BY language";
-pub(crate) const INVENTORY_DOC_TYPES_SQL: &str =
-    "SELECT DISTINCT doc_type FROM chunks ORDER BY doc_type";
+/// Loose index scan ("skip scan"): seek to the smallest value, then repeatedly
+/// seek past it, one probe per *distinct* value rather than one visit per row.
+///
+/// `SELECT DISTINCT language` walks all 120k index entries to find five
+/// answers, because SQLite will not derive this rewrite itself. 6.4ms against
+/// 0.3ms on the 120k corpus.
+///
+/// Correctness rests on `chunks.language` and `chunks.doc_type` being `NOT
+/// NULL` (see `SCHEMA_V1`): `MIN()` skips NULLs, so a nullable column would
+/// silently drop that value from the inventory — and an inventory that omits a
+/// value prunes it out of every plan, which is the phantom-filter bug in
+/// reverse. Do not point this idiom at a nullable column.
+///
+/// The seed row is `NULL` on an empty table, which the recursion terminates on
+/// immediately and the outer filter discards — an empty store yields no rows.
+pub(crate) const INVENTORY_LANGUAGES_SQL: &str = "WITH RECURSIVE d(v) AS (
+         SELECT MIN(language) FROM chunks
+         UNION ALL
+         SELECT (SELECT MIN(language) FROM chunks WHERE language > d.v)
+           FROM d WHERE d.v IS NOT NULL
+     )
+     SELECT v FROM d WHERE v IS NOT NULL ORDER BY v";
+pub(crate) const INVENTORY_DOC_TYPES_SQL: &str = "WITH RECURSIVE d(v) AS (
+         SELECT MIN(doc_type) FROM chunks
+         UNION ALL
+         SELECT (SELECT MIN(doc_type) FROM chunks WHERE doc_type > d.v)
+           FROM d WHERE d.v IS NOT NULL
+     )
+     SELECT v FROM d WHERE v IS NOT NULL ORDER BY v";
 
 impl Store for SqliteStore {
     fn migrate(&mut self) -> Result<(), StoreError> {
@@ -1015,6 +1040,67 @@ mod tests {
 
         // No filter at all counts the whole corpus rather than zero.
         assert_eq!(count(&bare()), Some(2));
+    }
+
+    /// The loose index scan enumerates by repeatedly seeking past the last
+    /// value it saw, so a recursion that terminates early returns a *prefix* of
+    /// the truth and every later value silently vanishes from the inventory —
+    /// which then prunes it out of every plan. Two values cannot show that;
+    /// this uses every language the CHECK constraint allows.
+    #[test]
+    fn inventory_enumerates_every_distinct_value_not_just_the_first() {
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+        let project_id = create_project(&store, "vault");
+
+        let langs = [
+            Language::Go,
+            Language::Rust,
+            Language::Scala,
+            Language::Proto,
+            Language::OpenApi,
+            Language::Helm,
+            Language::Markdown,
+            Language::Unknown,
+        ];
+        let doc_types = [
+            DocType::Contract,
+            DocType::Plan,
+            DocType::Convention,
+            DocType::Meta,
+        ];
+
+        for (i, lang) in langs.iter().enumerate() {
+            store
+                .upsert_document(
+                    &Document {
+                        project_id,
+                        doc_type: doc_types[i % doc_types.len()],
+                        source_path: format!("src/f{i}"),
+                        title: format!("f{i}"),
+                        content_hash: format!("h{i}"),
+                    },
+                    &[ChunkWithEmbedding {
+                        chunk: lang_chunk(*lang, &format!("item{i}"), "body", 0),
+                        embedding: unit_embedding(i),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let inv = store.inventory().unwrap();
+
+        let mut got = inv.languages.clone();
+        got.sort_by_key(|l| l.as_str());
+        let mut want = langs.to_vec();
+        want.sort_by_key(|l| l.as_str());
+        assert_eq!(got, want, "every language with a chunk must be reported");
+
+        let mut got_dt = inv.doc_types.clone();
+        got_dt.sort_by_key(|d| d.as_str());
+        let mut want_dt = doc_types.to_vec();
+        want_dt.sort_by_key(|d| d.as_str());
+        assert_eq!(got_dt, want_dt);
     }
 
     #[test]
