@@ -146,9 +146,20 @@ Two constraints, both load-bearing:
 - **Absolute paths, no shell.** `launcher_cmd` is split on whitespace and executed
   directly, so `$HOME`, `~`, and `$(id -u)` do **not** expand. Write them out.
 
-Note that `vault tei status` reports `reachable: yes` as soon as the port is bound,
-which happens *before* the model finishes loading. For true readiness poll
-`/health`:
+`vault tei status` reports `serving:` from a `GET /health` against the endpoint
+rather than a TCP connect, so a `yes` means TEI is answering HTTP — not merely
+that something is bound. The distinction matters under Docker: the port is
+published the moment the container starts, well before TEI has loaded weights
+and bound its own HTTP server — measured at ~28s on a cold start. For that whole
+window the old TCP probe reported the server up while every embed failed.
+
+Two things `serving: yes` still does not tell you. Any HTTP reply counts,
+including a non-2xx, so a server that answers `/health` while refusing work
+reads as serving. And a healthy server says nothing about *which* model is
+loaded — `vault index sync` and `vault diagnose` each probe that up front with
+`TeiEmbedder::verify_against_server` and refuse to run on a mismatch. The hook
+does not: it fails open like any other backend failure. To wait for readiness in
+a script:
 
 ```bash
 until curl -fs http://localhost:8081/health >/dev/null; do sleep 1; done; echo ready
@@ -273,7 +284,7 @@ rm ~/.vault/tei.pid
 | `Could not start ORT backend: duplicate field hidden_size` | Expected on nomic-embed-text-v1.5 — TEI falls back to Candle | Ignore. Do **not** delete `n_embd` from `config.json`; that breaks Candle too and neither backend will start |
 | Sync is slow (minutes), hook is fine | Candle CPU backend; ORT unavailable for this model | Expected. See the throughput table in the Arch section for options |
 | CUDA image exits immediately on a GTX 10xx | Pascal (compute 6.1) is below TEI's minimum of 7.5 | Use `cpu-latest`. Check with `nvidia-smi --query-gpu=compute_cap --format=csv,noheader` |
-| `vault tei status` says reachable but embeds fail | Port is bound before the model finishes loading — status uses a TCP probe | Poll `/health` instead: `until curl -fs localhost:8081/health; do sleep 1; done` |
+| `vault tei status` says `serving: yes` but embeds fail | `/health` answers, but health is not capability — the loaded model or its dims may not match `[embeddings]` | `vault index sync` and `vault diagnose` probe model and dims up front and fail loudly; see the two dim/model rows above |
 | `vault tei start` leaves nothing running | `launcher_cmd` used `docker run -d`, so the recorded PID exited instantly | Drop `-d`; the launcher needs a foreground process to track |
 
 ### Notes on the model
