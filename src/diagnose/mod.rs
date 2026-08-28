@@ -85,20 +85,8 @@ pub fn run(args: Args) -> CliResult {
     } else {
         let backend = resolve_backend(&config);
         let router = build_router(&config)?;
-        match router.plan(&args.prompt, &inventory)? {
-            RouterOutput::Skip => (RouterStatus::Skip { backend }, None),
-            RouterOutput::Plan(mut p) => {
-                // Prune before merging overrides, never after: an explicit
-                // `--languages go` is the operator deliberately probing a filter
-                // that matches nothing, and silently discarding it would break
-                // the one tool for observing that path.
-                p.retain_indexed(&inventory);
-                (
-                    RouterStatus::Plan { backend },
-                    Some(merge_overrides(p, &cli)),
-                )
-            }
-        }
+        let output = router.plan(&args.prompt, &inventory)?;
+        plan_for_output(output, backend, &inventory, &cli)
     };
 
     let alpha = args.alpha.unwrap_or(config.alpha());
@@ -106,6 +94,14 @@ pub fn run(args: Args) -> CliResult {
     let min_score = config.min_score();
     let max_hits = config.max_hits();
     let used_stub = args.stub;
+
+    // Cheap COUNT over the same filter clause the search arms use. Runs before
+    // the header so the trace can say whether the plan above it reached
+    // anything; `None` (backend cannot count) prints nothing.
+    let filter_reach = match plan.as_ref() {
+        Some(p) => filter_reach(p, store.count_matching_filters(p)?),
+        None => FilterReach::Unreported,
+    };
 
     print_header(&TraceHeader {
         prompt: &args.prompt,
@@ -118,6 +114,7 @@ pub fn run(args: Args) -> CliResult {
         min_score,
         max_hits,
         inventory: &inventory,
+        filter_reach: &filter_reach,
         used_stub,
     });
 
@@ -143,6 +140,88 @@ pub fn run(args: Args) -> CliResult {
 
     print_results(&trace, args.top, budget_tokens, max_hits);
     Ok(())
+}
+
+/// What the plan's structural filters actually reached in the store.
+///
+/// `hybrid_search` silently retries with `doc_types`/`languages` cleared when a
+/// filtered pass returns nothing. That rescue is right on the hook path and
+/// wrong to hide here: without it on screen the trace prints a filter in the
+/// plan and the whole unfiltered corpus underneath, which reads as proof the
+/// filter matched.
+enum FilterReach {
+    /// Nothing to say: the plan carries no structural filter, or the backend
+    /// does not implement the count.
+    Unreported,
+    Matched(usize),
+    /// The filters selected no chunks. `relaxed` is whether that actually
+    /// triggered the retry — it fires only for `doc_types`/`languages`, so a
+    /// `projects`-only plan reaching zero returns an empty result instead.
+    Nothing {
+        relaxed: bool,
+    },
+}
+
+fn filter_reach(plan: &QueryPlan, count: Option<usize>) -> FilterReach {
+    let has_filter =
+        !plan.projects.is_empty() || !plan.doc_types.is_empty() || !plan.languages.is_empty();
+    if !has_filter {
+        return FilterReach::Unreported;
+    }
+    match count {
+        None => FilterReach::Unreported,
+        Some(0) => FilterReach::Nothing {
+            // Mirrors the condition in `Store::hybrid_search`.
+            relaxed: !plan.doc_types.is_empty() || !plan.languages.is_empty(),
+        },
+        Some(n) => FilterReach::Matched(n),
+    }
+}
+
+/// Decide what the trace should search, given what the router returned.
+///
+/// Split out of `run` so it is reachable from tests: `run` itself needs a
+/// loaded `Config`, an open store, and a live embedder, so the decision it
+/// used to make inline could not be exercised at all.
+fn plan_for_output(
+    output: RouterOutput,
+    backend: ResolvedBackend,
+    inventory: &Inventory,
+    cli: &Overrides,
+) -> (RouterStatus, Option<QueryPlan>) {
+    match output {
+        // A skip with filter flags on the command line is not a skip. Those
+        // flags exist to drive the store when the router's judgement is
+        // unhelpful, and the router judging a prompt uninteresting is the case
+        // where they matter most. Build the plan from the overrides alone —
+        // there is no router plan to merge onto — and leave it unpruned, the
+        // same treatment `--no-router` gives them.
+        RouterOutput::Skip if !cli.is_empty() => (
+            RouterStatus::Skip {
+                backend,
+                overridden: true,
+            },
+            Some(cli.clone().into_plan()),
+        ),
+        RouterOutput::Skip => (
+            RouterStatus::Skip {
+                backend,
+                overridden: false,
+            },
+            None,
+        ),
+        RouterOutput::Plan(mut p) => {
+            // Prune before merging overrides, never after: an explicit
+            // `--languages go` is the operator deliberately probing a filter
+            // that matches nothing, and silently discarding it would break
+            // the one tool for observing that path.
+            p.retain_indexed(inventory);
+            (
+                RouterStatus::Plan { backend },
+                Some(merge_overrides(p, cli)),
+            )
+        }
+    }
 }
 
 fn parse_list<T: FromStr<Err = String>>(specs: &[String]) -> Result<Vec<T>, String> {
@@ -217,8 +296,17 @@ fn merge_overrides(mut plan: QueryPlan, overrides: &Overrides) -> QueryPlan {
 
 enum RouterStatus {
     Bypassed,
-    Skip { backend: ResolvedBackend },
-    Plan { backend: ResolvedBackend },
+    Skip {
+        backend: ResolvedBackend,
+        /// The router said skip, but the operator passed filter flags, so a
+        /// search ran anyway. Tracked so the header can say so — printing a
+        /// bare `decision: skip` above a page of results reads as a bug in the
+        /// tool.
+        overridden: bool,
+    },
+    Plan {
+        backend: ResolvedBackend,
+    },
 }
 
 struct TraceHeader<'a> {
@@ -241,6 +329,9 @@ struct TraceHeader<'a> {
     /// enum-valid values the router returns anyway. Without it on screen a
     /// pruned filter looks like a router that never proposed one.
     inventory: &'a Inventory,
+    /// What the plan's structural filters actually selected. Printed because a
+    /// zero here means the store threw the filter away and searched everything.
+    filter_reach: &'a FilterReach,
     used_stub: bool,
 }
 
@@ -257,11 +348,22 @@ fn print_header(h: &TraceHeader<'_>) {
     println!("prompt:    {:?}", h.prompt);
     match h.router_status {
         RouterStatus::Bypassed => println!("router:    bypassed (--no-router)"),
-        RouterStatus::Skip { backend } => println!(
-            "router:    {} ({}) — decision: skip",
-            backend_label(*backend),
-            h.router_mode
-        ),
+        RouterStatus::Skip {
+            backend,
+            overridden,
+        } => {
+            let suffix = if *overridden {
+                " (overridden by CLI filters — searching anyway)"
+            } else {
+                ""
+            };
+            println!(
+                "router:    {} ({}) — decision: skip{}",
+                backend_label(*backend),
+                h.router_mode,
+                suffix
+            );
+        }
         RouterStatus::Plan { backend } => {
             println!("router:    {} ({})", backend_label(*backend), h.router_mode)
         }
@@ -277,6 +379,17 @@ fn print_header(h: &TraceHeader<'_>) {
             "           doc_types={:?}  languages={:?}",
             doc_types, languages,
         );
+    }
+    match h.filter_reach {
+        FilterReach::Unreported => {}
+        FilterReach::Matched(n) => println!("filters:   match {n} chunks"),
+        FilterReach::Nothing { relaxed: true } => println!(
+            "filters:   match 0 chunks — doc_types/languages dropped, \
+             results below are UNFILTERED"
+        ),
+        FilterReach::Nothing { relaxed: false } => {
+            println!("filters:   match 0 chunks")
+        }
     }
     if h.inventory.is_empty() {
         println!("indexed:   (nothing — router ungrounded, no pruning applied)");
@@ -522,5 +635,164 @@ mod tests {
     fn without_a_cap_trimming_is_always_scoring() {
         assert_eq!(trim_cause(0, None), "min_score/budget");
         assert_eq!(trim_cause(50, None), "min_score/budget");
+    }
+    fn cli_overrides() -> Overrides {
+        Overrides {
+            topics: vec!["auth".into()],
+            ..Default::default()
+        }
+    }
+
+    fn rust_only_inventory() -> Inventory {
+        Inventory {
+            projects: vec!["vault".into()],
+            languages: vec![Language::Rust],
+            doc_types: vec![DocType::Meta],
+        }
+    }
+
+    /// The whole point of `--topics`/`--languages`/... is to drive the store
+    /// when the router's judgement is unhelpful. A skip must not throw them
+    /// away: `vault diagnose "hi" --topics auth` is an operator deliberately
+    /// probing the `auth` topic, and answering "no search ran" leaves them with
+    /// no way to reach the store at all short of `--no-router`.
+    #[test]
+    fn a_skip_still_searches_when_the_operator_supplied_filters() {
+        let (status, plan) = plan_for_output(
+            RouterOutput::Skip,
+            ResolvedBackend::Gemma,
+            &rust_only_inventory(),
+            &cli_overrides(),
+        );
+
+        let plan = plan.expect("CLI overrides must survive a router skip");
+        assert_eq!(plan.topics, vec!["auth".to_string()]);
+        assert!(
+            matches!(
+                status,
+                RouterStatus::Skip {
+                    overridden: true,
+                    ..
+                }
+            ),
+            "the header must say the skip was overridden, or it reports \
+             `decision: skip` directly above a page of results"
+        );
+    }
+
+    /// A skip with nothing to override is still a skip.
+    #[test]
+    fn a_bare_skip_runs_no_search() {
+        let (status, plan) = plan_for_output(
+            RouterOutput::Skip,
+            ResolvedBackend::Gemma,
+            &rust_only_inventory(),
+            &Overrides::default(),
+        );
+
+        assert!(plan.is_none());
+        assert!(matches!(
+            status,
+            RouterStatus::Skip {
+                overridden: false,
+                ..
+            }
+        ));
+    }
+
+    /// Overrides on a skip are the operator's word, so they bypass
+    /// `retain_indexed` exactly as they do on a router-supplied plan and under
+    /// `--no-router`. Pruning `go` out of an explicit `--languages go` would
+    /// remove the only way to watch that filter match nothing.
+    #[test]
+    fn a_skip_override_is_not_pruned_against_the_inventory() {
+        let overrides = Overrides {
+            languages: vec![Language::Go],
+            ..Default::default()
+        };
+
+        let (_, plan) = plan_for_output(
+            RouterOutput::Skip,
+            ResolvedBackend::Gemma,
+            &rust_only_inventory(),
+            &overrides,
+        );
+
+        assert_eq!(
+            plan.expect("overrides present").languages,
+            vec![Language::Go],
+            "an explicit --languages must reach the store unpruned"
+        );
+    }
+
+    /// The router-plan path is unchanged: pruned against the inventory, then
+    /// overridden.
+    #[test]
+    fn a_router_plan_is_pruned_then_overridden() {
+        let mut routed = full_plan();
+        routed.languages = vec![Language::Rust, Language::Go];
+
+        let (status, plan) = plan_for_output(
+            RouterOutput::Plan(routed),
+            ResolvedBackend::Gemma,
+            &rust_only_inventory(),
+            &cli_overrides(),
+        );
+
+        let plan = plan.expect("a plan was returned");
+        assert_eq!(plan.languages, vec![Language::Rust], "go is not indexed");
+        assert_eq!(plan.topics, vec!["auth".to_string()], "override applied");
+        assert!(matches!(status, RouterStatus::Plan { .. }));
+    }
+    /// A filter that selected nothing must be called out. The store relaxed it
+    /// and searched the whole corpus, so the results printed underneath the
+    /// plan have nothing to do with the plan.
+    #[test]
+    fn a_filter_matching_no_chunks_is_reported_as_relaxed() {
+        let mut plan = empty_plan();
+        plan.languages = vec![Language::Helm];
+
+        assert!(matches!(
+            filter_reach(&plan, Some(0)),
+            FilterReach::Nothing { relaxed: true }
+        ));
+    }
+
+    /// `hybrid_search` relaxes `doc_types`/`languages` only. A `projects`-only
+    /// plan that reaches zero returns an empty result instead, so claiming a
+    /// relax there would describe a retry that never ran.
+    #[test]
+    fn a_projects_only_filter_matching_nothing_is_not_a_relax() {
+        let mut plan = empty_plan();
+        plan.projects = vec!["never-synced".into()];
+
+        assert!(matches!(
+            filter_reach(&plan, Some(0)),
+            FilterReach::Nothing { relaxed: false }
+        ));
+    }
+
+    #[test]
+    fn a_filter_that_selects_chunks_reports_the_count() {
+        let mut plan = empty_plan();
+        plan.languages = vec![Language::Rust];
+
+        assert!(matches!(
+            filter_reach(&plan, Some(631)),
+            FilterReach::Matched(631)
+        ));
+    }
+
+    /// Nothing to report when there is no structural filter, or when the
+    /// backend cannot count — silence beats a fabricated reassurance.
+    #[test]
+    fn nothing_is_reported_without_a_filter_or_a_count() {
+        assert!(matches!(
+            filter_reach(&empty_plan(), Some(0)),
+            FilterReach::Unreported
+        ));
+        let mut plan = empty_plan();
+        plan.languages = vec![Language::Rust];
+        assert!(matches!(filter_reach(&plan, None), FilterReach::Unreported));
     }
 }

@@ -88,6 +88,30 @@ pub trait Store {
         Ok(Inventory::default())
     }
 
+    /// How many chunks match the plan's *structural* filters (`projects`,
+    /// `doc_types`, `languages`), ignoring the keyword and vector arms.
+    ///
+    /// Exists so `vault diagnose` can tell a filter that selected a narrow slice
+    /// apart from one that selected nothing and was silently relaxed by
+    /// [`Store::hybrid_search`]. Without it the trace prints the filter in the
+    /// plan and the *unfiltered* corpus underneath, which reads as "the filter
+    /// matched" — the exact wrong conclusion for the phantom-filter case the
+    /// grounding work exists to diagnose.
+    ///
+    /// A zero here is a sound proxy for "the relax-retry fired". The retry keys
+    /// off `hits.is_empty()`, and `cosine_search` is a nearest-neighbour scan
+    /// that returns something for *any* non-empty filtered set, so an empty
+    /// merged result and a zero structural count coincide.
+    ///
+    /// **Provided default returns `Ok(None)`** — "cannot say". Diagnose prints
+    /// nothing rather than guessing, so a backend that does not implement this
+    /// keeps its current output instead of gaining a false reassurance.
+    /// Only `vault diagnose` reads this, so a library-only build has no caller.
+    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
+    fn count_matching_filters(&self, _plan: &QueryPlan) -> Result<Option<usize>, StoreError> {
+        Ok(None)
+    }
+
     /// Resolve the indexed project whose `repo_path` contains `path`, if any.
     ///
     /// `path` is the `cwd` Claude Code sends with every prompt — the one signal

@@ -208,6 +208,25 @@ impl Store for SqliteStore {
         Ok(best.map(|(_, name)| name))
     }
 
+    fn count_matching_filters(&self, plan: &QueryPlan) -> Result<Option<usize>, StoreError> {
+        // Same clause builder and the same binding helper the two search arms
+        // use, so this cannot drift from what actually filters. `WHERE 1=1`
+        // because `build_filter_clause` emits ` AND ...` suffixes and may emit
+        // nothing at all.
+        let project_ids = self.existing_project_ids(&plan.projects)?;
+        let doc_type_strs: Vec<&'static str> = plan.doc_types.iter().map(|d| d.as_str()).collect();
+        let language_strs: Vec<&'static str> = plan.languages.iter().map(|l| l.as_str()).collect();
+        let filter_sql = build_filter_clause(&project_ids, plan);
+        let filter = filter_bind_params(&project_ids, &doc_type_strs, &language_strs);
+
+        let sql = format!("SELECT COUNT(*) FROM chunks c WHERE 1=1{filter_sql}");
+        let n: i64 = self
+            .conn
+            .query_row(&sql, filter.as_slice(), |r| r.get(0))
+            .map_err(backend_err)?;
+        Ok(Some(n as usize))
+    }
+
     fn inventory(&self) -> Result<Inventory, StoreError> {
         // Three cheap DISTINCT scans over `chunks`. Only values with at least
         // one chunk are reported: a language whose every chunk was dropped by
@@ -883,6 +902,82 @@ mod tests {
     /// be backed by a real chunk: the whole point is to stop the router naming
     /// values that match nothing, so a snapshot that itself contains phantoms
     /// would just move the bug.
+    /// `count_matching_filters` answers the question `vault diagnose` needs to
+    /// distinguish "this filter selected a narrow slice" from "this filter
+    /// selected nothing, so the store threw it away and searched everything".
+    #[test]
+    fn count_matching_filters_separates_a_narrow_filter_from_a_dead_one() {
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+        let vault_id = create_project(&store, "vault");
+
+        store
+            .upsert_document(
+                &Document {
+                    project_id: vault_id,
+                    doc_type: DocType::Convention,
+                    source_path: "src/lib.rs".into(),
+                    title: "lib.rs".into(),
+                    content_hash: "hr".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: lang_chunk(Language::Rust, "Widget", "fn widget", 0),
+                    embedding: unit_embedding(0),
+                }],
+            )
+            .unwrap();
+        store
+            .upsert_document(
+                &Document {
+                    project_id: vault_id,
+                    doc_type: DocType::Plan,
+                    source_path: "docs/plan.md".into(),
+                    title: "plan".into(),
+                    content_hash: "hm".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: lang_chunk(Language::Markdown, "Plan", "# the plan", 0),
+                    embedding: unit_embedding(1),
+                }],
+            )
+            .unwrap();
+
+        let bare = || QueryPlan {
+            projects: vec![],
+            type_names: vec![],
+            topics: vec![],
+            doc_types: vec![],
+            languages: vec![],
+        };
+        let count = |plan: &QueryPlan| store.count_matching_filters(plan).unwrap();
+
+        let mut indexed = bare();
+        indexed.languages = vec![Language::Rust];
+        assert_eq!(count(&indexed), Some(1), "rust is indexed");
+
+        let mut dead = bare();
+        dead.languages = vec![Language::Helm];
+        assert_eq!(
+            count(&dead),
+            Some(0),
+            "helm has no chunks — relax will fire"
+        );
+
+        // The AND-combination is what matters, not per-field existence: both
+        // values are indexed, but no chunk carries the pair.
+        let mut combination = bare();
+        combination.languages = vec![Language::Rust];
+        combination.doc_types = vec![DocType::Plan];
+        assert_eq!(
+            count(&combination),
+            Some(0),
+            "rust chunks are convention, markdown chunks are plan"
+        );
+
+        // No filter at all counts the whole corpus rather than zero.
+        assert_eq!(count(&bare()), Some(2));
+    }
+
     #[test]
     fn inventory_reports_only_values_that_have_chunks() {
         let config = Config::default();
