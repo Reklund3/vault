@@ -902,7 +902,7 @@ in `~/.claude/CLAUDE.md` — the single source of truth for what a tag means.
 [defaults]
 context_tag  = "vault-context"   # fallback if project has no domain assignment
 token_budget = 10000
-alpha        = 0.6               # BM25/cosine weight — 0.0 = pure semantic, 1.0 = pure keyword
+alpha        = 0.1               # BM25/cosine weight — 0.0 = pure semantic, 1.0 = pure keyword
 min_score    = 0.15
 
 # Domains are NOT configured here. Project→domain assignment is interactive
@@ -1246,7 +1246,7 @@ Step 3  store/sqlite_store::{bm25_search,cosine_search}  — the two retrieval
                               vec_distance_cosine. The blend itself is NOT here: the
                               trait's provided hybrid_search calls retrieve::hybrid::merge
                               (Step 11), so it merges by chunk_id with BM25 normalized
-                              against the result-set max at alpha=0.6 identically for every
+                              against the result-set max at the configured alpha identically for every
                               backend. Budget trim is Step 12 (retrieve/budget.rs) so the
                               store stays scoring-pure and the budget layer tunes
                               independently.

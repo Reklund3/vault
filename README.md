@@ -113,7 +113,7 @@ The context block uses one constant tag with the domain as an attribute — `<va
 [defaults]
 context_tag  = "vault-context"  # fallback when a project has no domain assignment
 token_budget = 10000            # ceiling on injected context
-alpha        = 0.6              # BM25/cosine weight
+alpha        = 0.1              # BM25/cosine weight — measured, not guessed; see CLAUDE.md
 min_score    = 0.15             # drop hits below this final_score
 # max_hits   = 4                # optional hard cap on chunk count, best-scoring first;
                                 # omitted = uncapped, which is the historical behaviour
