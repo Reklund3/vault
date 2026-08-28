@@ -86,6 +86,18 @@ impl SqliteStore {
     }
 }
 
+/// The inventory statements, named so the schema tests can `EXPLAIN QUERY PLAN`
+/// the query the store actually issues. Inlined string literals let a revert to
+/// a table-scanning form pass every behavioural test — the rows are identical,
+/// only the cost changes.
+pub(crate) const INVENTORY_PROJECTS_SQL: &str = "SELECT p.name FROM projects p
+     WHERE EXISTS (SELECT 1 FROM chunks c WHERE c.project_id = p.id)
+     ORDER BY p.name";
+pub(crate) const INVENTORY_LANGUAGES_SQL: &str =
+    "SELECT DISTINCT language FROM chunks ORDER BY language";
+pub(crate) const INVENTORY_DOC_TYPES_SQL: &str =
+    "SELECT DISTINCT doc_type FROM chunks ORDER BY doc_type";
+
 impl Store for SqliteStore {
     fn migrate(&mut self) -> Result<(), StoreError> {
         schema::migrate(&self.conn, self.embedding_dim)
@@ -228,10 +240,17 @@ impl Store for SqliteStore {
     }
 
     fn inventory(&self) -> Result<Inventory, StoreError> {
-        // Three cheap DISTINCT scans over `chunks`. Only values with at least
-        // one chunk are reported: a language whose every chunk was dropped by
-        // the secret pre-scan is not retrievable, so naming it to the router
-        // would be the same phantom-value problem in a new place.
+        // Three queries over `chunks`, all served by the schema-v2 covering
+        // indexes so none of them pages in the inline `content` column. Only
+        // values with at least one chunk are reported: a language whose every
+        // chunk was dropped by the secret pre-scan is not retrievable, so
+        // naming it to the router would be the same phantom-value problem in a
+        // new place.
+        //
+        // Left as three statements deliberately. Folding them into one `UNION`
+        // was measured *slower* — 369ms against 226ms on a 120k-chunk corpus —
+        // because the union dedupes 360k rows in one temp B-tree instead of
+        // three independent passes. The cost here was never the round trips.
         //
         // Unparseable stored labels are skipped rather than failing the call.
         // This runs on the hook path via `Vault::open`, where the fail-open
@@ -241,9 +260,13 @@ impl Store for SqliteStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT DISTINCT p.name FROM projects p
-                 JOIN chunks c ON c.project_id = p.id
-                 ORDER BY p.name",
+                // `EXISTS` rather than `JOIN ... DISTINCT` so the scan stops at
+                // the first chunk of each project. The two plan to the same
+                // join order once statistics exist — this is not a planner
+                // hint — but the join emits every matching row into a temp
+                // B-tree to deduplicate. 31ms against 0.26ms on the 120k
+                // corpus, measured after ANALYZE.
+                INVENTORY_PROJECTS_SQL,
             )
             .map_err(backend_err)?;
         let rows = stmt
@@ -257,7 +280,7 @@ impl Store for SqliteStore {
         let mut languages = Vec::new();
         let mut stmt = self
             .conn
-            .prepare("SELECT DISTINCT language FROM chunks ORDER BY language")
+            .prepare(INVENTORY_LANGUAGES_SQL)
             .map_err(backend_err)?;
         let rows = stmt
             .query_map([], |r| r.get::<_, String>(0))
@@ -272,7 +295,7 @@ impl Store for SqliteStore {
         let mut doc_types = Vec::new();
         let mut stmt = self
             .conn
-            .prepare("SELECT DISTINCT doc_type FROM chunks ORDER BY doc_type")
+            .prepare(INVENTORY_DOC_TYPES_SQL)
             .map_err(backend_err)?;
         let rows = stmt
             .query_map([], |r| r.get::<_, String>(0))

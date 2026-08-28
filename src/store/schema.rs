@@ -120,6 +120,26 @@ END;
 -- Rust above `SCHEMA_V1` before adding one (review B8).
 "#;
 
+/// Schema v2: covering indexes for the three columns `Store::inventory` scans
+/// and the plan filters bind against.
+///
+/// `inventory()` runs on every hook call, before the router can decide to skip,
+/// and `chunks.content` is stored inline — so a bare `SELECT DISTINCT language
+/// FROM chunks` pages in the whole corpus. Measured on a 120k-chunk / 91MB
+/// database: the three inventory queries cost 226ms without these and 40ms
+/// with them, and each becomes a covering index scan that never touches the
+/// table.
+///
+/// Additive only. `CREATE INDEX` builds a new B-tree from one pass over the
+/// table; it does not rewrite `chunks`, `chunks_fts`, or `chunks_vec`, so no
+/// re-embed or re-sync is involved. One-time build cost on that same 120k
+/// corpus was ~215ms total.
+const SCHEMA_V2: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_chunks_language   ON chunks(language);
+CREATE INDEX IF NOT EXISTS idx_chunks_doc_type   ON chunks(doc_type);
+CREATE INDEX IF NOT EXISTS idx_chunks_project_id ON chunks(project_id);
+"#;
+
 #[cfg(test)]
 mod b8 {
     use super::*;
@@ -268,6 +288,14 @@ pub(crate) fn migrate(conn: &Connection, dim: usize) -> Result<(), StoreError> {
         ))
         .map_err(|e| StoreError::Migration(e.to_string()))?;
         conn.pragma_update(None, "user_version", 1)
+            .map_err(|e| StoreError::Migration(e.to_string()))?;
+    }
+    // `version` is read once above, so a fresh database (0) runs both steps in
+    // this call while an existing v1 database runs only this one.
+    if version < 2 {
+        conn.execute_batch(SCHEMA_V2)
+            .map_err(|e| StoreError::Migration(e.to_string()))?;
+        conn.pragma_update(None, "user_version", 2)
             .map_err(|e| StoreError::Migration(e.to_string()))?;
     }
     Ok(())
@@ -656,7 +684,133 @@ mod tests {
         let version: i32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
+    }
+
+    fn index_names(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'chunks'
+                   AND name LIKE 'idx_chunks_%' ORDER BY name",
+            )
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// The three columns `Store::inventory` reads and the plan filters bind
+    /// against. Without these, every hook call scans `chunks` — and `content`
+    /// is inline, so the scan pages in the whole corpus.
+    #[test]
+    fn migrate_creates_the_inventory_indexes() {
+        let conn = open_in_memory().expect("open");
+        migrate(&conn, DEFAULT_DIM).expect("migrate");
+
+        assert_eq!(
+            index_names(&conn),
+            vec![
+                "idx_chunks_doc_type".to_string(),
+                "idx_chunks_language".to_string(),
+                "idx_chunks_project_id".to_string(),
+            ]
+        );
+    }
+
+    /// The upgrade path, which the fresh-database test cannot cover: a store
+    /// created before v2 must gain the indexes on its next open, without the
+    /// table being rebuilt.
+    #[test]
+    fn an_existing_v1_database_gains_the_indexes_without_losing_rows() {
+        let conn = open_in_memory().expect("open");
+        // Stop at v1: apply exactly what a pre-v2 vault would have.
+        conn.execute_batch(SCHEMA_V1).expect("v1 schema");
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(chunk_id INTEGER PRIMARY KEY, embedding FLOAT[{DEFAULT_DIM}]);"
+        ))
+        .expect("vec table");
+        conn.pragma_update(None, "user_version", 1).unwrap();
+
+        conn.execute(
+            "INSERT INTO projects (name, repo_path, created_at) VALUES ('p', '/p', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents (project_id, doc_type, source_path, title, content_hash, created_at, updated_at)
+             VALUES (1, 'plan', 'a.md', 'a', 'h', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks (document_id, project_id, doc_type, language, label, content, content_hash, token_est, chunk_index, created_at)
+             VALUES (1, 1, 'plan', 'markdown', 'l', 'c', 'ch', 1, 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        assert!(index_names(&conn).is_empty(), "precondition: v1 has none");
+
+        migrate(&conn, DEFAULT_DIM).expect("upgrade to v2");
+
+        assert_eq!(index_names(&conn).len(), 3, "indexes added on upgrade");
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let chunks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(chunks, 1, "adding an index must not touch the rows");
+    }
+
+    /// The whole point of the indexes: the inventory queries must stop reading
+    /// the table. A covering index keeps `content` — stored inline — off the
+    /// page cache entirely.
+    #[test]
+    fn the_inventory_queries_are_served_by_a_covering_index() {
+        let conn = open_in_memory().expect("open");
+        migrate(&conn, DEFAULT_DIM).expect("migrate");
+
+        use crate::store::sqlite_store::{
+            INVENTORY_DOC_TYPES_SQL, INVENTORY_LANGUAGES_SQL, INVENTORY_PROJECTS_SQL,
+        };
+
+        for (sql, idx) in [
+            (INVENTORY_LANGUAGES_SQL, "idx_chunks_language"),
+            (INVENTORY_DOC_TYPES_SQL, "idx_chunks_doc_type"),
+        ] {
+            let plan: String = conn
+                .query_row(&format!("EXPLAIN QUERY PLAN {sql}"), [], |r| r.get(3))
+                .unwrap();
+            assert!(
+                plan.contains("COVERING INDEX") && plan.contains(idx),
+                "expected a covering index scan on {idx}, got: {plan}"
+            );
+        }
+
+        // The projects query must probe the index per project, not scan every
+        // chunk row and deduplicate — that rewrite is the bulk of its win.
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {INVENTORY_PROJECTS_SQL}"))
+            .unwrap();
+        let steps: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        // The `EXISTS` marker is the load-bearing part: it means SQLite stops
+        // at the first chunk of each project. A `JOIN ... DISTINCT` plans to
+        // the same join order once statistics exist, but emits every matching
+        // row into a temp B-tree to deduplicate — 31ms against 0.26ms on the
+        // 120k corpus, *after* ANALYZE. Asserting only on the index name
+        // cannot tell the two apart.
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("EXISTS") && s.contains("idx_chunks_project_id")),
+            "expected an early-terminating EXISTS probe, got: {steps:?}"
+        );
     }
 
     #[test]
