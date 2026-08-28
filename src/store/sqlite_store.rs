@@ -1560,6 +1560,55 @@ mod tests {
         }
     }
 
+    /// ADVERSARIAL: the relax-retry clears `languages`/`doc_types` and keeps
+    /// `projects`, so the retried search is project-scoped, not unfiltered.
+    /// `vault diagnose` reports that case as "results below are UNFILTERED",
+    /// which is wrong the moment more than one project is indexed.
+    #[test]
+    fn relaxed_retry_still_honours_the_project_filter() {
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+
+        for (name, label) in [("vault", "vault_item"), ("other", "other_item")] {
+            let project_id = create_project(&store, name);
+            store
+                .upsert_document(
+                    &Document {
+                        project_id,
+                        doc_type: DocType::Convention,
+                        source_path: format!("{name}/src/lib.rs"),
+                        title: "lib.rs".into(),
+                        content_hash: format!("h{name}"),
+                    },
+                    &[ChunkWithEmbedding {
+                        chunk: lang_chunk(Language::Rust, label, "fn router query plan", 0),
+                        embedding: unit_embedding(0),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let plan = QueryPlan {
+            projects: vec!["vault".into()],
+            type_names: vec![],
+            topics: vec![],
+            doc_types: vec![],
+            languages: vec![Language::Helm], // zero helm chunks -> relax fires
+        };
+
+        let hits = store
+            .hybrid_search(&plan, &unit_embedding(0), config.alpha())
+            .unwrap();
+
+        assert!(!hits.is_empty(), "the retry must find something");
+        let labels: Vec<&str> = hits.iter().map(|h| h.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["vault_item"],
+            "the project filter survives the relax, so the retry is NOT unfiltered"
+        );
+    }
+
     #[test]
     fn hybrid_search_zero_match_language_filter_degrades_to_search() {
         // The proto trap: the router emits languages=["proto"] for "how does
