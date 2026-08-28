@@ -1,11 +1,11 @@
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, ConfigError};
-use crate::util::fs::{harden_dir, harden_file};
+use crate::util::fs::{harden_dir, harden_file, open_private_append, write_private};
 use crate::util::probe::tei_reachable;
 
 const PID_FILE: &str = "tei.pid";
@@ -82,10 +82,7 @@ pub(crate) fn start(config: &Config) -> Result<(), LauncherError> {
     harden_dir(&vault_dir);
 
     let log_path = vault_dir.join(LOG_FILE);
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
+    let log = open_private_append(&log_path)?;
     harden_file(&log_path);
     let log_err = log.try_clone()?;
 
@@ -107,7 +104,7 @@ pub(crate) fn start(config: &Config) -> Result<(), LauncherError> {
     // is non-blocking and reaps only a child that has already exited.
 
     let pid_path = vault_dir.join(PID_FILE);
-    fs::write(&pid_path, pid.to_string())?;
+    write_private(&pid_path, pid.to_string().as_bytes())?;
     harden_file(&pid_path);
 
     println!(

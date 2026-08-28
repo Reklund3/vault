@@ -393,18 +393,39 @@ impl Store for SqliteStore {
     ) -> Result<usize, StoreError> {
         let tx = self.conn.transaction().map_err(backend_err)?;
 
-        // The placeholder string only contains '?' and ',' — no user data formatted into SQL.
-        // Values are still parameter-bound below.
-        let (kept_clause, kept_params): (String, Vec<&dyn ToSql>) = if kept_paths.is_empty() {
-            (String::new(), Vec::new())
+        // Kept paths go through a temp table rather than an `IN (?, ?, ...)`
+        // list. One bind per kept file made the statement's parameter count
+        // scale with the repo, and SQLite caps that: measured here, a prune
+        // with 32,766 kept paths fails with "too many SQL variables" (the
+        // ceiling is 999 on builds older than 3.32). A monorepo of that size is
+        // unusual but not absurd, and the failure lands at the end of a
+        // successful sync, after all the embedding work. The temp table makes
+        // the parameter count constant at one.
+        //
+        // `DELETE FROM` before filling it: the table is per-connection and
+        // outlives a failed call, so a previous prune's rows would otherwise
+        // survive and protect documents that are now orphans.
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS kept_paths(source_path TEXT PRIMARY KEY);
+             DELETE FROM kept_paths;",
+        )
+        .map_err(backend_err)?;
+        {
+            let mut stmt = tx
+                .prepare("INSERT OR IGNORE INTO temp.kept_paths(source_path) VALUES (?1)")
+                .map_err(backend_err)?;
+            for path in kept_paths {
+                stmt.execute([path]).map_err(backend_err)?;
+            }
+        }
+
+        // An empty kept set means "nothing survives" — no clause, delete all of
+        // the project's documents. Distinct from an empty temp table only in
+        // that it skips the subquery entirely.
+        let kept_clause = if kept_paths.is_empty() {
+            ""
         } else {
-            (
-                format!(
-                    " AND source_path NOT IN ({})",
-                    placeholders(kept_paths.len())
-                ),
-                kept_paths.iter().map(|s| s as &dyn ToSql).collect(),
-            )
+            " AND source_path NOT IN (SELECT source_path FROM temp.kept_paths)"
         };
 
         // 1. Drop chunks_vec rows for orphan documents before the docs go (no FK cascade).
@@ -415,19 +436,14 @@ impl Store for SqliteStore {
                 WHERE d.project_id = ?1{kept_clause}
              )"
         );
-        let mut vec_params: Vec<&dyn ToSql> = vec![&project_id];
-        vec_params.extend(kept_params.iter().copied());
-        tx.execute(&vec_sql, vec_params.as_slice())
-            .map_err(backend_err)?;
+        tx.execute(&vec_sql, [&project_id]).map_err(backend_err)?;
 
         // 2. Delete documents. chunks cascade via FK; chunks_fts cascades via trigger.
         let doc_sql = format!("DELETE FROM documents WHERE project_id = ?1{kept_clause}");
-        let mut doc_params: Vec<&dyn ToSql> = vec![&project_id];
-        doc_params.extend(kept_params.iter().copied());
-        let removed = tx
-            .execute(&doc_sql, doc_params.as_slice())
-            .map_err(backend_err)?;
+        let removed = tx.execute(&doc_sql, [&project_id]).map_err(backend_err)?;
 
+        tx.execute_batch("DELETE FROM kept_paths;")
+            .map_err(backend_err)?;
         tx.commit().map_err(backend_err)?;
         Ok(removed)
     }
@@ -1651,6 +1667,89 @@ mod tests {
         assert!(
             hits.iter().all(|h| h.label == "RustWidget"),
             "a matching language filter must exclude proto chunks, not broaden"
+        );
+    }
+
+    /// A repo big enough to exceed SQLite's host-parameter ceiling must still
+    /// prune. The old `IN (?, ?, ...)` list bound one variable per kept file and
+    /// failed with "too many SQL variables" — measured at 32,766 kept paths on
+    /// the bundled SQLite, and as low as 999 on builds older than 3.32. The
+    /// failure landed after a whole sync's embedding work had already been done.
+    #[test]
+    fn prune_orphans_handles_more_paths_than_sqlite_can_bind() {
+        let mut store = SqliteStore::open_in_memory(&Config::default()).unwrap();
+        let project_id = create_project(&store, "p");
+
+        for path in ["keep.md", "drop.md"] {
+            store
+                .upsert_document(
+                    &Document {
+                        project_id,
+                        doc_type: DocType::Plan,
+                        source_path: path.into(),
+                        title: path.into(),
+                        content_hash: "h".into(),
+                    },
+                    &[],
+                )
+                .unwrap();
+        }
+
+        // Comfortably past the 32,766 ceiling. Only one names a real document;
+        // the rest exist purely to blow the parameter budget.
+        let mut kept: Vec<String> = (0..40_000).map(|i| format!("ghost{i}.md")).collect();
+        kept.push("keep.md".into());
+
+        let removed = store.prune_orphans(project_id, &kept).unwrap();
+
+        assert_eq!(removed, 1, "drop.md is the only orphan");
+        let remaining: Vec<String> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT source_path FROM documents ORDER BY source_path")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(remaining, vec!["keep.md".to_string()]);
+    }
+
+    /// The temp table is per-connection and outlives the call, so it must be
+    /// cleared before each use. A leftover row from an earlier prune would
+    /// protect a document that is an orphan now.
+    #[test]
+    fn prune_orphans_does_not_carry_kept_paths_between_calls() {
+        let mut store = SqliteStore::open_in_memory(&Config::default()).unwrap();
+        let project_id = create_project(&store, "p");
+
+        for path in ["a.md", "b.md"] {
+            store
+                .upsert_document(
+                    &Document {
+                        project_id,
+                        doc_type: DocType::Plan,
+                        source_path: path.into(),
+                        title: path.into(),
+                        content_hash: "h".into(),
+                    },
+                    &[],
+                )
+                .unwrap();
+        }
+
+        // First sync keeps both.
+        assert_eq!(
+            store
+                .prune_orphans(project_id, &["a.md".into(), "b.md".into()])
+                .unwrap(),
+            0
+        );
+
+        // Second sync no longer sees b.md, so it must go.
+        assert_eq!(
+            store.prune_orphans(project_id, &["a.md".into()]).unwrap(),
+            1,
+            "b.md was protected by a stale kept-path row"
         );
     }
 

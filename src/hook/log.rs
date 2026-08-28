@@ -8,13 +8,13 @@
 //! best-effort — every failure inside this module is swallowed, because
 //! fail-open applies to the logger too.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::Outcome;
-use crate::util::fs::{harden_dir, harden_file};
+use crate::util::fs::{harden_dir, harden_file, open_private_append};
 
 const LOG_FILE: &str = "hook.log";
 const ROTATED_FILE: &str = "hook.log.1";
@@ -157,7 +157,7 @@ fn append_to(dir: &Path, line: &str, max_bytes: u64) {
         let _ = fs::remove_file(&rotated);
         let _ = fs::rename(&path, &rotated);
     }
-    let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) else {
+    let Ok(mut f) = open_private_append(&path) else {
         return;
     };
     let _ = f.write_all(line.as_bytes());
