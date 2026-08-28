@@ -36,14 +36,11 @@ const HEALTH_TIMEOUT: Duration = Duration::from_millis(1500);
 /// confirmed separately by `TeiEmbedder::verify_against_server`.
 #[cfg(feature = "cli")]
 pub fn tei_reachable(endpoint: &str) -> bool {
-    let url = format!("{}/health", endpoint.trim_end_matches('/'));
-    let Ok(client) = reqwest::blocking::Client::builder()
-        .timeout(HEALTH_TIMEOUT)
-        .build()
-    else {
+    let Some(client) = crate::util::http::shared() else {
         return false;
     };
-    client.get(&url).send().is_ok()
+    let url = format!("{}/health", endpoint.trim_end_matches('/'));
+    client.get(&url).timeout(HEALTH_TIMEOUT).send().is_ok()
 }
 
 /// Shared TCP-connect core. The endpoint's authority must carry an explicit

@@ -19,7 +19,8 @@ pub struct TeiEmbedder {
     endpoint: Url,
     expected_model: String,
     dim: usize,
-    http: Client,
+    http: &'static Client,
+    timeout: Duration,
 }
 
 impl TeiEmbedder {
@@ -33,15 +34,17 @@ impl TeiEmbedder {
     ) -> Result<Self, EmbedError> {
         let endpoint = Url::parse(config.embedding_endpoint())
             .map_err(|e| EmbedError::Transport(format!("bad endpoint: {e}")))?;
-        let http = Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| EmbedError::Transport(e.to_string()))?;
+        // One process-wide client (see `util::http`): the timeout was the only
+        // thing that ever differed between these, and it rides on the request.
+        let http = crate::util::http::shared().ok_or_else(|| {
+            EmbedError::Transport("could not construct the shared HTTP client".to_string())
+        })?;
         Ok(Self {
             endpoint,
             expected_model: config.embedding_model().to_string(),
             dim: config.embedding_dim(),
             http,
+            timeout,
         })
     }
 
@@ -120,6 +123,7 @@ impl TeiEmbedder {
         let resp = self
             .http
             .post(url)
+            .timeout(self.timeout)
             .json(body)
             .send()
             .map_err(|e| EmbedError::Transport(e.to_string()))?;

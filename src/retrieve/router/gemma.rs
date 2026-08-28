@@ -22,7 +22,8 @@ const MAX_TOKENS: u32 = 1024;
 pub(crate) struct GemmaRouter {
     endpoint: Url,
     model: String,
-    http: Client,
+    http: &'static Client,
+    timeout: Duration,
 }
 
 impl GemmaRouter {
@@ -36,14 +37,16 @@ impl GemmaRouter {
     ) -> Result<Self, RouterError> {
         let endpoint = Url::parse(config.mlx_endpoint())
             .map_err(|e| RouterError::Transport(format!("bad mlx endpoint: {e}")))?;
-        let http = Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| RouterError::Transport(e.to_string()))?;
+        // One process-wide client (see `util::http`): the timeout was the only
+        // thing that ever differed between these, and it rides on the request.
+        let http = crate::util::http::shared().ok_or_else(|| {
+            RouterError::Transport("could not construct the shared HTTP client".to_string())
+        })?;
         Ok(Self {
             endpoint,
             model: config.mlx_model().to_string(),
             http,
+            timeout,
         })
     }
 }
@@ -82,6 +85,7 @@ impl Router for GemmaRouter {
         let resp = self
             .http
             .post(url)
+            .timeout(self.timeout)
             .json(&request)
             .send()
             .map_err(|e| RouterError::Transport(e.to_string()))?;
@@ -238,6 +242,71 @@ mod tests {
             .unwrap();
         let out = parse_response(&text).expect("parse");
         assert!(matches!(out, RouterOutput::Skip));
+    }
+
+    /// The timeout moved from the client to the request when every backend
+    /// started sharing one client (`util::http`). Nothing pinned it: dropping
+    /// `.timeout(..)` from a request still compiles and every other test still
+    /// passes — it just makes the hook's 3s hot-path budget unbounded, which is
+    /// silent until a hung backend holds a user's prompt open.
+    #[test]
+    fn the_request_carries_the_configured_timeout() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        // Bound but never accepted: the TCP connect completes from the backlog,
+        // then the server says nothing at all. Only a timeout ends this.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+
+        let toml_text = format!(
+            r#"
+[defaults]
+context_tag = "vault-context"
+token_budget = 10000
+alpha = 0.1
+min_score = 0.15
+timeout = 3
+
+[router]
+mode = "gemma"
+model = "haiku"
+
+[mlx]
+endpoint = "http://127.0.0.1:{port}"
+router_model = "test"
+
+[embeddings]
+endpoint = "http://127.0.0.1:8081"
+model = "nomic-ai/nomic-embed-text-v1.5"
+dims = 768
+"#
+        );
+        let config: Config = toml::from_str(&toml_text).expect("parse");
+        let router = GemmaRouter::from_config_with_timeout(&config, Duration::from_millis(300))
+            .expect("router");
+
+        // Run off-thread: without a timeout this call never returns, and a
+        // hanging test reports nothing useful.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = router.plan("anything", &Inventory::default());
+            let _ = tx.send((result.is_err(), started.elapsed()));
+        });
+
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok((is_err, elapsed)) => {
+                assert!(is_err, "a server that never replies must not yield a plan");
+                assert!(
+                    elapsed < Duration::from_secs(3),
+                    "took {elapsed:?} — the 300ms request timeout was not applied"
+                );
+            }
+            Err(_) => panic!("the request never timed out — it carries no timeout at all"),
+        }
+        drop(listener);
     }
 
     /// 30s for live tests: production sets the budget via
