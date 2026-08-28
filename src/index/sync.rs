@@ -694,10 +694,14 @@ pub fn format_report(report: &SyncReport) -> String {
             report.files_parsed_as_whole
         );
         if report.files_parser_found_nothing > 0 {
+            // Label shortened to fit the column: `of which parser-empty:` is
+            // exactly 26 characters with its indent, leaving no room to pad,
+            // which is why the separating space used to arrive via
+            // `format_args!`. The parenthetical carries the meaning.
             let _ = writeln!(
                 out,
-                "    of which parser-empty:{} (a parser claimed it and extracted nothing)",
-                format_args!(" {}", report.files_parser_found_nothing)
+                "    of which empty:       {} (a parser claimed it and extracted nothing)",
+                report.files_parser_found_nothing
             );
         }
         if report.files_windowed > 0 {
@@ -731,7 +735,7 @@ pub fn format_report(report: &SyncReport) -> String {
         let _ = writeln!(out, "  Chunks indexed:         {}", report.chunks_indexed);
         let _ = writeln!(
             out,
-            "  Chunks dropped (secret): {}",
+            "  Dropped (secret):       {}",
             report.chunks_dropped_secret
         );
         let _ = writeln!(out, "  Orphans pruned:         {}", report.orphans_pruned);
@@ -1848,6 +1852,71 @@ mod tests {
 
         assert!(s.contains("no domain attribute"), "{s}");
         assert!(!s.contains("-context>"), "{s}");
+    }
+
+    /// Every counter in the report body must put its value in the same column.
+    ///
+    /// The labels are hand-padded, so a label that grows past the column budget
+    /// silently pushes its own value one place right and nothing else notices.
+    /// That is how `of which parser-empty:` came to smuggle its separating
+    /// space in through a `format_args!(" {}", ..)` — the indirection review
+    /// finding 14 flagged was the *symptom*; `Chunks dropped (secret):` had the
+    /// same overflow with no `format_args!` involved and was in no finding at
+    /// all.
+    ///
+    /// Populated so every conditional line renders; a zeroed report hides most
+    /// of them.
+    #[test]
+    fn every_report_counter_lands_in_the_same_column() {
+        let r = SyncReport {
+            project: "vault".into(),
+            dry_run: false,
+            domain: Some("software".into()),
+            files_walked: 10,
+            files_classified: 9,
+            files_unchanged: 1,
+            files_skipped_remote_classify: 2,
+            files_parsed_via_parser: 5,
+            files_parsed_as_whole: 4,
+            files_windowed: 3,
+            files_parser_found_nothing: 2,
+            oversize_lines_truncated: 1,
+            chunks_indexed: 42,
+            chunks_dropped_secret: 7,
+            orphans_pruned: 3,
+            ..SyncReport::default()
+        };
+        let rendered = format_report(&r);
+
+        // A counter line is `  Label:<padding>value`. Skips the `- path: reason`
+        // entries and the `Label breakdown (...):` / `Skipped (n):` headers,
+        // which carry no value after the colon.
+        let columns: Vec<(usize, &str)> = rendered
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('-'))
+            .filter_map(|l| {
+                let colon = l.find(':')?;
+                let after = &l[colon + 1..];
+                if after.trim().is_empty() {
+                    return None;
+                }
+                let pad = after.len() - after.trim_start().len();
+                Some((colon + 1 + pad, l))
+            })
+            .collect();
+
+        assert!(columns.len() >= 10, "expected the full body: {rendered}");
+        let expected = columns[0].0;
+        let stray: Vec<&str> = columns
+            .iter()
+            .filter(|(c, _)| *c != expected)
+            .map(|(_, l)| *l)
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "these counters do not align at column {expected}:\n{}",
+            stray.join("\n")
+        );
     }
 
     #[test]
