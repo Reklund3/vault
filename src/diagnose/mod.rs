@@ -99,7 +99,28 @@ pub fn run(args: Args) -> CliResult {
     // the header so the trace can say whether the plan above it reached
     // anything; `None` (backend cannot count) prints nothing.
     let filter_reach = match plan.as_ref() {
-        Some(p) => filter_reach(p, store.count_matching_filters(p)?),
+        Some(p) => {
+            let matching = store.count_matching_filters(p)?;
+            // Only when the filters caught nothing is a retry coming, and only
+            // then is it worth two more counts to describe what it will search.
+            let retried_over = if matching == Some(0) {
+                let mut relaxed = p.clone();
+                relaxed.languages.clear();
+                relaxed.doc_types.clear();
+                let scope = store.count_matching_filters(&relaxed)?;
+                let total = store.count_matching_filters(&QueryPlan {
+                    projects: vec![],
+                    type_names: vec![],
+                    topics: vec![],
+                    doc_types: vec![],
+                    languages: vec![],
+                })?;
+                scope.zip(total)
+            } else {
+                None
+            };
+            filter_reach(p, matching, retried_over)
+        }
         None => FilterReach::Unreported,
     };
 
@@ -149,31 +170,47 @@ pub fn run(args: Args) -> CliResult {
 /// wrong to hide here: without it on screen the trace prints a filter in the
 /// plan and the whole unfiltered corpus underneath, which reads as proof the
 /// filter matched.
+#[derive(Debug)]
 enum FilterReach {
     /// Nothing to say: the plan carries no structural filter, or the backend
     /// does not implement the count.
     Unreported,
     Matched(usize),
-    /// The filters selected no chunks. `relaxed` is whether that actually
-    /// triggered the retry — it fires only for `doc_types`/`languages`, so a
-    /// `projects`-only plan reaching zero returns an empty result instead.
-    Nothing {
-        relaxed: bool,
+    /// The filters selected nothing, so `hybrid_search` cleared
+    /// `doc_types`/`languages` and retried. `retried_over` is `(scope, total)`
+    /// — how many chunks the retry could actually reach, against the whole
+    /// corpus — or `None` when the backend cannot count.
+    ///
+    /// The retry keeps `projects`, so it is *not* necessarily unfiltered. It is
+    /// measured rather than read off the plan because `existing_project_ids`
+    /// degrades project names that do not resolve, and a plan naming only
+    /// unknown projects retries over everything despite listing a filter.
+    Relaxed {
+        retried_over: Option<(usize, usize)>,
     },
+    /// The filters selected nothing and no retry fired: the relax clears only
+    /// `doc_types`/`languages`, so a `projects`-only plan returns empty.
+    Nothing,
 }
 
-fn filter_reach(plan: &QueryPlan, count: Option<usize>) -> FilterReach {
+fn filter_reach(
+    plan: &QueryPlan,
+    matching: Option<usize>,
+    retried_over: Option<(usize, usize)>,
+) -> FilterReach {
     let has_filter =
         !plan.projects.is_empty() || !plan.doc_types.is_empty() || !plan.languages.is_empty();
     if !has_filter {
         return FilterReach::Unreported;
     }
-    match count {
+    match matching {
         None => FilterReach::Unreported,
-        Some(0) => FilterReach::Nothing {
-            // Mirrors the condition in `Store::hybrid_search`.
-            relaxed: !plan.doc_types.is_empty() || !plan.languages.is_empty(),
-        },
+        // Mirrors the retry condition in `Store::hybrid_search`: it fires for
+        // `doc_types`/`languages` only.
+        Some(0) if !plan.doc_types.is_empty() || !plan.languages.is_empty() => {
+            FilterReach::Relaxed { retried_over }
+        }
+        Some(0) => FilterReach::Nothing,
         Some(n) => FilterReach::Matched(n),
     }
 }
@@ -383,13 +420,20 @@ fn print_header(h: &TraceHeader<'_>) {
     match h.filter_reach {
         FilterReach::Unreported => {}
         FilterReach::Matched(n) => println!("filters:   match {n} chunks"),
-        FilterReach::Nothing { relaxed: true } => println!(
-            "filters:   match 0 chunks — doc_types/languages dropped, \
-             results below are UNFILTERED"
-        ),
-        FilterReach::Nothing { relaxed: false } => {
-            println!("filters:   match 0 chunks")
-        }
+        FilterReach::Relaxed { retried_over } => match retried_over {
+            // The retry keeps `projects`, so say what it could actually reach
+            // rather than calling every relaxed search unfiltered.
+            Some((scope, total)) if scope < total => println!(
+                "filters:   match 0 chunks — doc_types/languages dropped, \
+                 retried over {scope} of {total} chunks (projects filter kept)"
+            ),
+            Some((_, total)) => println!(
+                "filters:   match 0 chunks — doc_types/languages dropped, \
+                 retried over all {total} chunks"
+            ),
+            None => println!("filters:   match 0 chunks — doc_types/languages dropped, retried"),
+        },
+        FilterReach::Nothing => println!("filters:   match 0 chunks"),
     }
     if h.inventory.is_empty() {
         println!("indexed:   (nothing — router ungrounded, no pruning applied)");
@@ -744,18 +788,41 @@ mod tests {
         assert_eq!(plan.topics, vec!["auth".to_string()], "override applied");
         assert!(matches!(status, RouterStatus::Plan { .. }));
     }
-    /// A filter that selected nothing must be called out. The store relaxed it
-    /// and searched the whole corpus, so the results printed underneath the
-    /// plan have nothing to do with the plan.
+    /// A filter that selected nothing must be called out, together with what
+    /// the retry could actually reach — otherwise the results printed under the
+    /// plan look like the plan produced them.
     #[test]
     fn a_filter_matching_no_chunks_is_reported_as_relaxed() {
         let mut plan = empty_plan();
         plan.languages = vec![Language::Helm];
 
         assert!(matches!(
-            filter_reach(&plan, Some(0)),
-            FilterReach::Nothing { relaxed: true }
+            filter_reach(&plan, Some(0), Some((705, 705))),
+            FilterReach::Relaxed {
+                retried_over: Some((705, 705))
+            }
         ));
+    }
+
+    /// The relax clears `doc_types`/`languages` and **keeps `projects`**, so a
+    /// retry under a project filter is not unfiltered. Reporting it as such was
+    /// the bug: with one project indexed the two are indistinguishable, and
+    /// with two the trace claimed a scope it never searched.
+    #[test]
+    fn a_relax_under_a_project_filter_is_not_reported_as_unfiltered() {
+        let mut plan = empty_plan();
+        plan.projects = vec!["vault".into()];
+        plan.languages = vec![Language::Helm];
+
+        let reach = filter_reach(&plan, Some(0), Some((631, 705)));
+        match reach {
+            FilterReach::Relaxed {
+                retried_over: Some((scope, total)),
+            } => {
+                assert!(scope < total, "the surviving project filter must show");
+            }
+            other => panic!("expected a scoped relax, got {other:?}"),
+        }
     }
 
     /// `hybrid_search` relaxes `doc_types`/`languages` only. A `projects`-only
@@ -767,8 +834,8 @@ mod tests {
         plan.projects = vec!["never-synced".into()];
 
         assert!(matches!(
-            filter_reach(&plan, Some(0)),
-            FilterReach::Nothing { relaxed: false }
+            filter_reach(&plan, Some(0), None),
+            FilterReach::Nothing
         ));
     }
 
@@ -778,7 +845,7 @@ mod tests {
         plan.languages = vec![Language::Rust];
 
         assert!(matches!(
-            filter_reach(&plan, Some(631)),
+            filter_reach(&plan, Some(631), None),
             FilterReach::Matched(631)
         ));
     }
@@ -788,11 +855,14 @@ mod tests {
     #[test]
     fn nothing_is_reported_without_a_filter_or_a_count() {
         assert!(matches!(
-            filter_reach(&empty_plan(), Some(0)),
+            filter_reach(&empty_plan(), Some(0), None),
             FilterReach::Unreported
         ));
         let mut plan = empty_plan();
         plan.languages = vec![Language::Rust];
-        assert!(matches!(filter_reach(&plan, None), FilterReach::Unreported));
+        assert!(matches!(
+            filter_reach(&plan, None, None),
+            FilterReach::Unreported
+        ));
     }
 }
