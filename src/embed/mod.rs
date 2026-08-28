@@ -12,8 +12,14 @@ pub use stub::StubEmbedder;
 pub use tei::TeiEmbedder;
 
 pub trait Embedder {
-    /// Embedding dimension this embedder produces. Used by callers (the store,
-    /// validation paths) to confirm three-way agreement: config ⟷ schema ⟷ server.
+    /// Embedding dimension this embedder produces.
+    ///
+    /// Part of the trait contract, exercised only by test doubles today — the
+    /// config ⟷ schema ⟷ server agreement it was meant to check is enforced
+    /// instead by `TeiEmbedder::verify_against_server` and the store's
+    /// `(model, dim)` lock. Kept because an `Embedder` that cannot state its
+    /// dimension cannot be validated at all; the previous comment claimed
+    /// callers in the store and validation paths, and there were none.
     #[allow(dead_code)]
     fn dim(&self) -> usize;
 

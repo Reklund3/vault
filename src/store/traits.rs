@@ -6,9 +6,6 @@ use crate::types::Inventory;
 pub enum StoreError {
     #[error("migration failed: {0}")]
     Migration(String),
-    #[error("not found")]
-    #[allow(dead_code)]
-    NotFound,
     #[error("integrity violation: {0}")]
     Conflict(String),
     #[error("invalid input: {0}")]
@@ -206,6 +203,9 @@ pub trait Store {
         Ok(hits)
     }
 
+    /// Record a retrieval for later tuning. Implemented by the SQLite backend
+    /// and covered by its tests, but not yet called from the hook — the
+    /// unfinished half of the `retrieval_log` feature, kept deliberately.
     #[allow(dead_code)]
     fn log_retrieval(&mut self, entry: &RetrievalLogEntry) -> Result<(), StoreError>;
 }

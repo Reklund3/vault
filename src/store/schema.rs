@@ -233,7 +233,9 @@ pub(crate) fn open(path: &Path) -> Result<Connection, StoreError> {
     Ok(conn)
 }
 
-#[allow(dead_code)]
+/// Test-only: the sole caller, `SqliteStore::open_in_memory`, is `#[cfg(test)]`.
+/// Gated rather than `allow(dead_code)`-ed so the compiler keeps that true.
+#[cfg(test)]
 pub(crate) fn open_in_memory() -> Result<Connection, StoreError> {
     register_vec_extension();
     let conn = Connection::open_in_memory().map_err(|e| StoreError::Backend(e.to_string()))?;

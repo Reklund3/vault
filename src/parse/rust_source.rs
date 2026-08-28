@@ -38,10 +38,9 @@ impl Parser for RustParser {
                     return Err(ParseError::Unterminated { line: i + 1 });
                 }
                 if scanner.group_depth > 0 {
-                    let (ty, trait_impl) = parse_impl_target(pending_impl.take().unwrap().as_str());
+                    let ty = parse_impl_target(pending_impl.take().unwrap().as_str());
                     mode = Mode::Impl {
                         ty,
-                        trait_impl,
                         body_depth: scanner.group_depth,
                     };
                     preamble_start = None;
@@ -77,10 +76,9 @@ impl Parser for RustParser {
                             if is_impl_header(trimmed) {
                                 let new_depth = pre_depth + net;
                                 if new_depth > 0 {
-                                    let (ty, trait_impl) = parse_impl_target(raw_line);
+                                    let ty = parse_impl_target(raw_line);
                                     next_mode = Some(Mode::Impl {
                                         ty,
-                                        trait_impl,
                                         body_depth: new_depth,
                                     });
                                 } else if !raw_line.contains('{') {
@@ -117,7 +115,6 @@ impl Parser for RustParser {
                                     open = Some(OpenItem {
                                         label: format!("{} {}", item.kind.keyword(), item.name),
                                         start_line: start,
-                                        emit: true,
                                         close_depth: 0,
                                     });
                                 }
@@ -125,24 +122,12 @@ impl Parser for RustParser {
                                 preamble_start = None;
                             }
                         }
-                        Mode::Impl {
-                            ty,
-                            trait_impl,
-                            body_depth,
-                        } => {
+                        Mode::Impl { ty, body_depth } => {
                             if let Some(method) = parse_method_header(raw_line) {
-                                // Was `*trait_impl || method.is_pub`. Trait-impl
-                                // methods were always emitted (they cannot be
-                                // marked `pub`), so the rule dropped exactly the
-                                // private *inherent* ones — among them
-                                // `SqliteStore::existing_project_ids`.
-                                let _ = (trait_impl, method.is_pub);
-                                let emit = true;
                                 let start = preamble_start.take().unwrap_or(i);
                                 open = Some(OpenItem {
                                     label: format!("{ty}::{}", method.name),
                                     start_line: start,
-                                    emit,
                                     close_depth: *body_depth,
                                 });
                             } else {
@@ -169,10 +154,8 @@ impl Parser for RustParser {
                 && scanner.block_comment_depth == 0
                 && !scanner.in_string_like()
             {
-                if item.emit {
-                    let content = lines[item.start_line..=i].join("\n");
-                    push_chunk(&mut chunks, &mut chunk_index, item.label.clone(), content);
-                }
+                let content = lines[item.start_line..=i].join("\n");
+                push_chunk(&mut chunks, &mut chunk_index, item.label.clone(), content);
                 open = None;
             }
 
@@ -215,17 +198,12 @@ fn push_chunk(chunks: &mut Vec<Chunk>, chunk_index: &mut u32, label: String, con
 
 enum Mode {
     Module,
-    Impl {
-        ty: String,
-        trait_impl: bool,
-        body_depth: i32,
-    },
+    Impl { ty: String, body_depth: i32 },
 }
 
 struct OpenItem {
     label: String,
     start_line: usize,
-    emit: bool,
     /// The `group_depth` this item returns to when its body closes: 0 for a
     /// top-level item, the impl's body depth for a method.
     close_depth: i32,
@@ -263,7 +241,6 @@ struct PubItem {
 
 struct Method {
     name: String,
-    is_pub: bool,
 }
 
 #[derive(Default)]
@@ -489,10 +466,14 @@ fn is_impl_header(trimmed: &str) -> bool {
     }
 }
 
-/// Parse the implementing type and whether this is a trait impl from an impl
-/// header (single line or accumulated multi-line). `impl<T> Tr<T> for Foo<T>`
-/// → (`Foo`, true); `impl Foo` → (`Foo`, false).
-fn parse_impl_target(text: &str) -> (String, bool) {
+/// Parse the implementing type from an impl header (single line or accumulated
+/// multi-line). `impl<T> Tr<T> for Foo<T>` → `Foo`; `impl Foo` → `Foo`.
+///
+/// Trait impls and inherent impls are not distinguished. They were, back when
+/// only `pub` methods were chunked and a trait impl's methods (which cannot be
+/// marked `pub`) needed an exemption. Chunking covers every visibility now, so
+/// both kinds emit the same way and the distinction had no reader left.
+fn parse_impl_target(text: &str) -> String {
     let head = match text.find('{') {
         Some(b) => &text[..b],
         None => text,
@@ -505,8 +486,8 @@ fn parse_impl_target(text: &str) -> (String, bool) {
         None => head,
     };
     match split_on_word(head, "for") {
-        Some((_, target)) => (type_name_from(target), true),
-        None => (type_name_from(head), false),
+        Some((_, target)) => type_name_from(target),
+        None => type_name_from(head),
     }
 }
 
@@ -550,14 +531,14 @@ fn parse_pub_item(line: &str) -> Option<PubItem> {
 
 fn parse_method_header(line: &str) -> Option<Method> {
     let t = line.trim_start();
-    let (is_pub, t) = strip_visibility(t);
+    let (_, t) = strip_visibility(t);
     let t = strip_modifiers(t);
     let rest = strip_word(t, "fn")?;
     let name = read_name(rest);
     if name.is_empty() {
         return None;
     }
-    Some(Method { name, is_pub })
+    Some(Method { name })
 }
 
 /// Strip a leading `pub` / `pub(crate)` / `pub(in path)` visibility. Returns

@@ -11,9 +11,6 @@ const CONFIG_DB: &str = "vault.db";
 pub enum ConfigError {
     #[error("could not resolve home directory (set HOME or USERPROFILE)")]
     HomeNotFound,
-    #[error("missing key {0}")]
-    #[allow(dead_code)]
-    MissingKey(String),
     #[error("io error reading config {}: {source}", path.display())]
     IoError {
         path: PathBuf,

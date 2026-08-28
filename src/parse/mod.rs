@@ -19,6 +19,9 @@ pub use proto::ProtoParser;
 pub use rust_source::RustParser;
 
 pub trait Parser {
+    /// The language this parser claims. Dispatch goes through `select_parser`
+    /// on `(doc_type, language)` rather than asking the parser, so this is
+    /// read only by tests asserting each parser reports itself correctly.
     #[allow(dead_code)]
     fn language(&self) -> Language;
     fn parse(&self, source: &str) -> Result<Vec<Chunk>, ParseError>;
