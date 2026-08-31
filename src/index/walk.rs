@@ -35,6 +35,30 @@ const BUILT_IN_EXCLUDES: &[&str] = &[
     "**/.DS_Store",
 ];
 
+/// Machine-generated dependency locks. Non-removable like `BUILT_IN_EXCLUDES`,
+/// but kept separate because the rationale is different: these are not a
+/// security boundary, they are content that can never answer a question.
+///
+/// A lockfile has no prose, no structure any parser claims, and no lexical
+/// surface — so it lands in the windowed whole-file fallback as a run of
+/// hash chunks that score `bm25 = 0.000` against every query and are reachable
+/// only by cosine. Measured on this repo before the exclusion: `Cargo.lock`
+/// alone was 8 chunks and 11,475 tokens, 80% of the entire `unknown`-language
+/// bucket, and a `languages: ["unknown"]` plan spent 9,854 of a 10,000-token
+/// budget with five `Cargo.lock` windows in the top ten. They cannot be
+/// retrieved *for* anything; they only displace chunks that can.
+///
+/// `*.lock` does not cover the category — npm, pnpm and Go use other suffixes —
+/// so the common names are listed explicitly.
+const BUILT_IN_NOISE_EXCLUDES: &[&str] = &[
+    "*.lock",            // Cargo, yarn, poetry, Gemfile, composer, flake, Pipfile
+    "*.lockb",           // bun
+    "package-lock.json", // npm
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+    "go.sum",
+];
+
 #[derive(Debug, Default, Clone)]
 pub struct WalkOptions {
     /// User-supplied glob additions from `[indexer.exclude].patterns`. Applied
@@ -138,7 +162,7 @@ pub fn walk_repo(root: &Path, opts: &WalkOptions) -> Result<Vec<Walked>, WalkErr
 
 fn build_exclude_set(user_extras: &[String], gitignore: &[String]) -> Result<GlobSet, WalkError> {
     let mut builder = GlobSetBuilder::new();
-    for pat in BUILT_IN_EXCLUDES {
+    for pat in BUILT_IN_EXCLUDES.iter().chain(BUILT_IN_NOISE_EXCLUDES) {
         let glob = Glob::new(pat).map_err(|e| WalkError::BadGlob {
             pattern: (*pat).to_string(),
             detail: e.to_string(),
@@ -279,6 +303,51 @@ mod tests {
         let mut v: Vec<String> = walked.iter().map(|w| w.relative_path.clone()).collect();
         v.sort();
         v
+    }
+
+    /// Lockfiles are machine-generated hash soup: no prose, no structure a
+    /// parser claims, no lexical surface. They chunk into windows that score
+    /// `bm25 = 0.000` against everything and can only crowd out chunks that
+    /// answer something. The manifests beside them stay — `Cargo.toml` is
+    /// hand-written and genuinely useful.
+    #[test]
+    fn excludes_dependency_lockfiles_but_keeps_their_manifests() {
+        let tmp = Tmp::new("lockfiles");
+        // One per ecosystem, because `*.lock` alone misses npm, pnpm and Go.
+        for locked in [
+            "Cargo.lock",
+            "yarn.lock",
+            "poetry.lock",
+            "Gemfile.lock",
+            "composer.lock",
+            "flake.lock",
+            "bun.lockb",
+            "package-lock.json",
+            "npm-shrinkwrap.json",
+            "pnpm-lock.yaml",
+            "go.sum",
+        ] {
+            tmp.write(locked, b"hash soup");
+        }
+        // Nested too — a workspace member's lockfile is no more useful.
+        tmp.write("crates/inner/Cargo.lock", b"hash soup");
+
+        for kept in ["Cargo.toml", "package.json", "go.mod", "pyproject.toml"] {
+            tmp.write(kept, b"real content");
+        }
+
+        let out = walk_repo(&tmp.root, &WalkOptions::default()).unwrap();
+
+        assert_eq!(
+            rels(&out),
+            vec![
+                "Cargo.toml".to_string(),
+                "go.mod".to_string(),
+                "package.json".to_string(),
+                "pyproject.toml".to_string(),
+            ],
+            "every lockfile must be excluded and every manifest kept"
+        );
     }
 
     #[test]
