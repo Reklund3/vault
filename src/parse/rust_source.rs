@@ -27,7 +27,8 @@ impl Parser for RustParser {
             let pre_depth = scanner.group_depth;
             let pre_in_block_comment = scanner.block_comment_depth > 0;
             let pre_in_string = scanner.in_string_like();
-            let net = scanner.scan_line(raw_line, i)?;
+            let facts = scanner.scan_line(raw_line, i)?;
+            let net = facts.net;
 
             // --- multi-line impl header accumulation ---
             if let Some(text) = pending_impl.as_mut() {
@@ -115,6 +116,7 @@ impl Parser for RustParser {
                                     open = Some(OpenItem {
                                         label: format!("{} {}", item.kind.keyword(), item.name),
                                         start_line: start,
+                                        body_opened: false,
                                         close_depth: 0,
                                     });
                                 }
@@ -128,6 +130,7 @@ impl Parser for RustParser {
                                 open = Some(OpenItem {
                                     label: format!("{ty}::{}", method.name),
                                     start_line: start,
+                                    body_opened: false,
                                     close_depth: *body_depth,
                                 });
                             } else {
@@ -149,14 +152,38 @@ impl Parser for RustParser {
                 });
             }
 
+            // A `{` on this line means the body has begun — checked after the
+            // depth update, and by *curly* rather than by depth, so a one-liner
+            // (`fn f() {}`, net zero) is recognised while a multi-line parameter
+            // list (`fn f(` … `)`) is not mistaken for one.
+            if let Some(item) = &mut open
+                && facts.opened_brace
+                && scanner.block_comment_depth == 0
+            {
+                item.body_opened = true;
+            }
+
             if let Some(item) = &open
                 && scanner.group_depth == item.close_depth
                 && scanner.block_comment_depth == 0
                 && !scanner.in_string_like()
             {
-                let content = lines[item.start_line..=i].join("\n");
-                push_chunk(&mut chunks, &mut chunk_index, item.label.clone(), content);
-                open = None;
+                // Two ways an item ends, and the header line sits at
+                // `close_depth` before either has happened — which is why the
+                // depth test alone used to close a `where`-clause item on its
+                // signature and throw the body away.
+                //
+                // A brace-less item (`pub type Id = u64;`, a unit or tuple
+                // struct) never opens a body and ends at its `;` instead. That
+                // is the case a naive "wait for the body" fix breaks: with no
+                // terminator rule it never closes, and swallows the rest of the
+                // file.
+                let ended = item.body_opened || facts.semicolon;
+                if ended {
+                    let content = lines[item.start_line..=i].join("\n");
+                    push_chunk(&mut chunks, &mut chunk_index, item.label.clone(), content);
+                    open = None;
+                }
             }
 
             let exit_impl =
@@ -204,6 +231,15 @@ enum Mode {
 struct OpenItem {
     label: String,
     start_line: usize,
+    /// Has this item's body actually started?
+    ///
+    /// Without it, closing on `group_depth == close_depth` fires on the header
+    /// line itself whenever the `{` is on a later line — which rustfmt does for
+    /// every multi-line `where` clause — emitting the signature and discarding
+    /// the body. Closing *needs* this because the header line is already at
+    /// `close_depth`; an item with no body never sets it and ends at its `;`
+    /// instead.
+    body_opened: bool,
     /// The `group_depth` this item returns to when its body closes: 0 for a
     /// top-level item, the impl's body depth for a method.
     close_depth: i32,
@@ -243,6 +279,20 @@ struct Method {
     name: String,
 }
 
+/// What one line contributed, beyond its net depth change.
+///
+/// `opened_brace` and `semicolon` are recorded as *code* — the scanner already
+/// tracks strings, char literals and nested block comments, so a `{` inside
+/// `"…"` or a `;` in a trailing comment does not count.
+struct LineFacts {
+    net: i32,
+    /// A `{` appeared. Distinct from `net > 0`, which `(` and `[` also cause.
+    opened_brace: bool,
+    /// A `;` appeared — the only way a brace-less item (`pub type Id = u64;`,
+    /// a unit struct) ever ends.
+    semicolon: bool,
+}
+
 #[derive(Default)]
 struct LineScanner {
     /// Combined nesting over `{`/`(`/`[`. Angle brackets are deliberately not
@@ -265,10 +315,12 @@ impl LineScanner {
 
     /// Net opener-minus-closer count on this line, ignoring comments, strings,
     /// raw strings, char literals, and lifetimes. Updates cross-line state.
-    fn scan_line(&mut self, line: &str, line_idx: usize) -> Result<i32, ParseError> {
+    fn scan_line(&mut self, line: &str, line_idx: usize) -> Result<LineFacts, ParseError> {
         let bytes = line.as_bytes();
         let mut i = 0;
         let mut net: i32 = 0;
+        let mut opened_brace = false;
+        let mut semicolon = false;
         let mut in_line_comment = false;
         let mut in_char = false;
         let mut prev_ident = false;
@@ -399,12 +451,24 @@ impl LineScanner {
             }
 
             match b {
-                b'{' | b'(' | b'[' => {
+                b'{' => {
+                    net += 1;
+                    // Curly specifically: `group_depth` also counts `(` and `[`,
+                    // so a multi-line parameter list raises it without a body
+                    // having started.
+                    opened_brace = true;
+                    prev_ident = false;
+                }
+                b'(' | b'[' => {
                     net += 1;
                     prev_ident = false;
                 }
                 b'}' | b')' | b']' => {
                     net -= 1;
+                    prev_ident = false;
+                }
+                b';' => {
+                    semicolon = true;
                     prev_ident = false;
                 }
                 _ => {
@@ -414,7 +478,11 @@ impl LineScanner {
             i += 1;
         }
 
-        Ok(net)
+        Ok(LineFacts {
+            net,
+            opened_brace,
+            semicolon,
+        })
     }
 }
 
@@ -1189,15 +1257,108 @@ pub fn f() {}
     /// condition is `group_depth == close_depth` and a header with no `{` never
     /// raises the depth — so the chunk holds the signature and none of the body.
     ///
-    /// Left as a failing case rather than deleted: it is the reproduction. The
-    /// fix needs a third state (has the body started?), because closing
-    /// immediately at `close_depth` is *correct* for brace-less items like
-    /// `pub type Id = u64;` — making the naive fix swallow everything after one.
+    /// Fixed by `OpenItem::body_opened`. The close test is
+    /// `group_depth == close_depth`, which the *header* line already satisfies,
+    /// so an item whose `{` lands on a later line used to close on its
+    /// signature and lose the body.
     ///
-    /// Measured against the live index: zero chunks are affected, since this
-    /// tree is rustfmt-clean. It bites on vendored or generated code.
+    /// The naive fix — wait for the body unconditionally — breaks brace-less
+    /// items like `pub type Id = u64;`, which never open one and would swallow
+    /// the rest of the file; `facts.semicolon` is the other half.
+    ///
+    /// The case that makes this more than a style curiosity: rustfmt puts the
+    /// `{` on its own line for every multi-line `where` clause, so this is
+    /// *standard* formatting, not Allman. Two of this crate's own functions
+    /// were being indexed as bare signatures because of it.
     #[test]
-    #[ignore = "known bug: Allman-style braces lose the item body — see doc comment"]
+    fn a_where_clause_does_not_truncate_the_item() {
+        let src = "\
+pub fn render<W>(w: &mut W) -> Result<(), Error>
+where
+    W: std::io::Write,
+{
+    writeln!(w, \"BODY_MARKER\")?;
+    Ok(())
+}
+
+pub fn plain(x: i32) -> i32 {
+    x + 1
+}
+";
+        let chunks = parse(src);
+        assert_eq!(labels(&chunks), ["fn render", "fn plain"]);
+        assert!(
+            chunks[0].content.contains("BODY_MARKER"),
+            "body lost: {}",
+            chunks[0].content
+        );
+        assert!(
+            chunks[0].content.contains("W: std::io::Write"),
+            "the where clause is part of the signature: {}",
+            chunks[0].content
+        );
+    }
+
+    /// The trap in the fix. These never open a body, so "wait for the body"
+    /// alone would leave the first one open forever and swallow everything
+    /// after it.
+    #[test]
+    fn brace_less_items_still_close_at_their_semicolon() {
+        let src = "\
+pub type Id = u64;
+
+pub struct Marker;
+
+pub struct Wrapper(pub u32);
+
+pub const LIMIT: usize = 8;
+
+pub type Spread =
+    std::collections::HashMap<String, u32>;
+
+pub fn after_them_all() -> i32 {
+    7
+}
+";
+        let chunks = parse(src);
+        assert_eq!(
+            labels(&chunks),
+            [
+                "type Id",
+                "struct Marker",
+                "struct Wrapper",
+                "const LIMIT",
+                "type Spread",
+                "fn after_them_all"
+            ],
+            "a brace-less item that never closes swallows every item after it"
+        );
+        assert!(
+            chunks[5].content.contains("7"),
+            "the trailing fn kept its body: {}",
+            chunks[5].content
+        );
+    }
+
+    /// A multi-line parameter list raises `group_depth` via `(`, not `{`, so it
+    /// must not count as the body starting — otherwise the item closes at the
+    /// `)` and loses everything after it.
+    #[test]
+    fn a_multi_line_signature_is_not_mistaken_for_a_body() {
+        let src = "\
+pub fn wide(
+    a: i32,
+    b: i32,
+) -> i32 {
+    a + b
+}
+";
+        let chunks = parse(src);
+        assert_eq!(labels(&chunks), ["fn wide"]);
+        assert!(chunks[0].content.contains("a + b"), "{}", chunks[0].content);
+    }
+
+    #[test]
     fn opening_brace_on_newline_includes_body() {
         let src = "\
 fn helper()
