@@ -60,6 +60,11 @@ CREATE TABLE IF NOT EXISTS chunks (
     document_id  INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     project_id   INTEGER NOT NULL,
     doc_type     TEXT NOT NULL,
+    -- 'helm' is retained deliberately. `Language::Helm` was removed from the
+    -- enum (Helm is a templating framework, not a syntax, and had no parser),
+    -- but narrowing a CHECK in SQLite requires rebuilding the table — three
+    -- FTS5 triggers and chunks_vec hang off this one. Nothing writes 'helm' any
+    -- more; `inventory()` skips a stale row rather than failing on it.
     language     TEXT NOT NULL CHECK(language IN
                    ('go','rust','scala','proto','openapi','helm','markdown','unknown')),
     label        TEXT NOT NULL,

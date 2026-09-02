@@ -77,7 +77,7 @@ pub(crate) const CLASSIFY_SYSTEM: &str = r#"You classify a source file for a cod
 
 You are given a file's name, extension, and the first 1KB of its content. Respond with JSON only — no prose, no markdown fences:
 
-{"doc_type": "<contract|plan|convention|meta>", "language": "<go|rust|scala|proto|openapi|helm|markdown|unknown>"}
+{"doc_type": "<contract|plan|convention|meta>", "language": "<go|rust|scala|proto|openapi|markdown|unknown>"}
 
 doc_type:
 - contract:   API/interface definitions — protobuf, OpenAPI/Swagger specs

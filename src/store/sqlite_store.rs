@@ -1020,11 +1020,11 @@ mod tests {
         assert_eq!(count(&indexed), Some(1), "rust is indexed");
 
         let mut dead = bare();
-        dead.languages = vec![Language::Helm];
+        dead.languages = vec![Language::Scala];
         assert_eq!(
             count(&dead),
             Some(0),
-            "helm has no chunks — relax will fire"
+            "scala has no chunks — relax will fire"
         );
 
         // The AND-combination is what matters, not per-field existence: both
@@ -1047,6 +1047,60 @@ mod tests {
     /// the truth and every later value silently vanishes from the inventory —
     /// which then prunes it out of every plan. Two values cannot show that;
     /// this uses every language the CHECK constraint allows.
+    /// `Language::Helm` was removed from the enum without a schema migration:
+    /// the CHECK on `chunks.language` still permits 'helm', because narrowing
+    /// it would need a full table rebuild for a value nothing writes any more.
+    /// So a database synced by an older vault can still hold `helm` rows, and
+    /// the read path must skip them rather than fail — `inventory()` is on the
+    /// hook's fail-open path, where aborting retrieval over one stale label
+    /// would be much worse than omitting it.
+    #[test]
+    fn a_legacy_helm_row_is_skipped_not_fatal() {
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+        let project_id = create_project(&store, "vault");
+
+        store
+            .upsert_document(
+                &Document {
+                    project_id,
+                    doc_type: DocType::Convention,
+                    source_path: "src/lib.rs".into(),
+                    title: "lib.rs".into(),
+                    content_hash: "hr".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: lang_chunk(Language::Rust, "Widget", "fn widget", 0),
+                    embedding: unit_embedding(0),
+                }],
+            )
+            .unwrap();
+
+        // Written as an older vault would have. The CHECK still allows it,
+        // which is precisely why this row can exist.
+        store
+            .conn
+            .execute(
+                "INSERT INTO chunks
+                   (document_id, project_id, doc_type, language, label, content,
+                    content_hash, token_est, chunk_index, created_at)
+                 SELECT id, ?1, 'convention', 'helm', 'chart', 'replicas: 1', 'hh', 3, 1, 0
+                 FROM documents LIMIT 1",
+                [project_id],
+            )
+            .expect("the CHECK must still permit 'helm' — narrowing it needs a rebuild");
+
+        let inv = store
+            .inventory()
+            .expect("inventory must not fail on a stale label");
+
+        assert_eq!(
+            inv.languages,
+            vec![Language::Rust],
+            "a label the enum no longer knows is skipped, not surfaced or fatal"
+        );
+    }
+
     #[test]
     fn inventory_enumerates_every_distinct_value_not_just_the_first() {
         let config = Config::default();
@@ -1059,7 +1113,6 @@ mod tests {
             Language::Scala,
             Language::Proto,
             Language::OpenApi,
-            Language::Helm,
             Language::Markdown,
             Language::Unknown,
         ];
@@ -1702,7 +1755,7 @@ mod tests {
             type_names: vec![],
             topics: vec![],
             doc_types: vec![],
-            languages: vec![Language::Helm], // zero helm chunks -> relax fires
+            languages: vec![Language::Scala], // zero scala chunks -> relax fires
         };
 
         let hits = store

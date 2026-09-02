@@ -36,7 +36,7 @@ pub struct Args {
     #[arg(long = "doc-types", value_delimiter = ',')]
     doc_types: Vec<String>,
 
-    /// Override the router's `languages` list: go|rust|scala|proto|openapi|helm|markdown|unknown.
+    /// Override the router's `languages` list: go|rust|scala|proto|openapi|markdown|unknown.
     #[arg(long, value_delimiter = ',')]
     languages: Vec<String>,
 
@@ -794,7 +794,7 @@ mod tests {
     #[test]
     fn a_filter_matching_no_chunks_is_reported_as_relaxed() {
         let mut plan = empty_plan();
-        plan.languages = vec![Language::Helm];
+        plan.languages = vec![Language::Scala];
 
         assert!(matches!(
             filter_reach(&plan, Some(0), Some((705, 705))),
@@ -812,7 +812,7 @@ mod tests {
     fn a_relax_under_a_project_filter_is_not_reported_as_unfiltered() {
         let mut plan = empty_plan();
         plan.projects = vec!["vault".into()];
-        plan.languages = vec![Language::Helm];
+        plan.languages = vec![Language::Scala];
 
         let reach = filter_reach(&plan, Some(0), Some((631, 705)));
         match reach {

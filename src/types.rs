@@ -40,13 +40,22 @@ impl FromStr for DocType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+/// The *syntax* a chunk is written in, as far as retrieval filtering cares.
+///
+/// `OpenApi` is the one entry that is not a syntax — an OpenAPI document is
+/// YAML or JSON. It stays because it is the dispatch key for `OpenApiParser`,
+/// and `.yaml`/`.yml`/`.json` are shared with non-spec files, so only the
+/// classifier can tell a spec apart. `Helm` used to sit beside it and earned
+/// nothing: Helm is a templating framework rather than a language, there is no
+/// Helm parser (out of v1 scope), and the variant fell through to the
+/// extension fallback — chunking a chart exactly as `Unknown` would.
+#[allow(rustdoc::broken_intra_doc_links)]
 pub enum Language {
     Go,
     Rust,
     Scala,
     Proto,
     OpenApi,
-    Helm,
     Markdown,
     Unknown,
 }
@@ -59,7 +68,6 @@ impl Language {
             Language::Scala => "scala",
             Language::Proto => "proto",
             Language::OpenApi => "openapi",
-            Language::Helm => "helm",
             Language::Markdown => "markdown",
             Language::Unknown => "unknown",
         }
@@ -76,11 +84,10 @@ impl FromStr for Language {
             "scala" => Ok(Language::Scala),
             "proto" => Ok(Language::Proto),
             "openapi" => Ok(Language::OpenApi),
-            "helm" => Ok(Language::Helm),
             "markdown" => Ok(Language::Markdown),
             "unknown" => Ok(Language::Unknown),
             other => Err(format!(
-                "unknown language '{other}' (expected: go|rust|scala|proto|openapi|helm|markdown|unknown)"
+                "unknown language '{other}' (expected: go|rust|scala|proto|openapi|markdown|unknown)"
             )),
         }
     }
