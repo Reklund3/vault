@@ -124,6 +124,11 @@ pub(crate) enum Stage {
     /// Unreachable from the hook — `vault hook` never indexes. It exists so
     /// `Stage::of` stays total without mislabelling a sync failure as a query
     /// one; an unused-but-truthful name beats a reachable-but-wrong one.
+    ///
+    /// Unreachable is not untested: `every_variant` covers it, so the "sync"
+    /// string is pinned like every other stage. It previously was not, which
+    /// meant this could have been remapped to `Stage::Query` with the whole
+    /// suite still green.
     Sync,
 }
 
@@ -265,6 +270,7 @@ mod tests {
     // `RouterError` and `StoreError` are already imported by the fixtures below.
     use crate::config::ConfigError;
     use crate::embed::EmbedError;
+    use crate::index::sync::SyncError;
     use crate::retrieve::Context;
 
     /// One instance of every `VaultError` variant, paired with the `stage`
@@ -293,7 +299,43 @@ mod tests {
                 "embed-query",
             ),
             (VaultError::Query(StoreError::Backend("b".into())), "query"),
+            // Unreachable from the hook — `vault hook` never indexes — but the
+            // mapping ships, so its telemetry string is pinned like the rest.
+            // Leaving it out is what let `Stage::Sync` carry an unasserted
+            // string that could have been remapped to `Stage::Query` with no
+            // test failing (review finding 15).
+            (VaultError::Sync(SyncError::DeclinedRemoteCost), "sync"),
         ]
+    }
+
+    /// Ties the fixture above to the enum, which nothing else does.
+    ///
+    /// A new `VaultError` variant already breaks `Stage::of` — that match is
+    /// exhaustive — but nothing forces `every_variant` to grow with it, which is
+    /// exactly how `Sync` came to be missing while the doc comment claimed
+    /// otherwise. This match breaks on a new variant *and* the count below has
+    /// to be edited, so the two cannot drift apart silently again.
+    #[test]
+    fn every_variant_lists_all_of_them() {
+        fn _exhaustive(err: &VaultError) {
+            match err {
+                VaultError::Config(_)
+                | VaultError::RouterBuild(_)
+                | VaultError::EmbedderBuild(_)
+                | VaultError::DbOpen(_)
+                | VaultError::RouterPlan(_)
+                | VaultError::EmbedQuery(_)
+                | VaultError::Query(_)
+                | VaultError::Sync(_) => {}
+            }
+        }
+        const VARIANTS: usize = 8;
+
+        assert_eq!(
+            every_variant().len(),
+            VARIANTS,
+            "a VaultError variant was added without a fixture — see `_exhaustive` above"
+        );
     }
 
     /// `stage` in hook.log is a stable telemetry contract, and moving the
