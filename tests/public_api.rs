@@ -14,8 +14,8 @@
 // still works, but the root is the curated surface and this file names it.
 use vault::{
     ClassifyError, Config, ConfigError, Context, DocType, EmbedError, Hit, Interaction, Language,
-    PlannedQuery, QueryPlan, QueryPlanner, Retrieval, RouterError, SkipReason, StoreError,
-    SyncError, SyncOptions, SyncReport, Vault, VaultError, VaultStore, WalkError,
+    PlannedQuery, QueryPlan, QueryPlanner, Retrieval, RetrieveTimings, RouterError, SkipReason,
+    StoreError, SyncError, SyncOptions, SyncReport, Vault, VaultError, VaultStore, WalkError,
 };
 
 #[test]
@@ -290,4 +290,15 @@ fn the_library_half_stands_on_its_own() {
 
     let config = Config::default();
     assert!(config.embedding_dim() > 0);
+}
+
+/// `retrieve_in_timed` is only usable if its argument type is reachable from
+/// outside the crate. Re-exporting the method without the struct would compile
+/// in-crate and leave every consumer unable to call it.
+#[test]
+fn retrieve_timings_is_constructible_by_a_consumer() {
+    let t = RetrieveTimings::default();
+    assert_eq!(t.router_ms, None);
+    assert_eq!(t.embed_ms, None);
+    assert_eq!(t.query_ms, None);
 }

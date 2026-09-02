@@ -69,4 +69,4 @@ pub use index::walk::WalkError;
 pub use retrieve::{Context, PlannedQuery, QueryPlan, Retrieval, RouterError, SkipReason};
 pub use store::{Hit, StoreError};
 pub use types::{DocType, Inventory, Language};
-pub use vault::{QueryPlanner, Vault, VaultStore};
+pub use vault::{QueryPlanner, RetrieveTimings, Vault, VaultStore};

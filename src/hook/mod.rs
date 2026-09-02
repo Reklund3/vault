@@ -7,8 +7,8 @@ use serde::Deserialize;
 
 use crate::config::Config;
 use crate::error::VaultError;
-use crate::retrieve::{PlannedQuery, Retrieval, SkipReason};
-use crate::vault::Vault;
+use crate::retrieve::{Retrieval, SkipReason};
+use crate::vault::{RetrieveTimings, Vault};
 
 mod log;
 
@@ -160,10 +160,6 @@ impl Stage {
     }
 }
 
-fn ms_since(start: Instant) -> u64 {
-    start.elapsed().as_millis() as u64
-}
-
 /// Returns the outcome plus the vault directory the run resolved, if it got
 /// far enough to load a config. The directory is the logger's destination — see
 /// `log::log_dir` for why it is an `Option` rather than always resolved here.
@@ -228,60 +224,37 @@ fn pipeline_with(
 /// embed latency stay separately recorded; `hook.log` has always carried them as
 /// distinct fields. Each `tel` write happens before the corresponding `?` so a
 /// failure still reports the timing that preceded it.
+/// The hook's retrieval call: [`Vault::retrieve_in_timed`], with the phase
+/// times copied into telemetry.
+///
+/// This used to be a second copy of the pipeline, because the hook needs each
+/// phase timed and `QueryPlanner::plan` offers no seam between routing and
+/// embedding. The seam now lives on the facade, so there is one pipeline and
+/// one place the "cwd is a hint, never a filter" invariant is written down.
 fn retrieve_with(
     prompt: &str,
     cwd: Option<&str>,
     vault: &Vault,
     tel: &mut log::Telemetry,
 ) -> Result<Retrieval, VaultError> {
-    // `QueryPlanner::route` folds an empty prompt into the same `Ok(None)` it
-    // uses for "the router saw no need for context", so the `else` arm below
-    // cannot tell the two apart and would report every blank prompt as a
-    // `RouterSkip`. `Vault::retrieve` guards first for exactly this reason;
-    // this is the hook's copy of that guard, keeping the two entry points
-    // agreed on which `SkipReason` a blank prompt produces.
-    if prompt.trim().is_empty() {
-        return Ok(Retrieval::Skip(SkipReason::EmptyPrompt));
+    let mut timings = RetrieveTimings::default();
+    let result = vault.retrieve_in_timed(prompt, cwd, &mut timings);
+
+    // Copied whatever the outcome: a failed call still spent whatever time the
+    // phases before it took, and that is the number worth logging.
+    tel.router_ms = timings.router_ms;
+    tel.embed_ms = timings.embed_ms;
+    tel.query_ms = timings.query_ms;
+
+    // `backend` names who served the call, so it is recorded only once the
+    // router phase actually ran. A blank prompt is turned away before that, and
+    // stamping a backend on it would claim work nothing did. A router that ran
+    // and *failed* still gets named — `router_ms` is stamped before the error
+    // is propagated, which is the point.
+    if timings.router_ms.is_some() {
+        tel.backend = Some(vault.planner().backend());
     }
 
-    let planner = vault.planner();
-    tel.backend = Some(planner.backend());
-
-    // --- phase 1: network-bound, no store access ---
-    let t = Instant::now();
-    let routed = planner.route(prompt);
-    tel.router_ms = Some(ms_since(t));
-    let Some(plan) = routed? else {
-        return Ok(Retrieval::Skip(SkipReason::RouterSkip));
-    };
-
-    let t = Instant::now();
-    let embedded = planner.embed_query(prompt);
-    tel.embed_ms = Some(ms_since(t));
-    let embedding = embedded?;
-
-    // --- phase 2: store-bound ---
-    // `query_ms` spans the whole store phase, which is exactly how long a
-    // concurrent caller would hold the store.
-    let t = Instant::now();
-    // The cwd bias (C1). Errors are swallowed rather than propagated: this is
-    // a hint that improves a plan, and a store hiccup resolving it must not
-    // fail a retrieval the router and embedder already paid for.
-    let mut plan = plan;
-    let mut cwd_project = None;
-    if let Some(project) = cwd.and_then(|c| vault.store().project_for_path(c).ok().flatten()) {
-        // Reorder only — see `QueryPlan::prefer_project`. The name reaches
-        // domain resolution through `cwd_project`, which is not a filter.
-        plan.prefer_project(&project);
-        cwd_project = Some(project);
-    }
-    let planned = PlannedQuery {
-        plan,
-        embedding,
-        cwd_project,
-    };
-    let result = vault.store().search(&planned);
-    tel.query_ms = Some(ms_since(t));
     result
 }
 

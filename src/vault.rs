@@ -17,6 +17,8 @@
 //! behind a multi-second router timeout. Keeping the planner shareable means
 //! only the store half is ever contended.
 
+use std::time::Instant;
+
 use crate::config::Config;
 use crate::embed::{Embedder, TeiEmbedder};
 use crate::error::VaultError;
@@ -205,6 +207,22 @@ pub struct Vault {
     store: VaultStore,
 }
 
+/// Per-phase wall time for one [`Vault::retrieve_in_timed`] call.
+///
+/// `None` means the phase did not run — a router skip never embeds or queries.
+/// Milliseconds, because that is the resolution `~/.vault/hook.log` records and
+/// anything finer would imply a precision the network hops do not have.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetrieveTimings {
+    pub router_ms: Option<u64>,
+    pub embed_ms: Option<u64>,
+    pub query_ms: Option<u64>,
+}
+
+fn ms_since(start: Instant) -> u64 {
+    start.elapsed().as_millis() as u64
+}
+
 impl Vault {
     pub fn open(config: &Config) -> Result<Self, VaultError> {
         // Store first, planner second: the planner needs the corpus snapshot to
@@ -253,6 +271,29 @@ impl Vault {
     /// fails to answer, leaves the plan untouched — a bias signal must not be
     /// able to fail a retrieval that would otherwise have succeeded.
     pub fn retrieve_in(&self, prompt: &str, cwd: Option<&str>) -> Result<Retrieval, VaultError> {
+        self.retrieve_in_timed(prompt, cwd, &mut RetrieveTimings::default())
+    }
+
+    /// [`Vault::retrieve_in`], recording how long each phase took.
+    ///
+    /// This exists so the hook does not need its own copy of the pipeline. It
+    /// had one because `QueryPlanner::plan` fuses routing and embedding into a
+    /// single call with no seam to stopwatch, and `~/.vault/hook.log` records
+    /// the two separately — so the hook called `route` and `embed_query`
+    /// itself, and then had to re-implement everything wrapped around them.
+    /// Two copies meant two places to fix: the cwd-narrowing regression had to
+    /// be corrected in both, and both carried the same invariant in prose.
+    ///
+    /// `timings` is filled in as each phase completes, so a failure still
+    /// leaves the phases that did run measured. Phases skipped by an early
+    /// return stay `None` — a router skip records a router time and nothing
+    /// else, which is the truth about what the call cost.
+    pub fn retrieve_in_timed(
+        &self,
+        prompt: &str,
+        cwd: Option<&str>,
+        timings: &mut RetrieveTimings,
+    ) -> Result<Retrieval, VaultError> {
         // Checked here as well as in `route` so the caller gets the *reason*.
         // `route` can only say "no plan"; these two skips call for different
         // follow-up, and `SkipReason::EmptyPrompt` was a public variant no
@@ -260,22 +301,43 @@ impl Vault {
         if prompt.trim().is_empty() {
             return Ok(Retrieval::Skip(SkipReason::EmptyPrompt));
         }
-        match self.planner.plan(prompt)? {
-            None => Ok(Retrieval::Skip(SkipReason::RouterSkip)),
-            Some(mut planned) => {
-                // Two different jobs, deliberately kept apart. `prefer_project`
-                // only reorders a project the router already named, so it can
-                // never narrow the filter; `cwd_project` carries the same name
-                // to domain resolution, which no filter reads.
-                if let Some(project) =
-                    cwd.and_then(|c| self.store.project_for_path(c).ok().flatten())
-                {
-                    planned.plan.prefer_project(&project);
-                    planned.cwd_project = Some(project);
-                }
-                self.store.search(&planned)
-            }
+
+        // --- phase 1: network-bound, no store access ---
+        let t = Instant::now();
+        let routed = self.planner.route(prompt);
+        timings.router_ms = Some(ms_since(t));
+        let Some(plan) = routed? else {
+            return Ok(Retrieval::Skip(SkipReason::RouterSkip));
+        };
+
+        let t = Instant::now();
+        let embedded = self.planner.embed_query(prompt);
+        timings.embed_ms = Some(ms_since(t));
+        let embedding = embedded?;
+
+        // --- phase 2: store-bound ---
+        // `query_ms` spans the whole store phase, which is exactly how long a
+        // concurrent caller would hold the store.
+        let t = Instant::now();
+        // Two different jobs, deliberately kept apart. `prefer_project` only
+        // reorders a project the router already named, so it can never narrow
+        // the filter; `cwd_project` carries the same name to domain resolution,
+        // which no filter reads. Errors are swallowed rather than propagated:
+        // this is a hint that improves a plan, and a store hiccup resolving it
+        // must not fail a retrieval the router and embedder already paid for.
+        let mut plan = plan;
+        let mut cwd_project = None;
+        if let Some(project) = cwd.and_then(|c| self.store.project_for_path(c).ok().flatten()) {
+            plan.prefer_project(&project);
+            cwd_project = Some(project);
         }
+        let result = self.store.search(&PlannedQuery {
+            plan,
+            embedding,
+            cwd_project,
+        });
+        timings.query_ms = Some(ms_since(t));
+        result
     }
 }
 
@@ -317,6 +379,80 @@ mod tests {
             ),
             VaultStore::from_store(Box::new(store), config.clone()),
         )
+    }
+
+    /// A phase that did not run must not be reported as having taken time.
+    ///
+    /// This is the contract the hook's telemetry is built on: `~/.vault/hook.log`
+    /// distinguishes "the router answered in 40ms and said skip" from "we never
+    /// asked". `retrieve_with` also derives `backend` from `router_ms` being
+    /// set, so a `Some(0)` here would name a backend for a call that never
+    /// reached one.
+    #[test]
+    fn timings_record_only_the_phases_that_actually_ran() {
+        let config = Config::default();
+        let vault = stub_vault(&config);
+
+        // Blank: turned away before the router, so nothing is timed.
+        let mut blank = RetrieveTimings::default();
+        let out = vault
+            .retrieve_in_timed("   ", None, &mut blank)
+            .expect("blank is a skip, not an error");
+        assert!(matches!(out, Retrieval::Skip(SkipReason::EmptyPrompt)));
+        assert_eq!(blank, RetrieveTimings::default(), "no phase ran");
+
+        // Real prompt: every phase runs, so every phase is timed.
+        let mut full = RetrieveTimings::default();
+        vault
+            .retrieve_in_timed("what does BuildRequest need?", None, &mut full)
+            .expect("retrieval");
+        assert!(full.router_ms.is_some(), "router ran");
+        assert!(full.embed_ms.is_some(), "embedder ran");
+        assert!(full.query_ms.is_some(), "store ran");
+    }
+
+    /// A router skip stops the pipeline, so the embed and query phases must stay
+    /// unreported rather than showing zero — the hook would otherwise log an
+    /// embedding call that never happened.
+    #[test]
+    fn a_router_skip_times_the_router_and_nothing_after_it() {
+        struct SkippingRouter;
+        impl Router for SkippingRouter {
+            fn name(&self) -> &'static str {
+                "skipping"
+            }
+            fn plan(
+                &self,
+                _prompt: &str,
+                _inventory: &Inventory,
+            ) -> Result<RouterOutput, RouterError> {
+                Ok(RouterOutput::Skip)
+            }
+        }
+
+        let config = Config::default();
+        let store = SqliteStore::open_in_memory(&config).expect("store");
+        let vault = Vault::from_parts(
+            QueryPlanner::from_parts(
+                Box::new(SkippingRouter),
+                Box::new(StubEmbedder::from_config(&config)),
+                Inventory::default(),
+            ),
+            VaultStore::from_store(Box::new(store), config.clone()),
+        );
+
+        let mut t = RetrieveTimings::default();
+        let out = vault
+            .retrieve_in_timed("anything", None, &mut t)
+            .expect("skip");
+
+        assert!(matches!(out, Retrieval::Skip(SkipReason::RouterSkip)));
+        assert!(t.router_ms.is_some(), "the router was asked");
+        assert!(
+            t.embed_ms.is_none(),
+            "the embedder must not have been reached"
+        );
+        assert!(t.query_ms.is_none(), "the store must not have been reached");
     }
 
     /// `Vault::retrieve` runs both phases: the stub router plans, the stub
