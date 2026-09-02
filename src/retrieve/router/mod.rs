@@ -66,13 +66,12 @@ Schema:
                     // account categories, report names, or any named entity
   topics:     [],   // conceptual topics: auth, events, tax, invoicing, grpc, helm, etc
   doc_types:  [],   // which to search: contract, plan, convention, meta
-  languages:  []    // ONLY values the user turn lists as indexed. Never name a
-                    // language absent from that list, and never infer one from
+  languages:  []    // the syntax the answer is written in. Never infer one from
                     // the subject alone -- asking about a proto contract does
                     // not mean proto files are indexed. Set it when the prompt
-                    // is clearly about source code in a listed language ("the
-                    // rust parser", "how is this implemented"); omit it when the
-                    // answer could just as well live in prose docs.
+                    // is clearly about source code ("the rust parser", "how is
+                    // this implemented"); omit it when the answer could just as
+                    // well live in prose docs. Omitting is always safe.
 }
 
 If nothing warrants retrieval, return { "skip": true }."#;
@@ -522,6 +521,54 @@ mod tests {
         assert_eq!(
             build_user_prompt("what does BuildRequest need?", &Inventory::default()),
             "what does BuildRequest need?"
+        );
+    }
+
+    /// Phrasings that bind the model to the corpus listing. Checked against the
+    /// *composite* message — system prompt plus user turn — because that is what
+    /// the model actually receives, and the bug was a rule in one half
+    /// referencing data in the other.
+    const RESTRICT_PHRASES: &[&str] = &[
+        "Use only these values",
+        "ONLY values the user turn lists",
+        "absent from that list",
+        "not listed above",
+    ];
+
+    fn composite(prompt: &str, inventory: &Inventory) -> String {
+        format!("{ROUTER_SYSTEM}\n{}", build_user_prompt(prompt, inventory))
+    }
+
+    /// With no inventory there is no listing, so nothing may tell the model to
+    /// restrict itself to one.
+    ///
+    /// `ROUTER_SYSTEM` used to say `languages` must be "ONLY values the user
+    /// turn lists as indexed" — unconditionally, in a prompt sent on every call,
+    /// about a list `build_user_prompt` omits entirely when the inventory is
+    /// empty. Read together that says "name no language at all", exactly when
+    /// the inventory is *unknown* rather than empty. A backend whose
+    /// `inventory()` is the trait default (the Postgres placeholder, any test
+    /// double) would have lost language filtering permanently with nothing
+    /// reporting it.
+    #[test]
+    fn an_unknown_inventory_carries_no_restrict_to_the_listing_instruction() {
+        let msg = composite("how is the router implemented?", &Inventory::default());
+        for phrase in RESTRICT_PHRASES {
+            assert!(
+                !msg.contains(phrase),
+                "an empty inventory renders no listing, but the model is still told {phrase:?}"
+            );
+        }
+    }
+
+    /// The converse: when there *is* a listing, the binding instruction must be
+    /// present — carried by the user turn, next to the data it refers to.
+    #[test]
+    fn a_known_inventory_does_carry_the_restriction() {
+        let msg = composite("how is the router implemented?", &sample_inventory());
+        assert!(
+            msg.contains("Use only these values"),
+            "a rendered listing must come with the instruction that binds it"
         );
     }
 
