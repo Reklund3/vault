@@ -41,12 +41,42 @@ if [ -z "$rlib" ]; then
   exit 1
 fi
 
-hits=$(nm "$rlib" 2>/dev/null | grep -E "$PATTERN" || true)
+# `nm` must exist and must work. The previous form was
+# `nm "$rlib" 2>/dev/null | grep -E ... || true`, which discarded nm's error,
+# produced no output, and reported zero hits — so a machine without binutils got
+# a green check for a rule nothing had verified. That is the same false comfort
+# the note at the top of this file warns about, in the one line that had to be
+# right.
+if ! command -v nm >/dev/null 2>&1; then
+  echo "FAIL: nm not found on PATH — cannot verify design rule 3." >&2
+  echo "Install binutils (or llvm-nm) rather than skipping: a check that cannot" >&2
+  echo "run must not report success." >&2
+  exit 1
+fi
+
+if ! symbols=$(nm "$rlib" 2>&1); then
+  echo "FAIL: nm could not read $rlib." >&2
+  echo "$symbols" | sed 's/^/  /' >&2
+  exit 1
+fi
+
+total=$(printf '%s\n' "$symbols" | grep -c . || true)
+# Zero symbols is not a pass. A stripped or truncated archive greps clean for
+# the same reason an empty file does, and this check's entire evidence is that
+# the symbol table was read and searched.
+if [ "$total" -eq 0 ]; then
+  echo "FAIL: nm reported no symbols at all in $rlib." >&2
+  echo "An empty symbol table cannot demonstrate the absence of stdin/stdout" >&2
+  echo "references — it demonstrates that nothing was searched." >&2
+  exit 1
+fi
+
+hits=$(printf '%s\n' "$symbols" | grep -E "$PATTERN" || true)
 count=$(printf '%s' "$hits" | grep -c . || true)
 
 if [ "$count" -eq 0 ]; then
   echo "OK: the library-only build references no stdin/stdout symbol."
-  echo "    (checked $(nm "$rlib" 2>/dev/null | grep -c . || echo 0) symbols in $(basename "$rlib"))"
+  echo "    (checked $total symbols in $(basename "$rlib"))"
   exit 0
 fi
 
