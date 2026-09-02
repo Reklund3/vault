@@ -31,7 +31,7 @@ use crate::store::traits::StoreError;
 /// deletes from `chunks` would silently orphan its `chunks_vec` rows, since
 /// nothing in the schema enforces the pairing. Any new delete path needs its own
 /// `DELETE FROM chunks_vec` and its own test.
-const SCHEMA_V1: &str = r#"
+const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
     id         INTEGER PRIMARY KEY,
     name       TEXT NOT NULL UNIQUE,
@@ -60,13 +60,14 @@ CREATE TABLE IF NOT EXISTS chunks (
     document_id  INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     project_id   INTEGER NOT NULL,
     doc_type     TEXT NOT NULL,
-    -- 'helm' is retained deliberately. `Language::Helm` was removed from the
-    -- enum (Helm is a templating framework, not a syntax, and had no parser),
-    -- but narrowing a CHECK in SQLite requires rebuilding the table — three
-    -- FTS5 triggers and chunks_vec hang off this one. Nothing writes 'helm' any
-    -- more; `inventory()` skips a stale row rather than failing on it.
-    language     TEXT NOT NULL CHECK(language IN
-                   ('go','rust','scala','proto','openapi','helm','markdown','unknown')),
+    -- No CHECK. It used to enumerate the `Language` variants, which froze the
+    -- taxonomy: SQLite cannot ALTER a CHECK, so adding `yaml` — or removing
+    -- `helm` after it turned out to be a framework rather than a syntax — meant
+    -- rebuilding a table with three FTS5 triggers and chunks_vec hanging off
+    -- it. `Language::from_str` validates on read and `inventory()` skips a
+    -- label it does not recognise, so the constraint bought duplication of a
+    -- check that already happens, at the price of a rebuild per taxonomy edit.
+    language     TEXT NOT NULL,
     label        TEXT NOT NULL,
     content      TEXT NOT NULL,
     content_hash TEXT NOT NULL,
@@ -122,24 +123,14 @@ CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
 END;
 
 -- There is deliberately NO matching trigger for chunks_vec. See the note in
--- Rust above `SCHEMA_V1` before adding one (review B8).
-"#;
+-- Rust above `SCHEMA` before adding one (review B8).
 
-/// Schema v2: covering indexes for the three columns `Store::inventory` scans
-/// and the plan filters bind against.
-///
-/// `inventory()` runs on every hook call, before the router can decide to skip,
-/// and `chunks.content` is stored inline — so a bare `SELECT DISTINCT language
-/// FROM chunks` pages in the whole corpus. Measured on a 120k-chunk / 91MB
-/// database: the three inventory queries cost 226ms without these and 40ms
-/// with them, and each becomes a covering index scan that never touches the
-/// table.
-///
-/// Additive only. `CREATE INDEX` builds a new B-tree from one pass over the
-/// table; it does not rewrite `chunks`, `chunks_fts`, or `chunks_vec`, so no
-/// re-embed or re-sync is involved. One-time build cost on that same 120k
-/// corpus was ~215ms total.
-const SCHEMA_V2: &str = r#"
+-- Covering indexes for the three columns `Store::inventory` reads and the plan
+-- filters bind against. `inventory()` runs on every hook call before the router
+-- can decide to skip, and `chunks.content` is stored inline — without these a
+-- bare `SELECT DISTINCT language FROM chunks` pages in the whole corpus.
+-- Measured on a 120k-chunk / 91MB database: 226ms without, ~1ms with (the
+-- queries also use a loose index scan; see `INVENTORY_LANGUAGES_SQL`).
 CREATE INDEX IF NOT EXISTS idx_chunks_language   ON chunks(language);
 CREATE INDEX IF NOT EXISTS idx_chunks_doc_type   ON chunks(doc_type);
 CREATE INDEX IF NOT EXISTS idx_chunks_project_id ON chunks(project_id);
@@ -149,7 +140,7 @@ CREATE INDEX IF NOT EXISTS idx_chunks_project_id ON chunks(project_id);
 mod b8 {
     use super::*;
 
-    /// Pins the deliberate asymmetry documented on `SCHEMA_V1` (review B8).
+    /// Pins the deliberate asymmetry documented on `SCHEMA` (review B8).
     ///
     /// A trigger referencing `chunks_vec` compiles only where sqlite-vec is
     /// loaded, and SQLite compiles trigger bodies when they fire — so adding one
@@ -269,6 +260,15 @@ pub(crate) fn open_in_memory() -> Result<Connection, StoreError> {
     Ok(conn)
 }
 
+/// The one schema version. There is no migration *chain*: `SCHEMA` is the whole
+/// shape, applied idempotently, and a database below this version is brought up
+/// to it by `rebuild_chunks_without_language_check`.
+///
+/// Flattened while still pre-release. Keeping a numbered step per historical
+/// edit would mean carrying replay code for shapes no database outside this
+/// repo has ever had.
+pub(crate) const SCHEMA_VERSION: i32 = 3;
+
 pub(crate) fn migrate(conn: &Connection, dim: usize) -> Result<(), StoreError> {
     if dim == 0 {
         return Err(StoreError::Migration(
@@ -278,31 +278,112 @@ pub(crate) fn migrate(conn: &Connection, dim: usize) -> Result<(), StoreError> {
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(|e| StoreError::Migration(e.to_string()))?;
-    if version < 1 {
-        conn.execute_batch(SCHEMA_V1)
-            .map_err(|e| StoreError::Migration(e.to_string()))?;
-        // chunks_vec is built here, not in SCHEMA_V1: vec0 bakes the dimension
-        // into the column at creation and offers no dimensionless mode, so the
-        // configured `dim` must be formatted in. `dim` is a config u16 widened to
-        // usize, never user text — no injection surface; the `dim == 0` guard
-        // above keeps the DDL well-formed. `IF NOT EXISTS` leaves an existing
-        // table untouched, so a dim change on a populated DB is caught later by
-        // `verify_or_init_embedding` rather than silently re-created here.
-        conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(chunk_id INTEGER PRIMARY KEY, embedding FLOAT[{dim}]);"
-        ))
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    // A database that already has a `chunks` table predates the flattening and
+    // still carries the CHECK on `language`. `CREATE TABLE IF NOT EXISTS` below
+    // would leave it in place, so the table is rebuilt first. A fresh database
+    // has nothing to rebuild and skips straight to `SCHEMA`.
+    if version > 0 {
+        rebuild_chunks_without_language_check(conn)?;
+    }
+
+    conn.execute_batch(SCHEMA)
         .map_err(|e| StoreError::Migration(e.to_string()))?;
-        conn.pragma_update(None, "user_version", 1)
-            .map_err(|e| StoreError::Migration(e.to_string()))?;
+    // chunks_vec is built here, not in `SCHEMA`: vec0 bakes the dimension into
+    // the column at creation and offers no dimensionless mode, so the configured
+    // `dim` must be formatted in. `dim` is a config u16 widened to usize, never
+    // user text — no injection surface; the `dim == 0` guard above keeps the DDL
+    // well-formed. `IF NOT EXISTS` leaves an existing table untouched, so a dim
+    // change on a populated DB is caught later by `verify_or_init_embedding`
+    // rather than silently re-created here.
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(chunk_id INTEGER PRIMARY KEY, embedding FLOAT[{dim}]);"
+    ))
+    .map_err(|e| StoreError::Migration(e.to_string()))?;
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|e| StoreError::Migration(e.to_string()))?;
+    Ok(())
+}
+
+/// Rebuild `chunks` without the `language` CHECK, preserving every row and —
+/// critically — every `id`.
+///
+/// SQLite cannot ALTER a CHECK, so this is the documented table-rebuild dance.
+/// Two things make `chunks` the awkward table for it, and both are why `id` must
+/// survive untouched:
+///
+/// - `chunks_fts` is an **external-content** FTS5 table (`content='chunks'`,
+///   `content_rowid='id'`). Its index is keyed on those ids; renumbering rows
+///   would silently decouple the index from its source rather than error.
+/// - `chunks_vec` holds one embedding per `chunk_id` with no foreign key, so
+///   nothing would catch a mismatch either.
+///
+/// `INSERT ... SELECT` names `id` explicitly for that reason. The FTS and vec
+/// tables are deliberately untouched: with ids preserved they stay valid, and
+/// re-indexing FTS would be pointless work while re-embedding is not even
+/// possible offline.
+///
+/// The triggers go with the old table and are recreated by `SCHEMA` afterwards.
+fn rebuild_chunks_without_language_check(conn: &Connection) -> Result<(), StoreError> {
+    let err = |e: rusqlite::Error| StoreError::Migration(e.to_string());
+
+    // Nothing to rebuild if this database never had the table.
+    let has_chunks: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks')",
+            [],
+            |r| r.get::<_, i32>(0),
+        )
+        .map_err(err)?
+        == 1;
+    if !has_chunks {
+        return Ok(());
     }
-    // `version` is read once above, so a fresh database (0) runs both steps in
-    // this call while an existing v1 database runs only this one.
-    if version < 2 {
-        conn.execute_batch(SCHEMA_V2)
-            .map_err(|e| StoreError::Migration(e.to_string()))?;
-        conn.pragma_update(None, "user_version", 2)
-            .map_err(|e| StoreError::Migration(e.to_string()))?;
+
+    // Already CHECK-free (a database written by this version) — skip the work.
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(err)?;
+    if !sql.contains("CHECK(language") {
+        return Ok(());
     }
+
+    conn.execute_batch(
+        "PRAGMA foreign_keys=OFF;
+         BEGIN;
+         CREATE TABLE chunks_rebuild (
+             id           INTEGER PRIMARY KEY,
+             document_id  INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+             project_id   INTEGER NOT NULL,
+             doc_type     TEXT NOT NULL,
+             language     TEXT NOT NULL,
+             label        TEXT NOT NULL,
+             content      TEXT NOT NULL,
+             content_hash TEXT NOT NULL,
+             token_est    INTEGER NOT NULL,
+             chunk_index  INTEGER NOT NULL,
+             created_at   INTEGER NOT NULL,
+             UNIQUE(document_id, label)
+         );
+         INSERT INTO chunks_rebuild
+             (id, document_id, project_id, doc_type, language, label, content,
+              content_hash, token_est, chunk_index, created_at)
+         SELECT id, document_id, project_id, doc_type, language, label, content,
+                content_hash, token_est, chunk_index, created_at
+         FROM chunks;
+         DROP TABLE chunks;
+         ALTER TABLE chunks_rebuild RENAME TO chunks;
+         COMMIT;
+         PRAGMA foreign_keys=ON;",
+    )
+    .map_err(err)?;
     Ok(())
 }
 
@@ -689,7 +770,7 @@ mod tests {
         let version: i32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     fn index_names(conn: &Connection) -> Vec<String> {
@@ -722,51 +803,131 @@ mod tests {
         );
     }
 
-    /// The upgrade path, which the fresh-database test cannot cover: a store
-    /// created before v2 must gain the indexes on its next open, without the
-    /// table being rebuilt.
-    #[test]
-    fn an_existing_v1_database_gains_the_indexes_without_losing_rows() {
-        let conn = open_in_memory().expect("open");
-        // Stop at v1: apply exactly what a pre-v2 vault would have.
-        conn.execute_batch(SCHEMA_V1).expect("v1 schema");
-        conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(chunk_id INTEGER PRIMARY KEY, embedding FLOAT[{DEFAULT_DIM}]);"
-        ))
-        .expect("vec table");
+    /// The legacy shape: `chunks` with the `language` CHECK and no indexes,
+    /// exactly as a pre-v3 vault wrote it. Built from literal DDL rather than an
+    /// old `SCHEMA` const, because flattening deleted those and replaying a
+    /// shape from a const that no longer exists would test nothing.
+    fn create_legacy_v1_database(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE projects (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+                 repo_path TEXT, domain TEXT, created_at INTEGER NOT NULL);
+             CREATE TABLE documents (
+                 id INTEGER PRIMARY KEY,
+                 project_id INTEGER NOT NULL REFERENCES projects(id),
+                 doc_type TEXT NOT NULL CHECK(doc_type IN ('contract','plan','convention','meta')),
+                 source_path TEXT NOT NULL, title TEXT NOT NULL,
+                 content_hash TEXT NOT NULL, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, UNIQUE(project_id, source_path));
+             CREATE TABLE chunks (
+                 id INTEGER PRIMARY KEY,
+                 document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                 project_id INTEGER NOT NULL,
+                 doc_type TEXT NOT NULL,
+                 language TEXT NOT NULL CHECK(language IN
+                   ('go','rust','scala','proto','openapi','helm','markdown','unknown')),
+                 label TEXT NOT NULL, content TEXT NOT NULL, content_hash TEXT NOT NULL,
+                 token_est INTEGER NOT NULL, chunk_index INTEGER NOT NULL,
+                 created_at INTEGER NOT NULL, UNIQUE(document_id, label));
+             CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                 label, content, content='chunks', content_rowid='id',
+                 tokenize='porter unicode61');
+             CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
+                 INSERT INTO chunks_fts(rowid, label, content)
+                 VALUES (new.id, new.label, new.content);
+             END;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .expect("legacy schema");
         conn.pragma_update(None, "user_version", 1).unwrap();
+    }
+
+    /// The upgrade path a fresh database cannot cover. A pre-v3 store must gain
+    /// the indexes, lose the CHECK, and keep every row — with `id` untouched,
+    /// because `chunks_fts` is external-content keyed on it and `chunks_vec`
+    /// references it with no foreign key, so renumbering would decouple both
+    /// silently rather than erroring.
+    #[test]
+    fn an_existing_database_is_rebuilt_without_losing_rows_or_ids() {
+        let conn = open_in_memory().expect("open");
+        create_legacy_v1_database(&conn);
 
         conn.execute(
-            "INSERT INTO projects (name, repo_path, created_at) VALUES ('p', '/p', 0)",
+            "INSERT INTO projects (id, name, repo_path, created_at) VALUES (1,'p','/p',0)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO documents (project_id, doc_type, source_path, title, content_hash, created_at, updated_at)
-             VALUES (1, 'plan', 'a.md', 'a', 'h', 0, 0)",
+            "INSERT INTO documents (id, project_id, doc_type, source_path, title, content_hash, created_at, updated_at)
+             VALUES (1,1,'plan','a.md','a','h',0,0)",
             [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO chunks (document_id, project_id, doc_type, language, label, content, content_hash, token_est, chunk_index, created_at)
-             VALUES (1, 1, 'plan', 'markdown', 'l', 'c', 'ch', 1, 0, 0)",
-            [],
-        )
-        .unwrap();
+        // Deliberately non-contiguous ids: a rebuild that renumbers would look
+        // correct against 1,2,3 and wrong here.
+        for (id, lang, label) in [(7, "rust", "one"), (42, "markdown", "two")] {
+            conn.execute(
+                "INSERT INTO chunks (id, document_id, project_id, doc_type, language, label,
+                                     content, content_hash, token_est, chunk_index, created_at)
+                 VALUES (?1, 1, 1, 'plan', ?2, ?3, 'body text', 'ch', 2, 0, 0)",
+                rusqlite::params![id, lang, label],
+            )
+            .unwrap();
+        }
 
-        assert!(index_names(&conn).is_empty(), "precondition: v1 has none");
+        assert!(index_names(&conn).is_empty(), "precondition: no indexes");
 
-        migrate(&conn, DEFAULT_DIM).expect("upgrade to v2");
+        migrate(&conn, DEFAULT_DIM).expect("upgrade");
 
-        assert_eq!(index_names(&conn).len(), 3, "indexes added on upgrade");
         let version: i32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
-        let chunks: i64 = conn
-            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(index_names(&conn).len(), 3, "indexes added");
+
+        let ids: Vec<i64> = {
+            let mut stmt = conn.prepare("SELECT id FROM chunks ORDER BY id").unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(ids, vec![7, 42], "ids must survive the rebuild verbatim");
+
+        // The CHECK is gone: a syntax the old constraint rejected now stores.
+        conn.execute(
+            "INSERT INTO chunks (id, document_id, project_id, doc_type, language, label,
+                                 content, content_hash, token_est, chunk_index, created_at)
+             VALUES (99, 1, 1, 'plan', 'yaml', 'ci', 'on: push', 'ch', 2, 0, 0)",
+            [],
+        )
+        .expect("'yaml' must be storable after the rebuild");
+
+        // The triggers came back with `SCHEMA`, so FTS still tracks inserts.
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH 'push'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(chunks, 1, "adding an index must not touch the rows");
+        assert_eq!(hits, 1, "insert trigger must be back after the rebuild");
+    }
+
+    /// Idempotent: a second call must not rebuild again or disturb the rows.
+    #[test]
+    fn migrating_an_already_current_database_is_a_no_op() {
+        let conn = open_in_memory().expect("open");
+        migrate(&conn, DEFAULT_DIM).expect("first");
+        conn.execute(
+            "INSERT INTO projects (id, name, repo_path, created_at) VALUES (1,'p','/p',0)",
+            [],
+        )
+        .unwrap();
+        migrate(&conn, DEFAULT_DIM).expect("second");
+
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     /// The whole point of the indexes: the inventory queries must stop reading

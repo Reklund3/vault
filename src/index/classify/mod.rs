@@ -77,7 +77,7 @@ pub(crate) const CLASSIFY_SYSTEM: &str = r#"You classify a source file for a cod
 
 You are given a file's name, extension, and the first 1KB of its content. Respond with JSON only — no prose, no markdown fences:
 
-{"doc_type": "<contract|plan|convention|meta>", "language": "<go|rust|scala|proto|openapi|markdown|unknown>"}
+{"doc_type": "<contract|plan|convention|meta>", "language": "<go|rust|scala|proto|openapi|markdown|yaml|toml|json|shell|unknown>"}
 
 doc_type:
 - contract:   API/interface definitions — protobuf, OpenAPI/Swagger specs
@@ -85,11 +85,18 @@ doc_type:
 - convention: source code and coding-convention docs — Go/Rust/Scala source, CLAUDE.md-style guidance
 - meta:       repository meta docs — READMEs, contributing guides, changelogs
 
-language: the file's source language, or "unknown" if it cannot be determined.
+language: the file's syntax, or "unknown" if it cannot be determined.
 
 Rules:
 - Always return exactly one doc_type from {contract, plan, convention, meta}.
 - If you cannot determine the language, return "unknown".
+- "openapi" wins over "yaml"/"json" when the file IS an OpenAPI/Swagger spec —
+  it selects a structural parser that chunks per path and per schema, and the
+  extension cannot tell a spec from any other YAML. Every other YAML file
+  (CI workflows, Kubernetes manifests, Helm charts, docker-compose) is "yaml".
+- "shell" covers sh/bash/zsh scripts. "toml", "json" and "yaml" are the config
+  syntaxes; prefer them over "unknown", which is for files whose syntax is
+  genuinely unclear.
 
 Examples:
 

@@ -49,6 +49,11 @@ impl FromStr for DocType {
 /// nothing: Helm is a templating framework rather than a language, there is no
 /// Helm parser (out of v1 scope), and the variant fell through to the
 /// extension fallback — chunking a chart exactly as `Unknown` would.
+///
+/// The set is no longer frozen by a database CHECK (schema v3), so adding a
+/// syntax is a code change. A new variant needs a `from_str` arm, an `as_str`
+/// arm, and a mention in `CLASSIFY_SYSTEM` — nothing else, since anything
+/// without a structural parser falls through to the whole-file path.
 #[allow(rustdoc::broken_intra_doc_links)]
 pub enum Language {
     Go,
@@ -57,6 +62,10 @@ pub enum Language {
     Proto,
     OpenApi,
     Markdown,
+    Yaml,
+    Toml,
+    Json,
+    Shell,
     Unknown,
 }
 
@@ -69,6 +78,10 @@ impl Language {
             Language::Proto => "proto",
             Language::OpenApi => "openapi",
             Language::Markdown => "markdown",
+            Language::Yaml => "yaml",
+            Language::Toml => "toml",
+            Language::Json => "json",
+            Language::Shell => "shell",
             Language::Unknown => "unknown",
         }
     }
@@ -85,9 +98,14 @@ impl FromStr for Language {
             "proto" => Ok(Language::Proto),
             "openapi" => Ok(Language::OpenApi),
             "markdown" => Ok(Language::Markdown),
+            "yaml" => Ok(Language::Yaml),
+            "toml" => Ok(Language::Toml),
+            "json" => Ok(Language::Json),
+            "shell" => Ok(Language::Shell),
             "unknown" => Ok(Language::Unknown),
             other => Err(format!(
-                "unknown language '{other}' (expected: go|rust|scala|proto|openapi|markdown|unknown)"
+                "unknown language '{other}' \
+                 (expected: go|rust|scala|proto|openapi|markdown|yaml|toml|json|shell|unknown)"
             )),
         }
     }
