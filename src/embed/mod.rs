@@ -1,12 +1,25 @@
 mod stub;
 mod tei;
 
+// `StubEmbedder` exists for `vault diagnose --stub`, which traces retrieval
+// plumbing without TEI. It must NOT be `#[cfg(test)]`-gated — that is the
+// deliberate asymmetry with the router and classifier stubs (see CLAUDE.md), and
+// it still holds: this ships in every release build that has a CLI, which is
+// exactly when `--stub` exists. `test` is in the gate because the facade and
+// hook unit tests use it as a cheap deterministic embedder.
+#[cfg(any(feature = "cli", test))]
 pub use stub::StubEmbedder;
 pub use tei::TeiEmbedder;
 
 pub trait Embedder {
-    /// Embedding dimension this embedder produces. Used by callers (the store,
-    /// validation paths) to confirm three-way agreement: config ⟷ schema ⟷ server.
+    /// Embedding dimension this embedder produces.
+    ///
+    /// Part of the trait contract, exercised only by test doubles today — the
+    /// config ⟷ schema ⟷ server agreement it was meant to check is enforced
+    /// instead by `TeiEmbedder::verify_against_server` and the store's
+    /// `(model, dim)` lock. Kept because an `Embedder` that cannot state its
+    /// dimension cannot be validated at all; the previous comment claimed
+    /// callers in the store and validation paths, and there were none.
     #[allow(dead_code)]
     fn dim(&self) -> usize;
 

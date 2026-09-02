@@ -18,7 +18,8 @@ const MAX_TOKENS: u32 = 1024;
 pub(crate) struct GemmaClassifier {
     endpoint: Url,
     model: String,
-    http: Client,
+    http: &'static Client,
+    timeout: Duration,
 }
 
 impl GemmaClassifier {
@@ -32,14 +33,16 @@ impl GemmaClassifier {
     ) -> Result<Self, ClassifyError> {
         let endpoint = Url::parse(config.mlx_endpoint())
             .map_err(|e| ClassifyError::Transport(format!("bad mlx endpoint: {e}")))?;
-        let http = Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| ClassifyError::Transport(e.to_string()))?;
+        // One process-wide client (see `util::http`): the timeout was the only
+        // thing that ever differed between these, and it rides on the request.
+        let http = crate::util::http::shared().ok_or_else(|| {
+            ClassifyError::Transport("could not construct the shared HTTP client".to_string())
+        })?;
         Ok(Self {
             endpoint,
             model: config.mlx_model().to_string(),
             http,
+            timeout,
         })
     }
 }
@@ -74,6 +77,7 @@ impl Classifier for GemmaClassifier {
         let resp = self
             .http
             .post(url)
+            .timeout(self.timeout)
             .json(&request)
             .send()
             .map_err(|e| ClassifyError::Transport(e.to_string()))?;

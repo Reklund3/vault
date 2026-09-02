@@ -6,3 +6,10 @@
 # Claude Code local-only scratch (git worktrees, machine-specific settings)
 .claude/worktrees/
 .claude/settings.local.json
+
+# Incident-response tooling, local-only. Written for the 2026-08-20
+# arrayref/proc-macro1 attack; its BAD_CRATES/BAD_STRINGS lists are that
+# advisory's indicators, so it is a thing you run when an advisory lands, not a
+# standing gate. Committing it would pin a frozen IoC list that passes forever.
+/scripts/supply-chain-audit.sh
+/scripts/test-supply-chain-audit.sh

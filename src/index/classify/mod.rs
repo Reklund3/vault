@@ -1,5 +1,7 @@
 use std::str::FromStr;
 
+use serde::Deserialize;
+
 use crate::config::Config;
 use crate::types::{DocType, Language};
 use crate::util::json::extract_json_object;
@@ -75,7 +77,7 @@ pub(crate) const CLASSIFY_SYSTEM: &str = r#"You classify a source file for a cod
 
 You are given a file's name, extension, and the first 1KB of its content. Respond with JSON only — no prose, no markdown fences:
 
-{"doc_type": "<contract|plan|convention|meta>", "language": "<go|rust|scala|proto|openapi|helm|markdown|unknown>"}
+{"doc_type": "<contract|plan|convention|meta>", "language": "<go|rust|scala|proto|openapi|markdown|yaml|toml|json|shell|unknown>"}
 
 doc_type:
 - contract:   API/interface definitions — protobuf, OpenAPI/Swagger specs
@@ -83,11 +85,18 @@ doc_type:
 - convention: source code and coding-convention docs — Go/Rust/Scala source, CLAUDE.md-style guidance
 - meta:       repository meta docs — READMEs, contributing guides, changelogs
 
-language: the file's source language, or "unknown" if it cannot be determined.
+language: the file's syntax, or "unknown" if it cannot be determined.
 
 Rules:
 - Always return exactly one doc_type from {contract, plan, convention, meta}.
 - If you cannot determine the language, return "unknown".
+- "openapi" wins over "yaml"/"json" when the file IS an OpenAPI/Swagger spec —
+  it selects a structural parser that chunks per path and per schema, and the
+  extension cannot tell a spec from any other YAML. Every other YAML file
+  (CI workflows, Kubernetes manifests, Helm charts, docker-compose) is "yaml".
+- "shell" covers sh/bash/zsh scripts. "toml", "json" and "yaml" are the config
+  syntaxes; prefer them over "unknown", which is for files whose syntax is
+  genuinely unclear.
 
 Examples:
 
@@ -123,12 +132,24 @@ pub(crate) fn build_user_prompt(input: &ClassifyInput) -> String {
     )
 }
 
+/// `#[serde(default)]` covers a *missing* key but not an explicit `null`, which
+/// fails deserialization ("invalid type: null, expected a string"). A model
+/// emitting `"language": null` — routine for "I could not tell" — voided the
+/// whole classification, so the file was skipped rather than falling back to
+/// `Language::Unknown`, which `from_strings` is already lenient enough to do.
 #[derive(serde::Deserialize)]
 struct RawClassification {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty_string")]
     doc_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty_string")]
     language: String,
+}
+
+fn null_as_empty_string<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 /// Parse a model's free-text reply into a `Classification`. Tolerates markdown
@@ -386,6 +407,14 @@ dims = 768
     fn parse_response_no_json_is_bad_response() {
         let err = parse_response("I don't know.").unwrap_err();
         assert!(matches!(err, ClassifyError::BadResponse(_)));
+    }
+
+    #[test]
+    fn parse_response_null_fields_fall_back_to_unknown() {
+        let c = parse_response(r#"{"doc_type":"convention","language":null}"#)
+            .expect("null language should deserialize and map to Unknown");
+        assert_eq!(c.doc_type, DocType::Convention);
+        assert_eq!(c.language, Language::Unknown);
     }
 
     #[test]

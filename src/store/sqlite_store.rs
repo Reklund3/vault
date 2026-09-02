@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, ToSql, params};
@@ -8,7 +9,7 @@ use crate::retrieve::QueryPlan;
 use crate::store::schema;
 use crate::store::traits::{Store, StoreError};
 use crate::store::types::{ChunkWithEmbedding, Document, Hit, RetrievalLogEntry};
-use crate::types::DocType;
+use crate::types::{DocType, Inventory, Language};
 use crate::util::fs::{harden_dir, harden_file};
 
 pub struct SqliteStore {
@@ -84,6 +85,43 @@ impl SqliteStore {
         Ok(ids)
     }
 }
+
+/// The inventory statements, named so the schema tests can `EXPLAIN QUERY PLAN`
+/// the query the store actually issues. Inlined string literals let a revert to
+/// a table-scanning form pass every behavioural test — the rows are identical,
+/// only the cost changes.
+pub(crate) const INVENTORY_PROJECTS_SQL: &str = "SELECT p.name FROM projects p
+     WHERE EXISTS (SELECT 1 FROM chunks c WHERE c.project_id = p.id)
+     ORDER BY p.name";
+/// Loose index scan ("skip scan"): seek to the smallest value, then repeatedly
+/// seek past it, one probe per *distinct* value rather than one visit per row.
+///
+/// `SELECT DISTINCT language` walks all 120k index entries to find five
+/// answers, because SQLite will not derive this rewrite itself. 6.4ms against
+/// 0.3ms on the 120k corpus.
+///
+/// Correctness rests on `chunks.language` and `chunks.doc_type` being `NOT
+/// NULL` (see `SCHEMA_V1`): `MIN()` skips NULLs, so a nullable column would
+/// silently drop that value from the inventory — and an inventory that omits a
+/// value prunes it out of every plan, which is the phantom-filter bug in
+/// reverse. Do not point this idiom at a nullable column.
+///
+/// The seed row is `NULL` on an empty table, which the recursion terminates on
+/// immediately and the outer filter discards — an empty store yields no rows.
+pub(crate) const INVENTORY_LANGUAGES_SQL: &str = "WITH RECURSIVE d(v) AS (
+         SELECT MIN(language) FROM chunks
+         UNION ALL
+         SELECT (SELECT MIN(language) FROM chunks WHERE language > d.v)
+           FROM d WHERE d.v IS NOT NULL
+     )
+     SELECT v FROM d WHERE v IS NOT NULL ORDER BY v";
+pub(crate) const INVENTORY_DOC_TYPES_SQL: &str = "WITH RECURSIVE d(v) AS (
+         SELECT MIN(doc_type) FROM chunks
+         UNION ALL
+         SELECT (SELECT MIN(doc_type) FROM chunks WHERE doc_type > d.v)
+           FROM d WHERE d.v IS NOT NULL
+     )
+     SELECT v FROM d WHERE v IS NOT NULL ORDER BY v";
 
 impl Store for SqliteStore {
     fn migrate(&mut self) -> Result<(), StoreError> {
@@ -165,6 +203,139 @@ impl Store for SqliteStore {
             }
         }
         Ok(None)
+    }
+
+    fn project_for_path(&self, path: &str) -> Result<Option<String>, StoreError> {
+        let needle = path.trim_end_matches('/');
+        if needle.is_empty() {
+            return Ok(None);
+        }
+        // Prefix matching happens in Rust, not SQL. `LIKE` would need the
+        // pattern metacharacters in `path` escaped — and `path` arrives from
+        // the hook's stdin JSON — while `GLOB` has the same problem. Comparing
+        // in Rust keeps untrusted input out of pattern position entirely.
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, repo_path FROM projects WHERE repo_path IS NOT NULL")
+            .map_err(backend_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(backend_err)?;
+
+        let mut best: Option<(usize, String)> = None;
+        for row in rows {
+            let (name, repo_path) = row.map_err(backend_err)?;
+            let root = repo_path.trim_end_matches('/');
+            if root.is_empty() {
+                continue;
+            }
+            // Equal, or `path` sits under `root` at a component boundary. The
+            // boundary check is what stops `/src/vault-old` matching a project
+            // rooted at `/src/vault`.
+            let under = needle == root
+                || needle
+                    .strip_prefix(root)
+                    .is_some_and(|rest| rest.starts_with('/'));
+            // Longest root wins, so a repo nested inside another resolves to
+            // the inner one.
+            if under && best.as_ref().is_none_or(|(len, _)| root.len() > *len) {
+                best = Some((root.len(), name));
+            }
+        }
+        Ok(best.map(|(_, name)| name))
+    }
+
+    fn count_matching_filters(&self, plan: &QueryPlan) -> Result<Option<usize>, StoreError> {
+        // Same clause builder and the same binding helper the two search arms
+        // use, so this cannot drift from what actually filters. `WHERE 1=1`
+        // because `build_filter_clause` emits ` AND ...` suffixes and may emit
+        // nothing at all.
+        let project_ids = self.existing_project_ids(&plan.projects)?;
+        let doc_type_strs: Vec<&'static str> = plan.doc_types.iter().map(|d| d.as_str()).collect();
+        let language_strs: Vec<&'static str> = plan.languages.iter().map(|l| l.as_str()).collect();
+        let filter_sql = build_filter_clause(&project_ids, plan);
+        let filter = filter_bind_params(&project_ids, &doc_type_strs, &language_strs);
+
+        let sql = format!("SELECT COUNT(*) FROM chunks c WHERE 1=1{filter_sql}");
+        let n: i64 = self
+            .conn
+            .query_row(&sql, filter.as_slice(), |r| r.get(0))
+            .map_err(backend_err)?;
+        Ok(Some(n as usize))
+    }
+
+    fn inventory(&self) -> Result<Inventory, StoreError> {
+        // Three queries over `chunks`, all served by the schema-v2 covering
+        // indexes so none of them pages in the inline `content` column. Only
+        // values with at least one chunk are reported: a language whose every
+        // chunk was dropped by the secret pre-scan is not retrievable, so
+        // naming it to the router would be the same phantom-value problem in a
+        // new place.
+        //
+        // Left as three statements deliberately. Folding them into one `UNION`
+        // was measured *slower* — 369ms against 226ms on a 120k-chunk corpus —
+        // because the union dedupes 360k rows in one temp B-tree instead of
+        // three independent passes. The cost here was never the round trips.
+        //
+        // Unparseable stored labels are skipped rather than failing the call.
+        // This runs on the hook path via `Vault::open`, where the fail-open
+        // contract makes "ground with what parsed" strictly better than
+        // "abort retrieval over one bad row".
+        let mut projects = Vec::new();
+        let mut stmt = self
+            .conn
+            .prepare(
+                // `EXISTS` rather than `JOIN ... DISTINCT` so the scan stops at
+                // the first chunk of each project. The two plan to the same
+                // join order once statistics exist — this is not a planner
+                // hint — but the join emits every matching row into a temp
+                // B-tree to deduplicate. 31ms against 0.26ms on the 120k
+                // corpus, measured after ANALYZE.
+                INVENTORY_PROJECTS_SQL,
+            )
+            .map_err(backend_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(backend_err)?;
+        for row in rows {
+            projects.push(row.map_err(backend_err)?);
+        }
+        drop(stmt);
+
+        let mut languages = Vec::new();
+        let mut stmt = self
+            .conn
+            .prepare(INVENTORY_LANGUAGES_SQL)
+            .map_err(backend_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(backend_err)?;
+        for row in rows {
+            if let Ok(lang) = Language::from_str(&row.map_err(backend_err)?) {
+                languages.push(lang);
+            }
+        }
+        drop(stmt);
+
+        let mut doc_types = Vec::new();
+        let mut stmt = self
+            .conn
+            .prepare(INVENTORY_DOC_TYPES_SQL)
+            .map_err(backend_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(backend_err)?;
+        for row in rows {
+            if let Ok(dt) = doc_type_from_str(&row.map_err(backend_err)?) {
+                doc_types.push(dt);
+            }
+        }
+
+        Ok(Inventory {
+            projects,
+            languages,
+            doc_types,
+        })
     }
 
     fn set_project_domain(&mut self, project_id: i64, domain: &str) -> Result<(), StoreError> {
@@ -270,18 +441,39 @@ impl Store for SqliteStore {
     ) -> Result<usize, StoreError> {
         let tx = self.conn.transaction().map_err(backend_err)?;
 
-        // The placeholder string only contains '?' and ',' — no user data formatted into SQL.
-        // Values are still parameter-bound below.
-        let (kept_clause, kept_params): (String, Vec<&dyn ToSql>) = if kept_paths.is_empty() {
-            (String::new(), Vec::new())
+        // Kept paths go through a temp table rather than an `IN (?, ?, ...)`
+        // list. One bind per kept file made the statement's parameter count
+        // scale with the repo, and SQLite caps that: measured here, a prune
+        // with 32,766 kept paths fails with "too many SQL variables" (the
+        // ceiling is 999 on builds older than 3.32). A monorepo of that size is
+        // unusual but not absurd, and the failure lands at the end of a
+        // successful sync, after all the embedding work. The temp table makes
+        // the parameter count constant at one.
+        //
+        // `DELETE FROM` before filling it: the table is per-connection and
+        // outlives a failed call, so a previous prune's rows would otherwise
+        // survive and protect documents that are now orphans.
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS kept_paths(source_path TEXT PRIMARY KEY);
+             DELETE FROM kept_paths;",
+        )
+        .map_err(backend_err)?;
+        {
+            let mut stmt = tx
+                .prepare("INSERT OR IGNORE INTO temp.kept_paths(source_path) VALUES (?1)")
+                .map_err(backend_err)?;
+            for path in kept_paths {
+                stmt.execute([path]).map_err(backend_err)?;
+            }
+        }
+
+        // An empty kept set means "nothing survives" — no clause, delete all of
+        // the project's documents. Distinct from an empty temp table only in
+        // that it skips the subquery entirely.
+        let kept_clause = if kept_paths.is_empty() {
+            ""
         } else {
-            (
-                format!(
-                    " AND source_path NOT IN ({})",
-                    placeholders(kept_paths.len())
-                ),
-                kept_paths.iter().map(|s| s as &dyn ToSql).collect(),
-            )
+            " AND source_path NOT IN (SELECT source_path FROM temp.kept_paths)"
         };
 
         // 1. Drop chunks_vec rows for orphan documents before the docs go (no FK cascade).
@@ -292,19 +484,14 @@ impl Store for SqliteStore {
                 WHERE d.project_id = ?1{kept_clause}
              )"
         );
-        let mut vec_params: Vec<&dyn ToSql> = vec![&project_id];
-        vec_params.extend(kept_params.iter().copied());
-        tx.execute(&vec_sql, vec_params.as_slice())
-            .map_err(backend_err)?;
+        tx.execute(&vec_sql, [&project_id]).map_err(backend_err)?;
 
         // 2. Delete documents. chunks cascade via FK; chunks_fts cascades via trigger.
         let doc_sql = format!("DELETE FROM documents WHERE project_id = ?1{kept_clause}");
-        let mut doc_params: Vec<&dyn ToSql> = vec![&project_id];
-        doc_params.extend(kept_params.iter().copied());
-        let removed = tx
-            .execute(&doc_sql, doc_params.as_slice())
-            .map_err(backend_err)?;
+        let removed = tx.execute(&doc_sql, [&project_id]).map_err(backend_err)?;
 
+        tx.execute_batch("DELETE FROM kept_paths;")
+            .map_err(backend_err)?;
         tx.commit().map_err(backend_err)?;
         Ok(removed)
     }
@@ -442,12 +629,31 @@ fn escape_fts_token(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+/// Build the FTS5 `MATCH` expression from the plan's keyword fields.
+///
+/// Each value is emitted as **one quoted string**, so a multi-word topic is an
+/// FTS5 *phrase* and matches only where those words appear adjacently. That
+/// looks like a bug and is not — it was tried the other way and measured worse.
+///
+/// Splitting `"backend selection"` into `"backend" OR "selection"` widened the
+/// BM25 arm from 16 of 317 chunks to 69 and did raise the right chunks' scores,
+/// because they finally matched on both arms. But it *lowered their rank*: the
+/// generic halves of a conceptual phrase match a great deal of unrelated code,
+/// so `fn run`, `get_or_create_project` and `bm25_search` all acquired BM25
+/// scores on the strength of the word "selection" and displaced the answer.
+/// Top-6 precision on the tuning prompt went from 5/6 to 4/6, and the two
+/// intruders cost 883 tokens of budget.
+///
+/// Kept as a phrase, the keyword arm is a precision instrument: it contributes
+/// when the exact concept is present and contributes *nothing* otherwise,
+/// leaving the ranking to cosine — which is the arm that is consistently right.
+/// Widening it is not the fix; `[defaults].alpha` is (see review B5).
+///
+/// The quoting is also what neutralizes FTS5 syntax — a bare `OR`, `NEAR`, `-`,
+/// `*` or `(` from router output would otherwise parse as an operator.
 fn build_match_query(plan: &QueryPlan) -> Option<String> {
     let mut tokens: Vec<String> = Vec::new();
-    for t in &plan.type_names {
-        tokens.push(escape_fts_token(t));
-    }
-    for t in &plan.topics {
+    for t in plan.type_names.iter().chain(plan.topics.iter()) {
         tokens.push(escape_fts_token(t));
     }
     if tokens.is_empty() {
@@ -590,6 +796,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// The WAL sidecars are created by SQLite, not by `open()`, so `harden_file`
+    /// never runs on them — they take whatever mode SQLite gives them, which is
+    /// the main database's. `docs/security.md` states that inheritance as fact;
+    /// this is what keeps the statement true. It has to hold the store open,
+    /// because a clean close checkpoints both sidecars away.
+    #[cfg(unix)]
+    #[test]
+    fn wal_sidecars_inherit_the_hardened_db_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("vault-wal-mode-{}-{nanos}", std::process::id()));
+        let db = base.join("vault.db");
+
+        let store = SqliteStore::open(&db, &Config::default()).expect("open");
+        let wal = base.join("vault.db-wal");
+        let shm = base.join("vault.db-shm");
+        assert!(
+            wal.is_file(),
+            "WAL journal must exist while the store is open"
+        );
+        assert!(shm.is_file(), "WAL shared-memory index must exist too");
+
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&db), 0o600, "db must be 0600");
+        assert_eq!(
+            mode(&wal),
+            0o600,
+            "-wal leaks indexed content if it is not 0600"
+        );
+        assert_eq!(mode(&shm), 0o600, "-shm must not be looser than the db");
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     fn create_project(store: &SqliteStore, name: &str) -> i64 {
         store
             .conn
@@ -610,6 +856,423 @@ mod tests {
             token_est: 10,
             chunk_index: idx,
         }
+    }
+
+    fn project_at(store: &SqliteStore, name: &str, repo_path: &str) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO projects (name, repo_path, created_at) VALUES (?1, ?2, ?3)",
+                params![name, repo_path, now_secs()],
+            )
+            .unwrap();
+    }
+
+    /// The cwd bias resolves from any directory inside the repo, not just its
+    /// root — you are almost never sitting at the top of a checkout.
+    #[test]
+    fn project_for_path_matches_a_subdirectory_of_the_repo() {
+        let config = Config::default();
+        let store = SqliteStore::open_in_memory(&config).unwrap();
+        project_at(&store, "vault", "/home/u/git/vault");
+
+        for cwd in [
+            "/home/u/git/vault",
+            "/home/u/git/vault/",
+            "/home/u/git/vault/src/store",
+        ] {
+            assert_eq!(
+                store.project_for_path(cwd).unwrap().as_deref(),
+                Some("vault"),
+                "should resolve from {cwd}"
+            );
+        }
+    }
+
+    /// The boundary check. A plain `starts_with` would match a sibling whose
+    /// name merely extends the project's — and silently bias every prompt in it
+    /// toward the wrong project.
+    #[test]
+    fn project_for_path_does_not_match_a_sibling_with_a_longer_name() {
+        let config = Config::default();
+        let store = SqliteStore::open_in_memory(&config).unwrap();
+        project_at(&store, "vault", "/home/u/git/vault");
+
+        assert_eq!(
+            store.project_for_path("/home/u/git/vault-old").unwrap(),
+            None
+        );
+        assert_eq!(
+            store.project_for_path("/home/u/git/vaultx/src").unwrap(),
+            None
+        );
+    }
+
+    /// A repo checked out inside another must resolve to the inner one —
+    /// longest root wins.
+    #[test]
+    fn project_for_path_prefers_the_innermost_repo() {
+        let config = Config::default();
+        let store = SqliteStore::open_in_memory(&config).unwrap();
+        project_at(&store, "outer", "/home/u/git");
+        project_at(&store, "inner", "/home/u/git/vault");
+
+        assert_eq!(
+            store
+                .project_for_path("/home/u/git/vault/src")
+                .unwrap()
+                .as_deref(),
+            Some("inner")
+        );
+        assert_eq!(
+            store
+                .project_for_path("/home/u/git/other")
+                .unwrap()
+                .as_deref(),
+            Some("outer")
+        );
+    }
+
+    /// An unindexed directory contributes no bias rather than guessing.
+    #[test]
+    fn project_for_path_returns_none_outside_every_indexed_repo() {
+        let config = Config::default();
+        let store = SqliteStore::open_in_memory(&config).unwrap();
+        project_at(&store, "vault", "/home/u/git/vault");
+
+        assert_eq!(store.project_for_path("/tmp/scratch").unwrap(), None);
+        assert_eq!(store.project_for_path("").unwrap(), None);
+    }
+
+    /// `path` arrives from the hook's stdin JSON, so it is untrusted input.
+    /// Matching happens in Rust precisely so pattern metacharacters are inert
+    /// rather than needing `LIKE`/`GLOB` escaping.
+    #[test]
+    fn project_for_path_treats_pattern_metacharacters_as_literal() {
+        let config = Config::default();
+        let store = SqliteStore::open_in_memory(&config).unwrap();
+        project_at(&store, "vault", "/home/u/git/vault");
+
+        for hostile in ["%", "/home/%/git/vault", "/home/u/git/vau*", "_"] {
+            assert_eq!(
+                store.project_for_path(hostile).unwrap(),
+                None,
+                "{hostile:?} must not match as a pattern"
+            );
+        }
+    }
+
+    /// The grounding snapshot the router is handed. Everything it reports must
+    /// be backed by a real chunk: the whole point is to stop the router naming
+    /// values that match nothing, so a snapshot that itself contains phantoms
+    /// would just move the bug.
+    /// `count_matching_filters` answers the question `vault diagnose` needs to
+    /// distinguish "this filter selected a narrow slice" from "this filter
+    /// selected nothing, so the store threw it away and searched everything".
+    #[test]
+    fn count_matching_filters_separates_a_narrow_filter_from_a_dead_one() {
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+        let vault_id = create_project(&store, "vault");
+
+        store
+            .upsert_document(
+                &Document {
+                    project_id: vault_id,
+                    doc_type: DocType::Convention,
+                    source_path: "src/lib.rs".into(),
+                    title: "lib.rs".into(),
+                    content_hash: "hr".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: lang_chunk(Language::Rust, "Widget", "fn widget", 0),
+                    embedding: unit_embedding(0),
+                }],
+            )
+            .unwrap();
+        store
+            .upsert_document(
+                &Document {
+                    project_id: vault_id,
+                    doc_type: DocType::Plan,
+                    source_path: "docs/plan.md".into(),
+                    title: "plan".into(),
+                    content_hash: "hm".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: lang_chunk(Language::Markdown, "Plan", "# the plan", 0),
+                    embedding: unit_embedding(1),
+                }],
+            )
+            .unwrap();
+
+        let bare = || QueryPlan {
+            projects: vec![],
+            type_names: vec![],
+            topics: vec![],
+            doc_types: vec![],
+            languages: vec![],
+        };
+        let count = |plan: &QueryPlan| store.count_matching_filters(plan).unwrap();
+
+        let mut indexed = bare();
+        indexed.languages = vec![Language::Rust];
+        assert_eq!(count(&indexed), Some(1), "rust is indexed");
+
+        let mut dead = bare();
+        dead.languages = vec![Language::Scala];
+        assert_eq!(
+            count(&dead),
+            Some(0),
+            "scala has no chunks — relax will fire"
+        );
+
+        // The AND-combination is what matters, not per-field existence: both
+        // values are indexed, but no chunk carries the pair.
+        let mut combination = bare();
+        combination.languages = vec![Language::Rust];
+        combination.doc_types = vec![DocType::Plan];
+        assert_eq!(
+            count(&combination),
+            Some(0),
+            "rust chunks are convention, markdown chunks are plan"
+        );
+
+        // No filter at all counts the whole corpus rather than zero.
+        assert_eq!(count(&bare()), Some(2));
+    }
+
+    /// The loose index scan enumerates by repeatedly seeking past the last
+    /// value it saw, so a recursion that terminates early returns a *prefix* of
+    /// the truth and every later value silently vanishes from the inventory —
+    /// which then prunes it out of every plan. Two values cannot show that;
+    /// this uses every language the CHECK constraint allows.
+    /// `Language::Helm` was removed from the enum without a schema migration:
+    /// the CHECK on `chunks.language` still permits 'helm', because narrowing
+    /// it would need a full table rebuild for a value nothing writes any more.
+    /// So a database synced by an older vault can still hold `helm` rows, and
+    /// the read path must skip them rather than fail — `inventory()` is on the
+    /// hook's fail-open path, where aborting retrieval over one stale label
+    /// would be much worse than omitting it.
+    #[test]
+    fn a_legacy_helm_row_is_skipped_not_fatal() {
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+        let project_id = create_project(&store, "vault");
+
+        store
+            .upsert_document(
+                &Document {
+                    project_id,
+                    doc_type: DocType::Convention,
+                    source_path: "src/lib.rs".into(),
+                    title: "lib.rs".into(),
+                    content_hash: "hr".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: lang_chunk(Language::Rust, "Widget", "fn widget", 0),
+                    embedding: unit_embedding(0),
+                }],
+            )
+            .unwrap();
+
+        // Written as an older vault would have. The CHECK still allows it,
+        // which is precisely why this row can exist.
+        store
+            .conn
+            .execute(
+                "INSERT INTO chunks
+                   (document_id, project_id, doc_type, language, label, content,
+                    content_hash, token_est, chunk_index, created_at)
+                 SELECT id, ?1, 'convention', 'helm', 'chart', 'replicas: 1', 'hh', 3, 1, 0
+                 FROM documents LIMIT 1",
+                [project_id],
+            )
+            .expect("the CHECK must still permit 'helm' — narrowing it needs a rebuild");
+
+        let inv = store
+            .inventory()
+            .expect("inventory must not fail on a stale label");
+
+        assert_eq!(
+            inv.languages,
+            vec![Language::Rust],
+            "a label the enum no longer knows is skipped, not surfaced or fatal"
+        );
+    }
+
+    #[test]
+    fn inventory_enumerates_every_distinct_value_not_just_the_first() {
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+        let project_id = create_project(&store, "vault");
+
+        let langs = [
+            Language::Go,
+            Language::Rust,
+            Language::Scala,
+            Language::Proto,
+            Language::OpenApi,
+            Language::Markdown,
+            Language::Unknown,
+        ];
+        let doc_types = [
+            DocType::Contract,
+            DocType::Plan,
+            DocType::Convention,
+            DocType::Meta,
+        ];
+
+        for (i, lang) in langs.iter().enumerate() {
+            store
+                .upsert_document(
+                    &Document {
+                        project_id,
+                        doc_type: doc_types[i % doc_types.len()],
+                        source_path: format!("src/f{i}"),
+                        title: format!("f{i}"),
+                        content_hash: format!("h{i}"),
+                    },
+                    &[ChunkWithEmbedding {
+                        chunk: lang_chunk(*lang, &format!("item{i}"), "body", 0),
+                        embedding: unit_embedding(i),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let inv = store.inventory().unwrap();
+
+        let mut got = inv.languages.clone();
+        got.sort_by_key(|l| l.as_str());
+        let mut want = langs.to_vec();
+        want.sort_by_key(|l| l.as_str());
+        assert_eq!(got, want, "every language with a chunk must be reported");
+
+        let mut got_dt = inv.doc_types.clone();
+        got_dt.sort_by_key(|d| d.as_str());
+        let mut want_dt = doc_types.to_vec();
+        want_dt.sort_by_key(|d| d.as_str());
+        assert_eq!(got_dt, want_dt);
+    }
+
+    #[test]
+    fn inventory_reports_only_values_that_have_chunks() {
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+        let vault_id = create_project(&store, "vault");
+        // A project row with no documents at all. It exists, but nothing in it
+        // is retrievable, so naming it to the router would be a phantom filter.
+        create_project(&store, "never-synced");
+
+        store
+            .upsert_document(
+                &Document {
+                    project_id: vault_id,
+                    doc_type: DocType::Convention,
+                    source_path: "src/lib.rs".into(),
+                    title: "lib.rs".into(),
+                    content_hash: "hr".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: lang_chunk(Language::Rust, "Widget", "fn widget", 0),
+                    embedding: unit_embedding(0),
+                }],
+            )
+            .unwrap();
+        store
+            .upsert_document(
+                &Document {
+                    project_id: vault_id,
+                    doc_type: DocType::Plan,
+                    source_path: "docs/plan.md".into(),
+                    title: "plan".into(),
+                    content_hash: "hm".into(),
+                },
+                &[ChunkWithEmbedding {
+                    chunk: lang_chunk(Language::Markdown, "Plan", "# the plan", 0),
+                    embedding: unit_embedding(1),
+                }],
+            )
+            .unwrap();
+
+        let inv = store.inventory().unwrap();
+
+        assert_eq!(
+            inv.projects,
+            vec!["vault".to_string()],
+            "a project with no chunks must not be listed"
+        );
+        assert_eq!(inv.languages, vec![Language::Markdown, Language::Rust]);
+        assert_eq!(inv.doc_types, vec![DocType::Convention, DocType::Plan]);
+        assert!(
+            !inv.languages.contains(&Language::Go),
+            "Go is enum-valid but absent from this store — that is the whole bug"
+        );
+    }
+
+    /// An unindexed store reports an empty inventory, which every consumer
+    /// reads as "unknown": no grounding rendered, no filters pruned. It must not
+    /// be mistaken for "the corpus is genuinely empty".
+    #[test]
+    fn inventory_of_an_empty_store_is_empty() {
+        let config = Config::default();
+        let store = SqliteStore::open_in_memory(&config).unwrap();
+
+        assert!(store.inventory().unwrap().is_empty());
+    }
+
+    fn topic_plan(topics: &[&str]) -> QueryPlan {
+        QueryPlan {
+            projects: vec![],
+            type_names: vec![],
+            topics: topics.iter().map(|t| t.to_string()).collect(),
+            doc_types: vec![],
+            languages: vec![],
+        }
+    }
+
+    /// Pins the phrase behaviour so it is not "fixed" again.
+    ///
+    /// Emitting `"backend selection"` as one quoted phrase requires adjacency,
+    /// which looks like an obvious defect — it was changed to `"backend" OR
+    /// "selection"` and measured worse: top-6 precision on the tuning prompt
+    /// fell from 5/6 to 4/6 as generic word matches displaced the answer. See
+    /// `build_match_query`'s doc comment for the numbers.
+    #[test]
+    fn a_multi_word_topic_stays_one_phrase_deliberately() {
+        let q = build_match_query(&topic_plan(&["backend selection"])).expect("a query");
+
+        assert_eq!(
+            q, r#""backend selection""#,
+            "splitting this into OR-ed words was tried and measured worse"
+        );
+    }
+
+    /// Router output is untrusted-shaped: a bare `OR`/`NEAR`/`-`/`*` must be
+    /// searched for, not parsed as FTS5 syntax. The quoting is what guarantees
+    /// that, and an embedded quote has to be doubled or the expression breaks.
+    #[test]
+    fn fts_operators_from_the_router_stay_inert() {
+        let q = build_match_query(&topic_plan(&["auth OR -admin", "say \"hi\""])).expect("a query");
+
+        assert_eq!(q, r#""auth OR -admin" OR "say ""hi""""#);
+    }
+
+    /// Each keyword value is its own OR-ed term, so one topic matching nothing
+    /// cannot void the others.
+    #[test]
+    fn keyword_values_are_or_ed_not_and_ed() {
+        let q = build_match_query(&topic_plan(&["routing", "backend selection"])).expect("a query");
+
+        assert_eq!(q, r#""routing" OR "backend selection""#);
+    }
+
+    /// A plan with no keyword fields has no BM25 arm at all — the cosine arm
+    /// still runs, so this is a valid state rather than an error.
+    #[test]
+    fn a_plan_with_no_keywords_produces_no_match_query() {
+        assert!(build_match_query(&topic_plan(&[])).is_none());
     }
 
     fn set_domain(store: &SqliteStore, project_id: i64, domain: &str) {
@@ -1059,6 +1722,55 @@ mod tests {
         }
     }
 
+    /// ADVERSARIAL: the relax-retry clears `languages`/`doc_types` and keeps
+    /// `projects`, so the retried search is project-scoped, not unfiltered.
+    /// `vault diagnose` reports that case as "results below are UNFILTERED",
+    /// which is wrong the moment more than one project is indexed.
+    #[test]
+    fn relaxed_retry_still_honours_the_project_filter() {
+        let config = Config::default();
+        let mut store = SqliteStore::open_in_memory(&config).unwrap();
+
+        for (name, label) in [("vault", "vault_item"), ("other", "other_item")] {
+            let project_id = create_project(&store, name);
+            store
+                .upsert_document(
+                    &Document {
+                        project_id,
+                        doc_type: DocType::Convention,
+                        source_path: format!("{name}/src/lib.rs"),
+                        title: "lib.rs".into(),
+                        content_hash: format!("h{name}"),
+                    },
+                    &[ChunkWithEmbedding {
+                        chunk: lang_chunk(Language::Rust, label, "fn router query plan", 0),
+                        embedding: unit_embedding(0),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let plan = QueryPlan {
+            projects: vec!["vault".into()],
+            type_names: vec![],
+            topics: vec![],
+            doc_types: vec![],
+            languages: vec![Language::Scala], // zero scala chunks -> relax fires
+        };
+
+        let hits = store
+            .hybrid_search(&plan, &unit_embedding(0), config.alpha())
+            .unwrap();
+
+        assert!(!hits.is_empty(), "the retry must find something");
+        let labels: Vec<&str> = hits.iter().map(|h| h.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["vault_item"],
+            "the project filter survives the relax, so the retry is NOT unfiltered"
+        );
+    }
+
     #[test]
     fn hybrid_search_zero_match_language_filter_degrades_to_search() {
         // The proto trap: the router emits languages=["proto"] for "how does
@@ -1166,6 +1878,89 @@ mod tests {
         assert!(
             hits.iter().all(|h| h.label == "RustWidget"),
             "a matching language filter must exclude proto chunks, not broaden"
+        );
+    }
+
+    /// A repo big enough to exceed SQLite's host-parameter ceiling must still
+    /// prune. The old `IN (?, ?, ...)` list bound one variable per kept file and
+    /// failed with "too many SQL variables" — measured at 32,766 kept paths on
+    /// the bundled SQLite, and as low as 999 on builds older than 3.32. The
+    /// failure landed after a whole sync's embedding work had already been done.
+    #[test]
+    fn prune_orphans_handles_more_paths_than_sqlite_can_bind() {
+        let mut store = SqliteStore::open_in_memory(&Config::default()).unwrap();
+        let project_id = create_project(&store, "p");
+
+        for path in ["keep.md", "drop.md"] {
+            store
+                .upsert_document(
+                    &Document {
+                        project_id,
+                        doc_type: DocType::Plan,
+                        source_path: path.into(),
+                        title: path.into(),
+                        content_hash: "h".into(),
+                    },
+                    &[],
+                )
+                .unwrap();
+        }
+
+        // Comfortably past the 32,766 ceiling. Only one names a real document;
+        // the rest exist purely to blow the parameter budget.
+        let mut kept: Vec<String> = (0..40_000).map(|i| format!("ghost{i}.md")).collect();
+        kept.push("keep.md".into());
+
+        let removed = store.prune_orphans(project_id, &kept).unwrap();
+
+        assert_eq!(removed, 1, "drop.md is the only orphan");
+        let remaining: Vec<String> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT source_path FROM documents ORDER BY source_path")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(remaining, vec!["keep.md".to_string()]);
+    }
+
+    /// The temp table is per-connection and outlives the call, so it must be
+    /// cleared before each use. A leftover row from an earlier prune would
+    /// protect a document that is an orphan now.
+    #[test]
+    fn prune_orphans_does_not_carry_kept_paths_between_calls() {
+        let mut store = SqliteStore::open_in_memory(&Config::default()).unwrap();
+        let project_id = create_project(&store, "p");
+
+        for path in ["a.md", "b.md"] {
+            store
+                .upsert_document(
+                    &Document {
+                        project_id,
+                        doc_type: DocType::Plan,
+                        source_path: path.into(),
+                        title: path.into(),
+                        content_hash: "h".into(),
+                    },
+                    &[],
+                )
+                .unwrap();
+        }
+
+        // First sync keeps both.
+        assert_eq!(
+            store
+                .prune_orphans(project_id, &["a.md".into(), "b.md".into()])
+                .unwrap(),
+            0
+        );
+
+        // Second sync no longer sees b.md, so it must go.
+        assert_eq!(
+            store.prune_orphans(project_id, &["a.md".into()]).unwrap(),
+            1,
+            "b.md was protected by a stale kept-path row"
         );
     }
 

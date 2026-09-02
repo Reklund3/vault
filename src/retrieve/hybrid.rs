@@ -15,6 +15,31 @@ use crate::store::Hit;
 /// the token budget trims further downstream in `retrieve::budget`.
 pub(crate) const TOP_K: usize = 50;
 
+/// Sort key for `final_score`, with NaN mapped to negative infinity.
+///
+/// Two things force this. `partial_cmp(..).unwrap_or(Equal)` — the obvious
+/// spelling — is **not a total order** once a NaN is present: NaN compares
+/// `Equal` to every score while the scores order among themselves, which is not
+/// transitive. Rust's sort detects that and panics with "user-provided
+/// comparison function does not correctly implement a total order", aborting a
+/// process that is contractually fail-open on the hook path.
+///
+/// `total_cmp` alone fixes the panic but ranks `+NaN` *above* every real score,
+/// so junk would take the top slots and push good hits past `truncate(limit)`
+/// — a worse failure than the crash, because it is silent. Mapping NaN to
+/// `-inf` sorts it last while leaving every real comparison untouched.
+///
+/// NaN is still *dropped* downstream by `budget::select_within_budget`; this
+/// only decides where it sits until then. NaN reaches here from a zero-norm
+/// embedding making the cosine arm `0/0`.
+fn rank_key(score: f32) -> f32 {
+    if score.is_nan() {
+        f32::NEG_INFINITY
+    } else {
+        score
+    }
+}
+
 /// Blend BM25 and cosine result sets into one ranked list.
 ///
 /// `bm25` carries populated `bm25_score`s (its `cosine_score`s are 0); `cosine`
@@ -53,11 +78,7 @@ pub fn merge(bm25: Vec<Hit>, cosine: Vec<Hit>, alpha: f32, limit: usize) -> Vec<
         h.final_score = alpha * bm25_norm + (1.0 - alpha) * h.cosine_score;
     }
 
-    hits.sort_by(|a, b| {
-        b.final_score
-            .partial_cmp(&a.final_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    hits.sort_by(|a, b| rank_key(b.final_score).total_cmp(&rank_key(a.final_score)));
     hits.truncate(limit);
     hits
 }
@@ -79,6 +100,47 @@ mod tests {
             cosine_score: cosine,
             final_score: 0.0,
         }
+    }
+
+    /// ADVERSARIAL: a NaN score makes `merge`'s comparator non-transitive
+    /// (NaN compares Equal to everything, while the real scores order among
+    /// themselves). Rust's sort detects the broken total order and panics, so
+    /// this aborts the process *before* `select_within_budget`'s NaN guard is
+    /// ever reached — on the hook's hot path, which is contractually fail-open.
+    #[test]
+    fn merge_survives_a_nan_score() {
+        // TOP_K-sized, because the panic check only engages above the
+        // insertion-sort threshold — a 3-element test would pass and prove
+        // nothing.
+        let cosine: Vec<Hit> = (0..50)
+            .map(|i| {
+                let score = if i % 17 == 0 {
+                    f32::NAN
+                } else {
+                    i as f32 / 50.0
+                };
+                cosine_hit(i, score)
+            })
+            .collect();
+
+        let merged = merge(Vec::new(), cosine, 0.1, 50);
+
+        assert_eq!(merged.len(), 50, "merge must not lose hits");
+
+        let first_nan = merged
+            .iter()
+            .position(|h| h.final_score.is_nan())
+            .expect("the fixture seeds NaN scores");
+        assert!(
+            merged[first_nan..].iter().all(|h| h.final_score.is_nan()),
+            "NaN must sort last — ranking it first would push real hits out of `truncate(limit)`"
+        );
+        assert!(
+            merged[..first_nan]
+                .windows(2)
+                .all(|w| w[0].final_score >= w[1].final_score),
+            "real scores must stay score-descending"
+        );
     }
 
     fn bm25_hit(chunk_id: i64, score: f32) -> Hit {

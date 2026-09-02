@@ -8,12 +8,30 @@ rusqlite = { version = "0.39.0", features = ["bundled"] }
 sqlite-vec = "0.1.9"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-toml = "1.1.2+spec-1.1.0"
+toml = "1.1.2"
 thiserror = "2.0.18"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 sha2 = "0.10"
 globset = "0.4"
 walkdir = "2"
 regex = "1"
 yaml-rust2 = "0.10"
+
+# The CLI is a feature so a library consumer can leave it — and clap — behind.
+# On by default, so `cargo build` / `test` / `clippy` behave exactly as before;
+# a consumer opts out with `default-features = false`.
+# libc is already in the graph transitively (ring -> getrandom). It is a
+# dev-dependency here only so `tests/pipeline.rs` can redirect fd 1 while the
+# library runs, which is the only way to check rule 3 — that the library writes
+# nothing to stdout — from inside the test process.
+[dev-dependencies]
+libc = "0.2"
+
+[features]
+default = ["cli"]
+cli = ["dep:clap"]
+
+[[bin]]
+name = "vault"
+required-features = ["cli"]

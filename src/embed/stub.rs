@@ -1,6 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+#[cfg(any(feature = "cli", test))]
 use crate::config::Config;
 use crate::embed::{EmbedError, Embedder};
 
@@ -9,6 +10,10 @@ pub struct StubEmbedder {
 }
 
 impl StubEmbedder {
+    /// Same gate as the `StubEmbedder` re-export: this constructor exists for
+    /// `vault diagnose --stub` and for tests, and neither is present in a
+    /// library-only build.
+    #[cfg(any(feature = "cli", test))]
     pub fn from_config(config: &Config) -> Self {
         Self {
             dim: config.embedding_dim(),

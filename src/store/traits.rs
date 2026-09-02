@@ -1,13 +1,11 @@
 use crate::retrieve::QueryPlan;
 use crate::store::types::{ChunkWithEmbedding, Document, Hit, RetrievalLogEntry};
+use crate::types::Inventory;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("migration failed: {0}")]
     Migration(String),
-    #[error("not found")]
-    #[allow(dead_code)]
-    NotFound,
     #[error("integrity violation: {0}")]
     Conflict(String),
     #[error("invalid input: {0}")]
@@ -61,12 +59,67 @@ pub trait Store {
     /// Resolve the domain assigned to the first of `project_names` (in router
     /// order) that has one. Case-insensitive name match. Returns `Ok(None)` when
     /// no named project is assigned a domain — the hook then derives the tag
-    /// from `defaults.context_tag` instead of `{domain}-context`.
+    /// with no `domain` attribute on the block.
     ///
     /// **Provided default returns `Ok(None)`** (every project unassigned).
     /// Backends that persist `projects.domain` override this; test doubles and
     /// the Postgres placeholder inherit the no-domain default.
     fn resolve_domain(&self, _project_names: &[String]) -> Result<Option<String>, StoreError> {
+        Ok(None)
+    }
+
+    /// Snapshot the distinct project names, languages, and doc_types that
+    /// actually have chunks, so the router can be told what exists instead of
+    /// guessing from the example list in its system prompt.
+    ///
+    /// Reads the `chunks` table, not `projects`/`documents`: a project row whose
+    /// every chunk was dropped by the secret pre-scan is not retrievable, and
+    /// naming it to the router would reintroduce exactly the phantom-value
+    /// problem this exists to close.
+    ///
+    /// **Provided default returns an empty [`Inventory`]**, which every consumer
+    /// reads as "unknown" and ignores — so test doubles and the Postgres
+    /// placeholder keep the pre-existing ungrounded behavior rather than having
+    /// all their filters pruned.
+    fn inventory(&self) -> Result<Inventory, StoreError> {
+        Ok(Inventory::default())
+    }
+
+    /// How many chunks match the plan's *structural* filters (`projects`,
+    /// `doc_types`, `languages`), ignoring the keyword and vector arms.
+    ///
+    /// Exists so `vault diagnose` can tell a filter that selected a narrow slice
+    /// apart from one that selected nothing and was silently relaxed by
+    /// [`Store::hybrid_search`]. Without it the trace prints the filter in the
+    /// plan and the *unfiltered* corpus underneath, which reads as "the filter
+    /// matched" — the exact wrong conclusion for the phantom-filter case the
+    /// grounding work exists to diagnose.
+    ///
+    /// A zero here is a sound proxy for "the relax-retry fired". The retry keys
+    /// off `hits.is_empty()`, and `cosine_search` is a nearest-neighbour scan
+    /// that returns something for *any* non-empty filtered set, so an empty
+    /// merged result and a zero structural count coincide.
+    ///
+    /// **Provided default returns `Ok(None)`** — "cannot say". Diagnose prints
+    /// nothing rather than guessing, so a backend that does not implement this
+    /// keeps its current output instead of gaining a false reassurance.
+    /// Only `vault diagnose` reads this, so a library-only build has no caller.
+    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
+    fn count_matching_filters(&self, _plan: &QueryPlan) -> Result<Option<usize>, StoreError> {
+        Ok(None)
+    }
+
+    /// Resolve the indexed project whose `repo_path` contains `path`, if any.
+    ///
+    /// `path` is the `cwd` Claude Code sends with every prompt — the one signal
+    /// on the hook's input that is *certain* rather than inferred, and the only
+    /// one that costs nothing to obtain. Matching is a longest-prefix test at a
+    /// component boundary, so a nested repo wins over its parent and
+    /// `/src/vault-old` never matches a project rooted at `/src/vault`.
+    ///
+    /// **Provided default returns `Ok(None)`** — a backend that does not persist
+    /// `repo_path` simply contributes no cwd bias.
+    fn project_for_path(&self, _path: &str) -> Result<Option<String>, StoreError> {
         Ok(None)
     }
 
@@ -150,6 +203,9 @@ pub trait Store {
         Ok(hits)
     }
 
+    /// Record a retrieval for later tuning. Implemented by the SQLite backend
+    /// and covered by its tests, but not yet called from the hook — the
+    /// unfinished half of the `retrieval_log` feature, kept deliberately.
     #[allow(dead_code)]
     fn log_retrieval(&mut self, entry: &RetrievalLogEntry) -> Result<(), StoreError>;
 }

@@ -1,114 +1,368 @@
-# Review: docs/vault-plan.md
+# Open findings
 
-**Date:** 2026-06-11 · **Verified against:** working tree at commit `6b08f9d` (branch `init`) · **Status:** findings recorded, follow-up not yet executed
+Started as a review of `docs/vault-plan.md` (2026-06-11, against commit `6b08f9d`);
+now tracks open work from any source. Sections A–C keep their original IDs, so a
+reference to "A9" still resolves and a gap means that item was fixed. Section D is
+findings about the code as built rather than about the plan drifting from it.
 
-The design plan was written before Steps 1–14.8 were implemented and has drifted: some sections contradict the code, some contradict each other, and some describe behavior as current that was never built. Every finding below was verified against the source, plus a second-opinion advisor pass that confirmed/corrected them. Code-affecting findings are recorded as decisions/tracking items for later slices — nothing here mandates a code change by itself.
+**Open work only.** Every claim below was re-verified against the tree on
+2026-08-22, and resolution notes were stripped once verified — a document of what
+is left should not also be a changelog. The full original review, with each
+resolved finding and its commit, is recoverable:
 
----
+```
+git show af1aeab:docs/plan-review-2026-06-11.md
+```
 
-## Part 1 — Findings
-
-### Top 5 (priority order)
-
-**P1. Hot-path viability: the router cannot meet the hook's latency contract.**
-- The plan promises "3 second timeout" as an invariant (lines 495, 568, 909) and Gemma latency of "~100–300ms" (line 128). The deployed model (`gemma-4-31b-bf16`) runs ~15s/call warm — the live `vault.toml` comment says so.
-- One knob, two contexts: `[router].timeout_secs` governs both the hook hot path and interactive diagnose (`GemmaRouter::from_config` → `config.router_timeout()`, src/retrieve/router/gemma.rs:30). The live config raised it to 120s for diagnose — which silently rewrites the hook contract. Two failure modes fork from here: default config (3s) → every hook call times out → **systematic silent passthrough**; live config (120s) → the hook *succeeds* at a **~15s tax on every prompt** — roughly **half** of Claude Code's 30s default `UserPromptSubmit` timeout (verified 2026-06-14 against code.claude.com/docs/en/hooks.md; `UserPromptSubmit` is special-cased to 30s vs the 600s default on other events), and the session visibly stalls for that whole ~15s because the hook blocks model processing until it returns; cross 30s and the call is cancelled to silent passthrough. Both unacceptable, different bugs. *(Update 2026-06-21: `[router].timeout_secs` is now `[router].timeout`, and the parsed-but-dead `[defaults] timeout` field was removed; the latency contract issue itself remains open.)*
-- The auto-probe is TCP-reachability only (200ms, src/util/probe.rs) — it cannot detect "reachable but too slow," so auto mode happily selects the unusable backend.
-- One `[mlx].router_model` serves both router and classifier (src/config.rs:213–219). Routing needs small/fast; classification tolerates big/slow. No per-role model knob.
-- Candidate resolutions to record: dedicated small routing model (or Haiku-for-hook), per-role model + timeout keys, hook-side hard clamp on router timeout.
-- *(The companion zero-observability finding was resolved 2026-06-12 — outcome telemetry in `~/.vault/hook.log` + stderr breadcrumb; see the plan's Hook Behavior section. The 15s router tax is now measured per call, not yet fixed.)*
-
-**P2. Query-plan → filter trust gap: silent total-context-loss paths. — RESOLVED 2026-06-14.**
-- *All three paths are now closed. Project names filter case-insensitively (`name COLLATE NOCASE IN (...)`), mirroring the `eq_ignore_ascii_case` used for domain-tag resolution, so a router emitting "Vault" against a stored "vault" no longer voids every chunk. `languages` is validated-drop: unrecognized labels are dropped at `from_raw` (`filter_map(Language::from_str(...).ok())`) rather than collapsing to `Language::Unknown` and filtering to nothing; an emptied list means "no language filter" (degrade-to-broad), while an explicit `"unknown"` still survives. The earlier strict-`doc_types` path was resolved 2026-06-12 the same way — unrecognized values dropped, emptied list means no filter, dead `RouterError::Unparseable` removed. The unifying rule across all three: untrusted router-emitted enum labels are dropped on parse, never coerced to a poisoning sentinel.)*
-
-**P3. The injection-framing contract is broken on two axes — and it's a now-decision (nothing is registered yet: `~/.claude/settings.json` has no hooks entry, `~/.claude/CLAUDE.md` doesn't exist).**
-- The proposed global CLAUDE.md text enumerates exactly three domain tags; the fallback `<vault-context>` tag (code default, returned whenever no project matches a domain) is **not covered** → context arrives with no data-not-instructions framing. Same hole every time a domain is added without the two-file edit. Improvement to record: **one constant wrapper tag with a domain attribute** (`<vault-context domain="software">`) — instruction written once, never drifts, kills the two-file coupling.
-- The instruction says "the block is grouped by project" — but `render_block` (src/hook/mod.rs:75–96) emits a **flat `## label [doc_type]` list**: no project grouping, no language in the header (plan shows `[contract/proto]`). For whole-file chunks Claude sees `## CLAUDE.md [meta]` with no idea which repo it came from. Either implement grouping or fix the contract text — decide before first registration.
-- Plan's settings.json example uses the wrong event (`PreToolUse`; reality `UserPromptSubmit`) and a PATH-resolved `vault hook`, violating the plan's own security rule (absolute path).
-
-**P4. Chunk-size pipeline: oversized whole-file chunks are unembeddable and unretrievable.**
-- The plan document itself (48,198 bytes ≈ 12k tokens by chars/4) exceeds the 10k budget: budget fill `continue`-skips oversized chunks, so it could never be injected.
-- Worse (advisor): `embed_query`/document embedding sends untruncated text to TEI. Oversized content → TEI 413 → embed error → at index time **the file is skipped entirely** (sync records it in `files_skipped`) — the plan doc would likely be absent from the index, not just unretrievable. At hook time, long prompts (pasted diffs/logs) → embed fails → silent passthrough, exactly when context matters most.
-- Markdown — the dominant format for convention/meta, including every CLAUDE.md — ~~has **no parser** (whole-file fallback)~~ *(markdown parser landed 2026-06-18, commit `1378167`: convention/meta now `##`-block chunked; `plan` markdown and any unparsed type still fall back to a whole-file chunk)*. The **size guard/split fallback + embed truncation + sync-time "oversized" warning** half of this workstream is still open and still owns the budget pathology: the parser fixed markdown *coverage*, but oversized whole-file chunks — `plan` docs, the plan doc itself — remain unembeddable and unretrievable.
-
-**P5. The doc drift is fleet-wide; repo CLAUDE.md is the worst offender (it steers every session).**
-- Repo `CLAUDE.md`: lists `store/writer.rs` / `store/query.rs` (don't exist; it's `sqlite_store.rs`), `parse/openapi|markdown` (don't exist), says hook "returns decorated prompt to stdout" (it emits only the context block). *(all three resolved: store rename 2026-06-14, hook wording 2026-06-14, openapi/markdown parsers built 2026-06-18 — `1378167`.)*
-- `docs/security.md:194–201`: `PreToolUse` example, and falsely claims `vault hook` "exits non-zero" when the API key is missing — directly contradicting the always-exit-0 fail-open contract in `hook::run`.
-- `README.md`: repeats PreToolUse + prepend + the caching claim.
-- The plan itself: see section A below.
-
-### A. Plan contradicts the implemented system
-
-| # | Plan says | Reality | Where |
-|---|-----------|---------|-------|
-| A1 | `PreToolUse` hook; "prepends context"; "writes decorated prompt to stdout" | ✅ **fixed 2026-06-14** across all three docs — `UserPromptSubmit`, absolute-path example, and "emits **only** the block; Claude Code appends it" now consistent in README, plan, and CLAUDE.md (matches src/hook/mod.rs:10–23) | plan 43–66, 658–668, 762–763 |
-| A2 | `retrieve/hybrid.rs` "absorbed into sqlite_store::hybrid_search — skip Step 11"; Store trait = 5 methods | Reversed by commit 455303d: Store exposes `bm25_search`/`cosine_search` primitives; shared merge in retrieve/hybrid.rs so all backends score identically. Trait also has `get_or_create_project`, `get_document_content_hash`, alpha param | plan 613–617, 637–643, 1025–1028 |
-| A3 | Token estimation = "tiktoken cl100k_base, accurate counts" (a "Confirmed" decision) | chars/4 heuristic (`estimate_tokens`, div_ceil). cl100k is OpenAI's tokenizer anyway — never matched Claude | plan 199, 911 vs src/parse/mod.rs |
-| A4 | Canonical vault.toml example | **RESOLVED 2026-06-21.** Examples fixed (vault-plan.md + README + CLAUDE.md). Code: container-level `#[serde(default)]` on `Router`/`Classifier` (each with a `Default` impl) so a present block may omit any field; the timeout field is now `timeout` (seconds), not `timeout_secs`; the dead `Defaults.timeout` was removed. A `[classifier]` block omitting the timeout now loads (defaults to 300) instead of hard-erroring. | plan 681–705 vs src/config.rs |
-| A5 | CLI: `index add/remove`, `list`, `reindex`, `serve`; diagnose `--budget` | **Doc reconciled 2026-06-21**: vault-plan.md + README now mark `index add/remove`/`list`/`reindex`/`serve` as planned-not-implemented, document the real `sync` flags (`--name`/`--domain`/`--dry-run`) and `diagnose` flags (`--alpha`/`--top`/plan-overrides/`--stub`/`--no-router`), and drop the nonexistent `--budget`. *Code still open:* `index remove` itself — load-bearing, since documents FK has no CASCADE → needs explicit child deletes + a `chunks_vec` sweep (a manual sqlite3 delete on 2026-06-11 left 16 orphaned vec rows in the live DB). | plan 768–790 vs src/main.rs |
-| A6 | Binary-structure tree | **RESOLVED 2026-06-21.** Tree rewritten to match `src/`: dropped nonexistent `mcp/`; added `config.rs`, `types.rs`, `hook/log.rs`, `diagnose/`, `index/{mod,walk,secrets,sync}`, `tei/`, `util/`, `embed/{mod,stub}`, `retrieve/{hybrid,budget}`, and the `*/stub.rs` test doubles. Reversed the stale "hybrid.rs absorbed" note (it exists; the merge is shared via the trait's provided `hybrid_search`) and corrected the `Store` trait listing (primitives `bm25_search`/`cosine_search`, `get_or_create_project`, `get_document_content_hash`, `resolve_domain`/`set_project_domain`, provided `hybrid_search`). | plan 580–627 |
-| A7 | Schema section | **RESOLVED 2026-06-21.** Added the `meta` table DDL, the `projects.domain` column, and a "Migrations & the embedding lock" subsection (`user_version` versioning, `SCHEMA_V1` fold-in, `verify_or_init_embedding` model/dim lock). Also corrected the false `token_est` comment (chars/4 heuristic, not cl100k). | plan 169–227 vs src/store/schema.rs:74–77, 130–212 |
-| A8 | Hybrid SQL: skip-if-empty for languages only; `c.project_id IN (...)` directly from router "projects" (names!) | **RESOLVED 2026-06-21.** Step-2 section rewritten: all three filters skip-if-empty (projects/doc_types/languages); projects resolve via `name COLLATE NOCASE` subselect; BM25 arm skipped entirely when type_names+topics empty (cosine-only); MATCH = quoted-escaped type_names+topics joined `" OR "`; cosine arm is `WHERE 1=1` + same clauses. | plan 505–526 vs sqlite_store.rs `build_filter_clause`/`build_match_query` |
-| A9 | Re-embed skip + byte-compare collision defense ("Confirmed" behavior) | **Re-embed skip RESOLVED 2026-06-17** (B6, commit `7dac21d`): an unchanged file is skipped entirely via the `documents.content_hash` gate in `process_file` (no classify/parse/embed). ~~a changed file re-embeds every chunk; `upsert_document` wipes and reinserts; `chunks.content_hash` stored but never compared~~ — still true for a *changed* file: per-chunk `content_hash` is stored but never compared, so a one-line edit re-embeds all of that file's chunks (incremental per-chunk skip remains open) | plan 389–413 vs src/index/sync.rs, sqlite_store.rs |
-| A10 | retrieval_log drives alpha tuning | Zero producers — neither hook nor diagnose calls `log_retrieval` (budget.rs: "once the hook starts writing") | plan 219–227, 965 |
-| A11 | "~$0.0002/call **with prompt caching**" | ✅ **fixed 2026-06-14** — Haiku's 4096-token min cacheable prefix verified against current Anthropic docs; ROUTER_SYSTEM (~300 tok) is far below it, so `cache_control` is inert (`cache_creation_input_tokens: 0`, no error) and cost is low only because the prompt is tiny. CLAUDE.md + plan now say so and note caching engages only if the system block grows past ~4096 tokens | plan 12, 106–108, 942; CLAUDE.md 9/33/52/80 |
-| A12 | "Gemma 4 MLX model tag — Unconfirmed" tracking item; `router_model = "gemma4-27b-moe"` | Resolved: `/Users/kenobi/git/hub/mlx/gemma-4-31b-bf16` | plan 709, 934, 955 |
-
-### B. Internal contradictions / underspecification
-
-- **B1.** "Hook runtime access: Read-only" (decision, line 904) vs retrieval_log's purpose = collect real hook prompts for replay (line 965). Mutually exclusive as written; code comments already lean toward hook-writes. Whichever wins, note the interplay with **B2**: there is no WAL/busy_timeout anywhere (`schema::open` sets only `foreign_keys`) — hook reads during a long sync write → SQLITE_BUSY → fail-open context loss exactly while refreshing the index; the first hook *write* makes this worse.
-- **B3.** Even if written, retrieval_log can't serve replay: `prompt_hash` but no prompt text/embedding, no alpha/budget columns, aggregate counts only. Decide its fate as one decision: bless hook-writes + add columns + WAL in one change, or drop the table and log to a file.
-- **B4.** Cross-domain tag selection is first-listed-project-wins — order-sensitive to LLM output ordering; plan never specifies mixed-domain behavior. (Subsumed by P3's single-tag proposal.) *Update 2026-06-21:* `resolve_context_tag` is gone; the same first-assigned-project-wins logic now lives in `Store::resolve_domain` (DB-driven), with the tag derived as `{domain}-context`.
-- **B5.** ~~Scoring tradeoff undocumented~~ → **doc DONE 2026-06-14**, calibration follow-up tracked: BM25 normalizes against result-set max, so the top keyword hit always gets 1.0 → final ≥ α (0.6) regardless of absolute relevance, and scores aren't comparable across queries. The behavior + intended evolution is now recorded in the plan's Step-3 scoring section (fixed-divisor / sigmoid / theoretical-max as candidate replacements; RRF rejected as ordinal; **gated on C2**). The *calculation change itself* stays open as a scoring-calibration follow-up, blocked on C2's eval set — raw scores are retained per `Hit` so it needs no migration.
-- **B6.** ~~vault.toml is human-edited AND machine-written (`[classifications]` cache; planned domain writeback).~~ *DECISION 2026-06-17 — the classification cache moves to **vault.db**, and `vault.toml` becomes read-only from vault's perspective (no write-back code is built). The key realization: the classification already lives in the DB — `documents.doc_type` keyed `UNIQUE(project_id, source_path)` with a `content_hash`, where `source_path` is repo-relative ([sync.rs:367](../src/index/sync.rs:367)) and `project_id` derives from `projects.name` (UNIQUE). So a separate cache is redundant; the `documents` row **is** the cache, keyed the portable way (logical project + relative path), which survives a clone on another device and a shared Postgres backend — the absolute `projects.repo_path` is nullable and not part of any identity key. Implementation: delete `Config.classifications`/`CachedClassification`/`cached_classification()`, add a parameter-bound `Store::document_content_hash`, and in sync compare the stored hash — match ⇒ skip the file entirely (no classify, no parse, no re-embed), which also delivers **A9 (re-embed-skip)**. The `[classifications]` TOML mechanism never had a writer, so there is nothing to migrate. (Sticky user overrides across content edits are deferred into the task-#5 override UX.)
-- **B7.** ~~Router system prompt is a copy-paste artifact.~~ *RESOLVED 2026-06-14: the `System prompt:\n  "You are...` wrapper label + unbalanced quote are stripped — `ROUTER_SYSTEM` now opens directly on the instruction; the in-prompt skip example is valid JSON (`{ "skip": true }`), so a faithful echo parses straight to the zero-cost skip path. Both backends still read the byte-identical const, so Haiku's ephemeral cache is unaffected.*
-- **B8.** `chunks_vec` has no delete trigger while FTS5 does — deliberate (a vec0-referencing trigger breaks every delete when the extension isn't loaded) but undocumented; fold the rationale + cleanup order into the `index remove` item.
-- **B9.** ~~Minor grab-bag: hardcoded "(auto)" diagnose label; empty `migrations/` dir; stale example `[classifications]` block.~~ *RESOLVED/moot 2026-06-14 — three unrelated nits, none open repo work: (1) the hardcoded diagnose label is fixed (commit 4cbc21b — `diagnose` now prints the configured `[router].mode`); (2) no `migrations/` dir exists in the tree (it was an artifact of the machine the review was written on); (3) the `[classifications."~/repos/build-service"]` entry lives only in the machine-local `~/.vault/vault.toml` runtime cache, not the repo, so it is personal-config housekeeping with no codebase change. Tracked here only so the ID isn't mistaken for open work.*
-
-### C. Structural weaknesses (design-level, beyond the top 5)
-
-- **C1. cwd is an unused free signal.** `HookInput` deliberately ignores `cwd` (src/hook/mod.rs:25–32) while `projects.repo_path` exists. cwd→project→domain gives deterministic project bias, deterministic tag resolution, and a degraded-but-useful retrieval path when the router is down. Design after the router story stabilizes.
-- **C2. No eval ground truth.** The tuning loop (diagnose + retrieval_log) optimizes retrieval against itself. A small golden-prompt fixture set (prompt → expected chunk labels) as a test would anchor alpha/budget tuning. Do right before tuning, after the markdown parser lands. *(markdown parser landed 2026-06-18 — the stated precondition is now met; C2 is unblocked.)*
-- **C3. Trust model is unverifiable by the binary.** The only injection defense is a manually-maintained `~/.claude/CLAUDE.md` instruction vault never checks. A `vault doctor`-style check (instruction present, covers every configured tag, hook registered by absolute path) closes it.
-
-### Demoted as noise (advisor-concurred)
-CamelCase/FTS5 tokenization (one-line known-limitation at most — router extracts exact type_names; cosine covers prose). Budget-fill diversity control (premature without C2). Full tree-diff itemization (subsumed by rewrite). Dead `Defaults.timeout` field (mention in doc sync only).
+12 of the original 28 items have been fixed.
 
 ---
 
-## Part 2 — Follow-up: doc-sync checklist (not yet executed)
+## Priority
 
-Doc-only pass; all code changes stay out of scope and land as decisions/tracking items.
+### P1. The router cannot meet the hook's latency contract.
 
-### `docs/vault-plan.md`
-- [x] Hook contract: UserPromptSubmit everywhere; "emits only the context block, appended by Claude Code"; absolute-path settings.json example. *(done 2026-06-14 — A1; the minor "confirm hook key" plan note still to be removed in a later pass.)*
-- [x] Config: example vault.toml that actually parses, and a config omitting block timeouts loads. *(done 2026-06-21 — examples + container `#[serde(default)]` on `Router`/`Classifier`; field renamed `timeout_secs` → `timeout`; dead `Defaults.timeout` removed.)*
-- [x] Schema: add `meta` table + `verify_or_init_embedding` + user_version note. *(done 2026-06-21 — A7: `meta` DDL, `projects.domain`, "Migrations & the embedding lock" subsection, `token_est` comment corrected to chars/4.)*
-- [x] Retrieval: fix the SQL to match `build_filter_clause` semantics (skip-if-empty ×3, name subselect, BM25-arm skip, MATCH construction); ~~add the B5 scoring-tradeoff paragraph~~ *(done 2026-06-14)*. *(SQL rewrite done 2026-06-21 — A8.)*
-- [x] ~~Chunking table: mark markdown/openapi rows "planned — whole-file fallback today".~~ *(moot 2026-06-18 — resolved by **building** both parsers (commit `1378167`); the chunking table now describes live behavior, so no caveat is needed.)*
-- [ ] Indexing: ~~mark the re-embed-skip section "designed, not yet implemented" (A9)~~ *(inverted 2026-06-17 — A9's unchanged-file skip is implemented; mark it **implemented**, and note the per-chunk incremental skip is still open)*; add chunks_vec cleanup rationale (B8). *(B8 still open.)*
-- [x] Binary structure: rewrite the tree to match `src/`; reverse the Step-11 "absorbed" notes; correct the Store trait listing. *(done 2026-06-21 — A6.)*
-- [x] CLI: status-mark unimplemented commands; add `--name`/`--dry-run`/`--domain`; note diagnose flag reality. *(done 2026-06-21 — vault-plan.md + README; dropped the fake `--budget`. Code follow-up: implement `index remove` with FK child-delete + chunks_vec sweep.)*
-- [ ] Decisions table: token estimation → chars/4 (with revisit note); prompt-caching → correct mechanism (A11); hybrid placement → extracted (A2); latency table → real 31B numbers.
-- [ ] Tracking items: resolve A12; add items for P1 (per-role model+timeout, hook clamp, latency-aware fallback), ~~P2 (name normalization, drop-unknown languages)~~ *(resolved 2026-06-14)*, P3 (single-tag+domain-attribute decision, block grouping vs contract text, doctor check), P4 (~~markdown parser priority~~ *(built 2026-06-18)*, size guard, embed truncation), B1/B3 (retrieval_log fate + WAL as one decision), B6 (cache relocation), ~~B7 (router prompt cleanup)~~ *(resolved 2026-06-14)*, C1, C2.
+The plan promises a 3-second timeout as an invariant and Gemma latency of
+"~100–300ms". `gemma-4-31b-bf16` runs ~15s/call warm. At the 3s default every hook
+call times out to silent passthrough; raised to 120s the hook *succeeds* at a ~15s
+tax on every prompt — half of Claude Code's 30s `UserPromptSubmit` budget, session
+visibly stalled, cancelled to passthrough past 30s.
 
-### `CLAUDE.md` (repo)
-- Key modules table:
-  - [x] Store rows aligned to the trait-based, SQLite-only backend (`writer.rs`/`query.rs` → `traits.rs` + `schema.rs` + `sqlite_store.rs` + `postgresql_store.rs` stub + `types.rs`). *(done 2026-06-14 — the doc had referenced the pre-refactor SQLite-only layout; `PostgresStore` is a `todo!()` placeholder, not exported.)*
-  - [x] Add the missing module rows — sub-items: [x] `config.rs`; [x] `diagnose/mod.rs`; [x] `index/walk.rs`; [x] `index/sync.rs`; [x] `index/secrets.rs`; [x] `util/{json,path,probe,fs}.rs`. *(done 2026-06-17 — also added a `types.rs` row for the top-level `Language`/`DocType` enums.)*
-  - [x] ~~Implementation Order section still names `store/writer.rs` (Step 2) / `store/query.rs` (Step 3) → `sqlite_store.rs`; keep the `impl-status` skill's 14-step list in sync.~~ *(done 2026-06-17 — renamed in CLAUDE.md, the `impl-status` skill (14-step list + example output), and `docs/vault-context.md` Step 2/3.)*
-- [x] ~~Hook wording: "returns decorated prompt" → emits block~~ *(done 2026-06-14 — A1)*. (Parser-list truth split into its own item below.)
-- [x] ~~**Parser list — doc claims parsers that don't exist** *(separate tracking item)*: the module table + Architecture prose list `openapi`/`markdown` parsers, but `src/parse/` has only `proto.rs`/`go_source.rs`/`rust_source.rs`.~~ *(RESOLVED 2026-06-18, commit `1378167` — resolved by **building** both parsers rather than caveating: `src/parse/{openapi,markdown}.rs` now exist behind `select_parser`, and the CLAUDE.md module row + Impl-Order steps 7a/7b, the chunking table, `docs/vault-plan.md`, and the `impl-status`/`parser-test` skills were all reconciled to match. Ties to **P4**: markdown coverage is done; P4's size-guard/embed-truncation parts remain open.)*
-- [x] Verify the "30s per-call timeout" claim against current Claude Code docs. *(verified 2026-06-14: CLAUDE.md's 30s is **correct** — `UserPromptSubmit` is special-cased to a 30s default per code.claude.com/docs/en/hooks.md; the advisor's "60s" was wrong. Corrected the stray "60s default hook kill window" in P1 above to 30s instead.)*
+Three structural problems keep this from being only a model-choice issue:
 
-### `docs/security.md`
-- [x] Fix the `PreToolUse` example + the false "exits non-zero" claim (contradicts fail-open). *(resolved 2026-06-14: missing-key now described as fail-open exit-0 + `hook.log`/breadcrumb, surfacing loudly in `diagnose`/`sync`; example event `PreToolUse` → `UserPromptSubmit`.)*
+- **`[router].timeout` governs the hook *and* `vault diagnose`.** Both build their
+  router through `build_router` (`src/retrieve/router/mod.rs:167`) and every
+  backend reads `config.router_timeout()`; `diagnose::Args` has no override.
+  Raising it to make an interactive diagnose usable silently rewrites the hook's
+  contract.
+- **`[mlx].router_model` is one key for both roles.** Routing needs small and fast,
+  classification tolerates big and slow, and the local model name is shared.
+  *(Per-role `[router]`/`[classifier]` `timeout` and `model` keys do exist and are
+  used independently — that half is done. Only the MLX model name is shared.)*
+- **The probe cannot detect "reachable but slow"** — see **D4**, where the same
+  probe was measured going green 28s early.
 
-### `README.md`
-- [x] Same hook-event / prepend / caching family of fixes. *(done 2026-06-14 — A1 + A11: `UserPromptSubmit`, emits-only-the-block/appended wording, absolute-path example, fail-open empty-stdout phrasing, and the inert-caching cost note.)*
+Candidates: a dedicated small routing model (or Haiku for the hook), a per-role MLX
+model key, a diagnose-side timeout override, a hook-side hard clamp.
 
-### Verification (when executing)
-- `cargo test` stays green (docs only).
-- Validate the new example vault.toml parses (`toml::from_str::<Config>` against src/config.rs required fields — mirror the `indexer_section_optional_for_back_compat` fixture).
-- Confirm the Claude Code hook-timeout figure from current docs before writing it into CLAUDE.md.
-- Re-read the four edited docs for internal consistency (hook event, tag story, caching claim told identically in all four).
+### ~~P3. The injection-framing contract is unsatisfied.~~ — CLOSED 2026-08-22
+
+As originally written: `~/.claude/CLAUDE.md` did not exist. Vault deliberately
+never sanitises chunk text, so that file is the whole defence — `docs/security.md`
+lists it as defence #1 and `CLAUDE.md` states it "handles this for Claude".
+
+**Correction (2026-08-22).** An earlier revision of this section claimed
+`~/.claude/settings.json` holds a vault `UserPromptSubmit` entry. It does not —
+verified by parsing the file: one matcher group, and its handler is not vault's.
+The claim came from a `grep -c UserPromptSubmit` that counted the event name.
+Nothing has ever been injected on this machine; all retrieval to date has run
+through `vault diagnose`. This does not reopen P3 — the framing file exists and
+is correct — but it does mean the hook-registration check in **C3** currently
+has nothing to pass, and that registering the hook is a prerequisite for P1's
+latency problem to be observable in practice.
+
+Nothing has actually been injected on this machine yet: all 13 `hook.log` records
+are failures (`router-build` ×7 for a missing key, `stdin` ×3, `config` ×1, 2 skips)
+with no `router_ms` sample. The exposure opens when the router starts working —
+i.e. when P1 is fixed.
+
+Two of this finding's three parts closed on 2026-08-22:
+
+- ~~**Coverage drifts by construction.**~~ The tag is now constant and the domain
+  is an attribute — `<vault-context domain="software">` — so one section covers
+  every domain, including ones that do not exist yet, and the unassigned case
+  (no attribute) needs no special mention.
+- ~~**The contract describes output vault does not produce.**~~ The template in
+  `vault-plan.md` no longer claims the block is "grouped by project"; it describes
+  the flat `## label [doc_type]` list `render_block` actually emits. It also no
+  longer says the block appears "at the start of a message" — hook stdout is
+  appended, not prepended.
+
+~~**What is left is writing the section.**~~ Written 2026-08-22. `~/.claude/CLAUDE.md`
+now exists (0600) holding a single `## Vault Context` section, byte-identical to the
+template in `vault-plan.md` under "CLAUDE.md Strategy" — checked with `diff`, so the
+doc and the deployed file cannot silently disagree about what was installed.
+
+The defence is in place. **What is not in place is anything that keeps it there** —
+see C3. One concrete hole it should close: the section names `<vault-context>`
+literally, while `defaults.context_tag` is configurable, so changing that key in
+`vault.toml` silently stops the instruction matching the tag being emitted.
+
+Related — **B4**: which domain wins is first-assigned-project-wins via
+`Store::resolve_domain`, so it is sensitive to router output ordering, and mixed
+domains are unspecified. Less severe now that a wrong domain attribute still
+lands inside a correctly-framed block, but still unspecified.
+
+### P4. Long prompts silently truncate query-time embedding.
+
+`embed_query` is `self.embed(&format!("search_query: {text}"))` with no length
+guard. The index side has one (`whole_file_chunks` windows at
+`MAX_FALLBACK_CHUNK_TOKENS`); the query side has none.
+
+**Correction (2026-08-23).** This finding said the embed *fails* and falls
+through to silent passthrough. Measured against the live server, it does not:
+TEI 1.9.3 reports `auto_truncate: true`, so an over-long prompt returns a
+perfectly good vector computed from **only the first 8192 tokens**. Nothing
+errors and nothing is reported. That is worse in one respect — a failure is at
+least visible in `hook.log` as `embed-query`, whereas this produces confident
+retrieval against the head of a pasted diff while the actual question, if it sat
+at the bottom, was never embedded. It is also deployment-dependent: a TEI
+started with auto-truncate off fails as originally described.
+
+Design notes for the fix:
+
+- **Head-only truncation is wrong here.** The index truncates head-only so the
+  per-chunk secret scan cannot be bisected. A query yields *one* vector, so
+  truncating is not windowing — it is choosing what the query means. A prompt
+  ending in "why does this fail?" after 400 lines of stack trace loses the
+  question. Head+tail is the better default.
+- **The ceiling should be read, not hardcoded.** `/info` reports
+  `max_input_length` (8192 here). `verify_against_server` already calls the
+  server, so the handshake can learn it.
+- **The router has the same exposure.** `build_user_prompt` ends with
+  `out.push_str(prompt)`, untruncated. Haiku's 200k context will not error, but
+  the whole paste is billed on every long prompt, and a local Gemma with a
+  smaller window would fail outright. The same guard belongs there.
+- **The BM25 arm is unaffected** — it is built from the router's `type_names`
+  and `topics`, not the raw prompt — so a truncated query still gets full
+  keyword retrieval. That lowers the stakes on getting the split perfect.
+
+---
+
+## A. Code gaps the plan used to paper over
+
+The documentation half of every A finding was fixed on 2026-08-22 — `vault-plan.md`
+and README now describe what the code does. **A5b closed entirely** (it was
+doc-only) and **A10 merged into B1/B3**, since what is left of it is the
+`retrieval_log` decision. What remains here is the code these findings were
+pointing at.
+
+| # | Gap |
+|---|-----|
+| A5 | **`vault index remove` does not exist.** Load-bearing for cleanup: the `documents` FK has no CASCADE, so it needs explicit child deletes plus a `chunks_vec` sweep. Fold in **B8** while writing it |
+| A9 | **Per-chunk `content_hash` is written and never read.** A one-line edit re-embeds every chunk in that file — `upsert_document` deletes and re-inserts the whole set unconditionally. The design for the skip, including the byte-compare collision defence, is recorded in `vault-plan.md` under a heading now marked planned-not-implemented. (The unchanged-*file* gate does work.) |
+
+---
+
+## B. Internal contradictions / underspecification
+
+- **B1 / B3 / A10 — `retrieval_log`'s fate is undecided.** "Hook runtime access:
+  read-only" (plan line 904) contradicts its stated purpose of collecting hook
+  prompts for replay (line 965). It could not serve replay anyway: `prompt_hash`
+  but no prompt text or embedding, no alpha or budget columns, aggregate counts
+  only. One decision — add the columns and write to it, or drop the table and log
+  to a file.
+
+- **B5 — scoring calibration.** Two defects, not one. *Across* queries, BM25
+  normalises against the result-set max, so the top keyword hit always scores
+  1.0 and scores are not comparable between prompts. *Within* a query — measured
+  2026-08-23, and the one that actually bites — the arms are wildly
+  incommensurate: `bm25_normalized` spans 0–1 while `cosine` is used **raw**, and
+  its observed range on this corpus is 0.619–0.709. At α=0.3 that is 0.300 of
+  BM25 variation against 0.063 of cosine, so the documented "60/40 blend" is
+  nearer 92/8, and the arms only balance around α≈0.08.
+
+  Now measurable via C2. What the fixture set has already established:
+
+  - **α is now 0.1 by default**, changed in `Config::default()` and the seeded
+    template on 2026-08-23. Rank-of-first-expected summed over five cases:
+
+    | α | 0.6 | 0.4 | 0.3 | 0.2 | 0.15 | 0.1 | 0.05 | 0.0 |
+    |---|-----|-----|-----|-----|------|-----|------|-----|
+    | total | 11 | 9 | 9 | 9 | 8 | **7** | 6 | 20 |
+
+    0.05 scores one point better but is where the first case starts regressing
+    (`score blending` 1 → 2), so it trades an optimal case for one that was
+    already suboptimal. **0.0 collapses to 20** — three cases lose their answer
+    outright, so the keyword arm is load-bearing, just weighted ~6× too heavily.
+    0.1 is the last value at which no case has regressed, with 0.05 as a
+    measured buffer beneath it.
+  - **RRF is not the fix.** Recomputed offline over real scores, k=60 was
+    *identical* to the current linear blend: with only 8 of 46 candidates
+    carrying a BM25 rank it degenerates to cosine-plus-a-nudge. It had been
+    recommended repeatedly on theory before being measured.
+  - **Min-max normalising both arms** is the promising candidate — it moved
+    `fn build_router` from #9 to #1 on the tuning prompt — but it was derived
+    from that *one* prompt, which is the only fixture with headroom. Four of
+    five cases already sit at #1, so it can help one and risk four. Re-run
+    `alpha_sweep` against any change before believing it.
+  - Min-max interacts with `min_score`: once both arms are stretched to 0–1
+    per query, `0.15` stops being an absolute quality bar, since a uniformly
+    irrelevant result set is stretched to fill the range.
+
+  Raw scores are retained per `Hit`, so no migration is needed.
+
+- ~~**B8 — `chunks_vec` has no delete trigger while FTS5 does.**~~ — **closed
+  2026-08-23.** The rationale is now on `SCHEMA_V1` in `src/store/schema.rs` and
+  in `vault-plan.md`'s schema section, with a pointer in the DDL itself. It is
+  also *enforced*: `schema::b8::no_trigger_references_the_vec_table` fails if a
+  trigger ever names `chunks_vec`, since the obvious "fix" for the missing
+  trigger is the bug — SQLite compiles trigger bodies when they fire, so one
+  would break every delete in any process without sqlite-vec loaded.
+
+  It did not need to wait for A5. What A5 still inherits is the hand-maintained
+  invariant this documents: `vault index remove` will be a **third** path that
+  deletes chunks, so it needs its own `DELETE FROM chunks_vec` and its own test.
+
+---
+
+## C. Structural weaknesses
+
+- ~~**C1. `cwd` is an unused free signal.**~~ — **mostly closed 2026-08-22.**
+  `HookInput` now carries `cwd` (optional, so a client that omits it still
+  parses), `Store::project_for_path` resolves it to an indexed project by
+  longest-prefix match at a component boundary, and `QueryPlan::prefer_project`
+  moves that project to the front. The bias is additive — the router's projects
+  survive, since a prompt asked from one repo about a sibling service is
+  ordinary — and cwd-first makes `resolve_domain` deterministic rather than
+  dependent on router output ordering, which closes the practical half of
+  **B4**. Resolution failures are swallowed: a hint must not fail a retrieval
+  the router and embedder already paid for.
+
+  The note to "design after P1 settles" was wrong and is dropped: P1 is about
+  router *latency*, and the whole value of cwd is that it needs no router.
+
+  **What is left** is the third clause — *"a degraded-but-useful path when the
+  router is down"*. Today a router failure is still total passthrough. Falling
+  back to "everything from this project, cosine-only" would change the hook's
+  failure semantics and needs its own design pass; it also only helps when the
+  router is down *and* TEI is up.
+
+- ~~**C2. No eval ground truth.**~~ — **closed 2026-08-23.**
+  `src/retrieve/golden.toml` holds the fixture set (9 corpus files, 5 cases) and
+  `src/retrieve/eval.rs` the harness: real files, production parsers, real TEI
+  embeddings, no classifier (`doc_type`/`language` come from an extension rule,
+  so a run costs nothing and cannot drift with a model). Cases assert on chunk
+  **labels**, never content, so ordinary refactors do not break them.
+
+  Three entry points: `golden_prompts_retrieve_their_expected_chunks` is the
+  gate, `alpha_sweep` is the tuning loop, and
+  `fixtures_are_well_formed_and_the_corpus_exists` runs in normal CI without TEI
+  so a deleted corpus path fails immediately. That last one earned its keep on
+  the first run by catching a missing corpus file.
+
+  It unblocked **B5** and immediately corrected two conclusions reached from a
+  single prompt — see there.
+
+  Five cases is a floor. The suite should grow whenever a retrieval bug is
+  found, the same way a regression test does.
+
+- **C3. The trust model is unverifiable by the binary.** The injection defence is a
+  hand-maintained file vault never checks. It now exists (P3), which moves this from
+  "the defence is missing and nothing says so" to "the defence is present and nothing
+  keeps it that way". A `vault doctor` check closes it:
+
+  - `~/.claude/CLAUDE.md` exists and has a `## Vault Context` section;
+  - that section names the tag actually being emitted — `defaults.context_tag` is
+    configurable, so a changed key silently orphans the instruction;
+  - the hook is registered in `settings.json`, by absolute path, in the nested
+    matcher-group shape rather than the flat one that does not load.
+
+---
+
+## D. Findings from the code, not from the plan
+
+**D1** and **D2** are left over from the `lib-cli-split` code review; **D3** and
+**D4** were found on 2026-08-22 starting TEI for the test suite, and both were
+reproduced live on 2026-08-23. **D5** was found the same day, by hitting it.
+
+- **D1. `Vault::open` still builds a router an indexing-only consumer never
+  calls.** *Half-fixed 2026-08-22.* The ordering half is done — router grounding
+  made the planner depend on the store, so `Vault::open` now opens the store
+  first and a store failure is reported as one instead of being masked by a
+  `RouterBuild` error. What remains is that the planner is still built
+  **eagerly**, so a consumer that only wants to index still pays for router
+  construction and still gets `VaultError::RouterBuild` when the backend it
+  never uses is misconfigured. `VaultStore::open` remains the undocumented
+  workaround. Build the planner lazily, or document `VaultStore` as the
+  indexing entry point.
+
+- **D2. Temp-directory helpers are duplicated** — 15 `std::env::temp_dir()` sites
+  across 10 files, up two during the review pass, which is the argument for fixing
+  it. Most carry a `Drop` guard; `schema.rs::temp_db_path` returns a bare
+  `PathBuf`, so a panicking test leaks the file and nothing ever removes the
+  `-wal`/`-shm` sidecars holding whatever that test indexed.
+
+- ~~**D3. `vault tei start` reports success for a child that has already
+  died.**~~ — **closed 2026-08-23.** `spawn()` only proves the *launcher*
+  started; with the Docker launcher that is the client, not the server. `start`
+  now checks the child on every readiness poll and, when it has exited, prints
+  the last 15 log lines inline, removes the pidfile, and returns
+  `LauncherError::ChildDied` — exit 1 instead of the previous exit 0 with three
+  false sentences.
+
+  The check is `Child::try_wait`, **not** the `process_alive` helper, and the
+  difference is the whole bug. `start` deliberately never blocks on its child,
+  so an exited child is a *zombie* until reaped — and `kill -0` reports a zombie
+  as alive. The first cut of this fix used `process_alive` and still printed
+  "TEI process is running" for a launcher of `/usr/bin/false`; it was caught
+  only by running it. `status` has a pid and no handle, so it uses
+  `process_alive`, which is correct there because the spawning process is gone
+  and init has reaped the child.
+
+  `status` also stopped reporting the pidfile's contents as fact. It now prints
+  `process: running (pid N)` or `process: NOT running — stale pidfile …`,
+  which is what it should have said for pid 33619 instead of implying a live
+  process whose container had been gone for hours.
+
+- ~~**D4. Reachability probes are TCP-only, so "reachable" precedes
+  "serving".**~~ — **closed for TEI 2026-08-23.** `util::probe::tei_reachable`
+  is now an HTTP `GET /health` rather than a TCP connect, and `vault tei status`
+  reports `serving:` rather than `reachable:`. Pinned by
+  `tei_probe_rejects_a_socket_that_accepts_but_never_serves`, which binds a
+  listener and never accepts — the TCP connect succeeds, so the test asserts the
+  old probe's exact false green.
+
+  **The MLX half stays open, under P1.** `mlx_reachable` is still a TCP connect
+  because it runs at process startup in `auto` mode where the 200ms budget is
+  the point, and the question there is not "is it serving" but "is it serving
+  fast enough to meet the hook's timeout" — which no probe of this shape can
+  answer. See P1's third bullet.
+
+---
+
+- **D5. Parser behaviour is unversioned, so a parser change yields a silently
+  stale index.** The unchanged-file gate compares a file's hash against
+  `documents.content_hash`. That is the right key for *content* drift and the
+  wrong one for *parser* drift: when the rust parser stopped requiring `pub`
+  (2026-08-23), every already-indexed file still hashed the same, so `index
+  sync` reported `Unchanged: 67` and kept chunks the current parser would never
+  produce. The index was left in a mix — three reparsed files chunked per
+  private item, sixty-seven still holding pub-only chunks — with nothing on
+  screen indicating it.
+
+  The recovery is `rm ~/.vault/vault.db*` plus a full re-sync, which costs a
+  full reclassification pass against the remote backend. Worse, the failure is
+  silent: retrieval keeps working, just against chunk boundaries that no longer
+  match the code.
+
+  The embedding side already solved this — `meta` records `(embedding_model,
+  embedding_dim)` and every open verifies it, so a model change is a loud error
+  with an explicit remedy. Parsers have no equivalent. Fix: a `parser_version`
+  in `meta`, bumped when any parser's chunk boundaries change, that invalidates
+  the `content_hash` gate for affected languages — or, at minimum, refuses the
+  open with the same "full re-index needed" error the dim lock produces.
+
+## Loose ends
+
+- **`e2b7c12` does not compile standalone**, so `git bisect` dies on it — `lib.rs`
+  declared `pub mod vault;` while `src/vault.rs` was untracked, and `8b1805e` fixed
+  it forward. Both pushed, so correcting it means rewriting shared history. Use
+  `git bisect skip` through that range.
+
+---
+
+## Doc-sync checklist
+
+- [x] `vault-plan.md` indexing section: `chunks_vec` delete-trigger rationale
+      (B8) — done 2026-08-23. The A5/A9 reconciliations were already done.
+- [ ] `vault-plan.md` tracking items: P1, P3, P4, B1/B3, C1, C2.
+- [ ] `vault-plan.md` chunking section: rust chunks all visibilities now, not
+      just exported symbols, and a parser that extracts nothing takes the
+      whole-file fallback rather than skipping the file. `CLAUDE.md` is updated;
+      the plan is not.
+- [ ] `docs/embeddings.md` / `runbook.md`: TEI reports `auto_truncate: true`, so
+      an over-long input is silently truncated rather than rejected (P4).
+- [x] `vault-plan.md` on `vault tei start|status`: both fixed 2026-08-23 —
+      `tei_reachable` is an HTTP health check and `start` verifies the child
+      lived. If the plan describes the old TCP behaviour, correct it there too.

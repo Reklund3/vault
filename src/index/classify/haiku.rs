@@ -20,7 +20,8 @@ const MAX_TOKENS: u32 = 128;
 pub(crate) struct HaikuClassifier {
     model: String,
     api_key: String,
-    http: Client,
+    http: &'static Client,
+    timeout: Duration,
 }
 
 impl HaikuClassifier {
@@ -33,14 +34,16 @@ impl HaikuClassifier {
         timeout: Duration,
     ) -> Result<Self, ClassifyError> {
         let api_key = require_api_key(std::env::var("ANTHROPIC_API_KEY").ok())?;
-        let http = Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| ClassifyError::Transport(e.to_string()))?;
+        // One process-wide client (see `util::http`): the timeout was the only
+        // thing that ever differed between these, and it rides on the request.
+        let http = crate::util::http::shared().ok_or_else(|| {
+            ClassifyError::Transport("could not construct the shared HTTP client".to_string())
+        })?;
         Ok(Self {
             model: resolve_model(config.classifier_model()),
             api_key,
             http,
+            timeout,
         })
     }
 }
@@ -67,6 +70,7 @@ impl Classifier for HaikuClassifier {
         let resp = self
             .http
             .post(ANTHROPIC_URL)
+            .timeout(self.timeout)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .json(&request)

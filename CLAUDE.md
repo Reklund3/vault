@@ -12,17 +12,96 @@ Routing is local-first via Gemma (zero Claude token cost). When Gemma is unreach
 
 ```bash
 cargo build
-cargo build --release
+cargo build --release --locked   # as CI builds it
 cargo test
-cargo test <test_name>       # run a single test
-cargo run -- <subcommand>    # e.g. cargo run -- diagnose "what does BuildRequest need?"
+cargo test <test_name>           # run a single test
+cargo run -- <subcommand>        # e.g. cargo run -- diagnose "what does BuildRequest need?"
+
+# The library without the CLI — what a service or MCP server consumes. CI gates
+# on this, because nothing else builds without the `cli` feature.
+cargo build --no-default-features --lib --locked
+cargo clippy --no-default-features --lib --locked -- -D warnings
+
+# Design rule 3, checked on the artifact: asserts the library-only rlib holds no
+# stdin/stdout symbol. A source grep cannot do this — the library's stdin reads
+# are textually present inside `#[cfg(feature = "cli")]` arms.
+./scripts/check-library-io.sh
 ```
+
+CI (`.github/workflows/ci.yml`) gates on `fmt` first, then runs `test`, `build --release --locked`,
+`lib-only` (the `--no-default-features` commands plus the rule-3 check), and `clippy` in parallel
+behind it.
+
+**Every cargo invocation in CI passes `--locked`** — all except `cargo fmt`, which does not resolve
+dependencies and rejects the flag. This is a supply-chain control, not a style choice: without it
+cargo silently rewrites `Cargo.lock` when resolution would change, which is precisely how the
+2026-08-20 `arrayref`/`proc-macro1` attack propagated (the attacker yanked the good versions to force
+resolution onto a malicious one). `--locked` turns that into a failed build.
+
+There are two *standing* supply-chain gates — `--locked` and the `audit` job below. Sweeping history
+for known-bad crates is neither; it is incident response. The tooling for that
+(`scripts/supply-chain-audit.sh` and its test) is deliberately **untracked and local-only**, because
+its indicator lists are one advisory's IoCs and a committed copy would pin a frozen list that passes
+forever — false assurance, which is worse than no check. When an advisory lands, write the sweep
+against *that* advisory's indicators.
+
+The durable complement is the `audit` CI job: `cargo audit` against the RustSec database. `--locked`
+stops resolution from being silently rewritten; `cargo audit` catches a crate that was fine when it
+was pinned and is not fine now. It can go red with no code change — that is the job working, not a
+flake. It builds `cargo-audit` from source with `--locked` rather than pulling a third-party action,
+since a job about supply-chain hygiene should not add an unpinned dependency to the pipeline.
+
+Both gates are enforced — run them before pushing:
+
+```bash
+cargo fmt --check              # blocks every other CI job
+cargo clippy -- -D warnings    # warnings are errors in CI
+```
+
+### Subcommand flags
+
+```bash
+vault configure --force                     # re-seed an existing ~/.vault/vault.toml
+
+vault index sync <repo>                     # classify -> parse -> embed -> upsert
+vault index sync <repo> --name <name>       # project-name override (default: canonical path's last component)
+vault index sync <repo> --domain <domain>   # skip the first-run domain prompt
+vault index sync <repo> --dry-run           # walk + cache lookup only: no TEI, no classifier, no writes
+
+vault diagnose "<prompt>"                   # full retrieval trace
+vault diagnose "<prompt>" --alpha 0.75      # override the BM25/cosine weight for this run
+vault diagnose "<prompt>" --top 20          # results to display (default 10)
+vault diagnose "<prompt>" --stub            # StubEmbedder instead of TEI (plumbing only, cosine meaningless)
+vault diagnose "<prompt>" --no-router       # build the QueryPlan from CLI flags; isolates the store from routing
+
+# Plan overrides — each *replaces* the router's list rather than merging, and each
+# is comma-delimited. Useful with --no-router to drive the store directly.
+vault diagnose "<prompt>" --projects a,b --type-names BuildRequest --topics auth \
+                          --doc-types contract,plan --languages proto,rust
+```
+
+## Docs & Project Skills
+
+| Doc | Role |
+|------|---------------|
+| `docs/vault-plan.md` | canonical design spec — the 14-step order, schema DDL, config shape. **Written before Steps 1–14 were built and has drifted; cross-check against the source before trusting it.** |
+| `docs/plan-review-2026-06-11.md` | the **open** drift between `vault-plan.md` and the code — pruned 2026-08-21 to unresolved findings only; resolved ones are in git history. Read alongside `vault-plan.md`. |
+| `docs/security.md` | threat model, trust-boundary table, full design constraints |
+| `docs/embeddings.md` | what an embedding is here, and why nomic-embed-text-v1.5 + TEI |
+| `docs/runbook.md` | starting the runtime services by hand — TEI has a launcher, the Gemma/mlx one is not built yet |
+| `docs/vault-context.md` | design-conversation log |
+
+`.claude/skills/` ships three project skills:
+
+- **`impl-status`** — reads the source tree against the 14-step order; reports position and the next blocker
+- **`parser-test`** — runs one `src/parse/` parser against a sample file and pretty-prints the chunks, so boundary correctness can be checked without the full hook pipeline
+- **`schema-check`** — verifies `src/store/schema.rs` DDL against the spec; `chunks_vec FLOAT[N]` is locked at creation and the FTS5 triggers must stay in sync with `chunks`
 
 ## Architecture
 
 Execution modes from one binary, dispatched by subcommand in `main.rs`:
 - **`vault configure`** — first-run setup; provisions `~/.vault/` (0700), seeds a `vault.toml` template **only when absent** (0600), prints the Claude Code hook entry to add, and reports backend readiness. Idempotent. Never edits `~/.claude/settings.json` (print-only); `--force` re-seeds an existing toml.
-- **`vault hook`** — pre-send hook (registered globally in `~/.claude/settings.json`); reads prompt JSON from stdin, emits only the `<{domain}-context>` block to stdout (Claude Code appends it to the prompt)
+- **`vault hook`** — pre-send hook (registered globally in `~/.claude/settings.json`); reads prompt JSON from stdin, emits only the `<vault-context domain="...">` block to stdout (Claude Code appends it to the prompt)
 - **`vault index sync <repo>`** — explicit manual indexing; the classifier (Gemma local or Haiku fallback) labels files automatically (black box — no confirm/override), chunks written to SQLite
 - **`vault diagnose "<prompt>"`** — full retrieval trace for tuning alpha and token budget
 - **`vault tei start|stop|status|logs`** — manage the local TEI embeddings server
@@ -30,11 +109,11 @@ Execution modes from one binary, dispatched by subcommand in `main.rs`:
 ### Request Flow (hook mode)
 
 ```
-prompt → vault hook → Router extracts query plan
+prompt → vault hook → Router extracts query plan (grounded in the store's Inventory)
                       ├── primary:  Gemma at localhost:8080 (zero token cost)
                       └── fallback: Haiku via Anthropic API (~$0.0002/call, tiny prompt)
        → SQLite hybrid query (FTS5 BM25 + sqlite-vec cosine)
-       → score merge (α=0.6 BM25, 0.4 cosine) + token budget (10k)
+       → score merge (α=0.1 BM25, 0.9 cosine) + token budget (10k)
        → emit <{domain-context}> block on stdout → Claude Code appends it → Anthropic API
 ```
 
@@ -44,14 +123,17 @@ The router returns `{ skip: true }` for prompts that need no context — immedia
 
 | Path | Responsibility |
 |------|---------------|
+| `src/lib.rs` | the curated public API — library modules (`config`, `error`, `index`, `vault`) plus root re-exports; the four CLI modules sit behind the default-on `cli` feature |
+| `src/main.rs` | clap `Cli`/`Command` definitions and subcommand dispatch — the only place execution modes are wired |
+| `src/vault.rs` | library facade — `QueryPlanner` (Send+Sync, network half), `VaultStore` (Send, owns the connection), `Vault` (both) |
 | `src/hook/mod.rs` | stdin→stdout hook protocol, full pipeline entry; outcome taxonomy (injected / skip / failed-at-stage) |
 | `src/hook/log.rs` | hook telemetry — one metadata-only JSONL record per call to `~/.vault/hook.log` (5MB rotation) |
-| `src/store/traits.rs` | `Store` trait + `StoreError` — backend abstraction; carries the embedding model/dim lock error |
+| `src/store/traits.rs` | `Store` trait + `StoreError` — backend abstraction; carries the embedding model/dim lock error; `inventory()` snapshots what is actually indexed |
 | `src/store/schema.rs` | embedded SQL, migration runner |
 | `src/store/sqlite_store.rs` | the live (SQLite-only) backend — upsert + sync-time prune (file/document/chunk diff, reconciles deletions every sync) **and** FTS5 + sqlite-vec hybrid retrieval, score merge, budget trim |
 | `src/store/postgresql_store.rs` | `PostgresStore` — `todo!()` placeholder for a future distributed backend (pgvector/tsvector); declared but not exported, not wired up |
 | `src/store/types.rs` | shared store types: `Document`, `Chunk`, `Hit`, `RetrievalLogEntry` |
-| `src/retrieve/router/mod.rs` | Router trait + auto/gemma/haiku/openai mode selection (auto's remote fallback set by `[router].remote`) |
+| `src/retrieve/router/mod.rs` | Router trait + auto/gemma/haiku/openai mode selection (auto's remote fallback set by `[router].remote`); `build_user_prompt` grounds the model in the store's `Inventory` |
 | `src/retrieve/router/gemma.rs` | Local Gemma impl (mlx_lm.server HTTP) |
 | `src/retrieve/router/haiku.rs` | Anthropic Haiku impl (sets `cache_control`; inert at current prompt size) |
 | `src/retrieve/router/openai_compat.rs` | Generic OpenAI-compatible impl (Gemini AI Studio / Vertex express / any `/chat/completions`); static key from `api_key_env`, Bearer or `x-goog-api-key` auth |
@@ -65,12 +147,62 @@ The router returns `{ skip: true }` for prompts that need no context — immedia
 | `src/index/walk.rs` | repo walker — globset exclusions, symlink refusal, canonical-root bound (enforces the indexer security rules) |
 | `src/index/sync.rs` | `vault index sync` pipeline — classify → parse (whole-file fallback) → embed → upsert; `SyncReport` |
 | `src/index/secrets.rs` | index-time secret pre-scan (`RegexSet`) — drops chunks matching AWS/GitHub/Anthropic/OpenAI/JWT/PEM patterns before storage |
+| `src/embed/mod.rs` | `Embedder` trait + `EmbedError`; the default `embed_documents` loops `embed_document`, TEI overrides it with one batched request |
 | `src/embed/tei.rs` | nomic-embed-text-v1.5 embeddings via TEI HTTP (`localhost:8081`); single + batched (`embed_documents`, sub-batched to TEI's client cap) |
 | `src/tei/launcher.rs` | `vault tei start\|stop\|status\|logs` — spawn TEI from `[embeddings].launcher_cmd` with env scrubbing; PID + log in `~/.vault/`; cross-platform detach |
+| `src/configure/mod.rs` | `vault configure` — provisions `~/.vault/` (0700), seeds `vault.toml` only when absent, prints the hook entry; `--force` re-seeds |
 | `src/diagnose/mod.rs` | `vault diagnose "<prompt>"` — full retrieval trace for tuning α and token budget |
+| `src/error.rs` | `VaultError` — the library-boundary error type; variants mirror pipeline failure points so `hook` can derive its telemetry `Stage` from them |
 | `src/config.rs` | `vault.toml` parsing — `Config`, `ConfigError`, context-tag fallback (`default_context_tag`), router/classifier mode + timeout knobs |
-| `src/types.rs` | top-level shared enums — `Language`, `DocType` (orthogonal axes used across parse/classify/router) |
+| `src/types.rs` | top-level shared enums — `Language`, `DocType` (orthogonal axes used across parse/classify/router); `Inventory`, the corpus snapshot that grounds the router |
 | `src/util/` | `fs.rs` (0700/0600 hardening for `~/.vault/`), `json.rs` (balanced-brace extraction from model replies), `path.rs` (`~` expansion), `probe.rs` (200ms loopback TCP probe for auto-mode) |
+
+### Router grounding
+
+The router is told what the store actually holds. `Store::inventory()` snapshots
+the distinct project names, languages, and doc_types that **have chunks**, and
+`build_user_prompt` renders that into the router's *user* turn:
+
+```
+Indexed in this vault:
+  projects:  vault
+  languages: markdown, rust, unknown
+  doc_types: convention, meta, plan
+```
+
+It goes in the user turn, never in `ROUTER_SYSTEM`: the system block is what the
+Haiku backend marks `cache_control: ephemeral`, and a per-machine corpus listing
+there would make the cache key per-machine.
+
+Grounding is an instruction, so it is backed by a deterministic check.
+`QueryPlan::retain_indexed` drops `languages`/`doc_types` values with no chunks
+before the plan reaches SQL. `QueryPlan::from_raw` cannot do this — it only drops
+labels outside the enums, and `Go` *is* a `Language`, so a router guessing `go`
+against a Rust-only vault produced an enum-valid filter matching zero rows. That
+was caught downstream by the relax-retry in `Store::hybrid_search`, but only
+after a wasted filtered pass, and that retry clears `languages` **and**
+`doc_types` together — so one bad language also discarded a good `doc_type`.
+
+Scope and invariants:
+
+- **`projects` is not pruned.** `existing_project_ids` already degrades unknown
+  names case-insensitively (`COLLATE NOCASE`); duplicating that would risk the
+  two matchers drifting apart.
+- **An empty `Inventory` means "unknown", not "nothing is indexed"** — it renders
+  no grounding and prunes nothing. The `Store::inventory` default returns empty,
+  so a backend that does not implement it keeps the old ungrounded behavior
+  instead of having every filter stripped.
+- **The snapshot is read once**, at `Vault::open`, and can go stale against a
+  concurrent sync. Re-reading per call would put SQLite back on `QueryPlanner`,
+  the `Send + Sync` half. Stale only costs plan quality; the store still filters.
+- **`Vault::open` now opens the store before building the planner**, since the
+  planner needs the snapshot.
+- Project names are attacker-influenced (a directory basename), unlike the two
+  enum-backed lists. Names carrying control characters are dropped rather than
+  escaped, and the listing is capped at `MAX_LISTED_PROJECTS`.
+
+`vault diagnose` prints the snapshot on an `indexed:` line, so a pruned filter is
+distinguishable from a filter the router never proposed.
 
 ### Router selection
 
@@ -107,9 +239,17 @@ Haiku impls set `cache_control: ephemeral` on the system block, but the marker i
 
 ```
 ~/.vault/vault.db      # SQLite store — projects (incl. projects.domain assignment), documents, chunks, FTS5, vec, retrieval_log; documents.content_hash is the classification/re-embed cache
+~/.vault/vault.db-wal  # WAL journal — created by SQLite while a connection is open, checkpointed away on clean close
+~/.vault/vault.db-shm  # WAL shared-memory index — same lifetime as the -wal file
 ~/.vault/vault.toml    # context-tag fallback, router/classifier mode, tuning defaults, backend config (hand-authored; vault writes it only via `vault configure` when absent — never otherwise)
 ~/.vault/hook.log      # hook telemetry — one JSONL record per hook call (outcome, stage, latency, backend); rotated to hook.log.1 at 5MB
 ```
+
+The two WAL sidecars are created by SQLite, not by vault: they inherit `vault.db`'s
+mode (measured `0600`) rather than going through `util::fs::harden_file`, and both
+disappear on a clean close. They matter in two places — a full reindex has to remove
+them alongside `vault.db` (`rm ~/.vault/vault.db*`), and a backup that copies only
+`vault.db` out from under a live connection is missing committed data.
 
 Nothing is written to indexed repositories.
 
@@ -144,13 +284,13 @@ See `docs/embeddings.md` for the full write-up. Current decisions (subject to ch
 
 - **Backend** — HuggingFace [text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference) (TEI), an official Rust HTTP server. Single binary, no Python deps, OpenAI-compatible `/embeddings` endpoint. Endpoint defaults to `http://localhost:8081`.
 - **Model** — `nomic-ai/nomic-embed-text-v1.5`. Apply the `search_document:` prefix at index time and `search_query:` at query time.
-- **Dimensions** — defaults to **768** (nomic-embed-text-v1.5). `chunks_vec` is created at the dim from `[embeddings].dims`, then **locked per-DB**: the first sync records `(model, dim)` in the `meta` table and later opens must match. Changing the model/dim means a full reindex (delete `~/.vault/vault.db` and re-sync). The schema no longer hardcodes 768 — only the config default does.
+- **Dimensions** — defaults to **768** (nomic-embed-text-v1.5). `chunks_vec` is created at the dim from `[embeddings].dims`, then **locked per-DB**: the first sync records `(model, dim)` in the `meta` table and later opens must match. Changing the model/dim means a full reindex — `rm ~/.vault/vault.db*` and re-sync; the glob is deliberate, since removing only the main file leaves a `-wal` still holding plaintext indexed content (not corrupting — SQLite discards an orphan WAL rather than replaying it — but not erased either). The schema no longer hardcodes 768 — only the config default does.
 
 `vault index sync` requires TEI reachable (hard error if not). At hook time, TEI unreachable falls under the same 3-second silent passthrough as any other backend failure.
 
 The remaining open knobs are empirical, not blocking:
 
-- α tuning (BM25 vs cosine weight) — start 0.6, validate with `vault diagnose`
+- α tuning (BM25 vs cosine weight) — 0.1, measured with `cargo test --lib alpha_sweep -- --ignored --nocapture`
 - Token budget ceiling — start 10k, validate with `vault diagnose`
 - Context block ordering — score-descending within project grouping for now
 
@@ -163,20 +303,64 @@ The remaining open knobs are empirical, not blocking:
 | contract | proto | per message/service/enum |
 | contract | openapi | per path+method, per schema component |
 | plan | any | whole file, unless over the embed ceiling → windowed (see below) |
-| convention | go/rust | per exported symbol + doc comment |
+| convention | go/rust | per top-level item and impl method, with its doc comment — **all visibilities**, not just `pub` |
 | convention/meta | markdown | per `##` heading block |
 | convention | scala | whole file (v1) |
 
-Whole-file fallback (`plan` docs and any file no structural parser claims) is **windowed**: content under `MAX_FALLBACK_CHUNK_TOKENS` (1500, well under nomic's 8192-token context) stays a single chunk — identical to the historical behavior — while larger content is greedily packed by whole lines into ordered, embeddable chunks. This keeps a large file from exceeding the embedder's input limit and aborting the whole document. A single line longer than the ceiling (minified blob, one-line log) is truncated head-only rather than char-split, so the per-chunk secret scan can't be bisected. The sync report counts windowed files and truncated lines.
+Rust chunking covers private items too. Gating on `pub` indexed the API
+surface, which is the wrong premise here: the questions asked of vault are about
+implementation, and 241 of this crate's 348 top-level items are private —
+`build_match_query` and `build_filter_clause` among them, invisible to
+retrieval. A private `mod` matches as well, which is what keeps the change safe:
+`ItemKind::Mod` emits the declaration and lets depth tracking skip the body, so
+`#[cfg(test)] mod tests` yields one small chunk rather than ~620 test fns.
+
+Whole-file fallback (`plan` docs, any file no structural parser claims, **and
+any file a parser claims but extracts nothing from**) is **windowed**: content under `MAX_FALLBACK_CHUNK_TOKENS` (1500, well under nomic's 8192-token context) stays a single chunk — identical to the historical behavior — while larger content is greedily packed by whole lines into ordered, embeddable chunks. This keeps a large file from exceeding the embedder's input limit and aborting the whole document. A single line longer than the ceiling (minified blob, one-line log) is truncated head-only rather than char-split, so the per-chunk secret scan can't be bisected. The sync report counts windowed files and truncated lines.
 
 ## Scoring & Tuning
 
 ```
 final_score = α * bm25_normalized + (1 - α) * cos_sim
-α = 0.6 (initial), MinChunkScore = 0.15, TokenBudget = 10_000
+α = 0.1, MinChunkScore = 0.15, TokenBudget = 10_000, MaxHits = uncapped
 ```
 
-Tune `alpha` via `vault diagnose "<prompt>" --alpha X` after seeding real data; the token budget is set in `vault.toml` (`defaults.token_budget`), not a diagnose flag. Budget fill is score-descending with `continue` (not `break`) on oversized chunks.
+Three independent limits bound the budget pass, all in `vault.toml` under `[defaults]`:
+
+| Knob | Default | Effect |
+|------|---------|--------|
+| `min_score` | `0.15` | drops a hit outright |
+| `token_budget` | `10000` | stops filling once the running token count would overflow |
+| `max_hits` | absent = uncapped | hard cap on the number of chunks, highest `final_score` first |
+
+`max_hits` is `Option<u16>`, `#[serde(default)]`, so an existing `vault.toml` without
+it keeps the historical uncapped behavior. Set it when you want a *few* strong chunks
+rather than as many as fit — a 10k budget will happily inject twenty mediocre ones.
+
+**α defaults to 0.1, and that is measured, not guessed.** The two arms are not
+comparable as written: `bm25_normalized` is divided by the result-set max so it
+spans 0–1, while `cosine` is used raw and its observed range on a real corpus is
+about 0.62–0.71. At α=0.6 that is 0.60 of BM25 variation against 0.04 of cosine
+— a nominal "60/40 blend" that behaves nearer 92/8. The golden fixtures
+(`src/retrieve/golden.toml`) put numbers on it, as rank-of-first-expected-chunk
+summed over five cases:
+
+| α | 0.6 | 0.4 | 0.3 | 0.2 | 0.15 | 0.1 | 0.05 | 0.0 |
+|---|-----|-----|-----|-----|------|-----|------|-----|
+| total | 11 | 9 | 9 | 9 | 8 | **7** | 6 | 20 |
+
+0.05 scores marginally better but is where the first case starts regressing, and
+**0.0 collapses**: with the keyword arm contributing nothing, three of five cases
+lose their answer entirely. The arm is load-bearing — it was just weighted about
+six times too heavily. 0.1 is the last value at which no case has regressed.
+
+Re-run the sweep after any change to scoring, chunking, or the embedding model:
+
+```bash
+cargo test --lib alpha_sweep -- --ignored --nocapture   # needs TEI
+```
+
+Tune `alpha` via `vault diagnose "<prompt>" --alpha X` after seeding real data; the other three are config-only, not diagnose flags. `vault diagnose` prints all four in its header and labels a trim `max_hits cap` or `min_score/budget` (`trim_cause`) — it separates the cap from the scoring limits, not `min_score` from `token_budget` — so a cap doing the cutting can't be mistaken for a scoring problem. Budget fill is score-descending with `continue` (not `break`) on oversized chunks, but `break`s once `max_hits` is reached, since nothing later can outrank what is already selected.
 
 ## Global Hook Registration
 
@@ -195,7 +379,9 @@ Tune `alpha` via `vault diagnose "<prompt>" --alpha X` after seeding real data; 
 
 ## Context Tags
 
-Tags are domain-level (not project-level). A project's domain is assigned during `vault index sync` and stored in `vault.db` (`projects.domain`); the hook derives the tag by convention as `{domain}-context`, falling back to `defaults.context_tag` when unassigned. Introducing a *new* domain requires adding a matching `## {domain}-context` section to `~/.claude/CLAUDE.md` (the single source of truth for what a tag means) — vault.toml is not involved.
+The wrapper tag is **constant** — `defaults.context_tag`, `vault-context` by default — and the domain rides as an attribute: `<vault-context domain="software">`. A project's domain is assigned during `vault index sync` and stored in `vault.db` (`projects.domain`); an unassigned project simply gets no attribute.
+
+This shape exists so `~/.claude/CLAUDE.md` needs **one** `## Vault Context` section, forever. The earlier design derived the tag as `{domain}-context` and required a matching section per domain, which drifted the moment a domain was added and never covered the unassigned fallback at all — context arrived with no data-not-instructions framing and nothing reported it.
 
 ## Security
 
@@ -210,6 +396,7 @@ Vault is on the hot path of every Claude Code prompt. Full design constraints, t
 - **Index-time secret pre-scan.** Chunks matching common secret patterns (AWS keys, GitHub/Anthropic/OpenAI tokens, JWT, PEM headers) are dropped before storage.
 - **Classifier sees filename + extension + first 1KB only**, never full files. Full content reaches Anthropic only via retrieval-time injection, which the user controls via `vault diagnose`.
 - **Hook fails open.** Any error → empty stdout, exit 0 — never block the user. Failures stay observable without breaking that contract: one stderr breadcrumb (visible only in Claude Code debug mode) plus a metadata-only JSONL record in `~/.vault/hook.log` — never prompt text, never chunk content; error detail truncated.
+- **Stub backends are `#[cfg(test)]`-gated on purpose.** `retrieve/router/stub.rs` and `index/classify/stub.rs` compile only under test, so the compiler enforces that a stub can never become a silent production fallback — with Gemma and the remote backend both unreachable, vault passes through (hook) or prompts/fails (sync), never guesses. `embed/stub.rs` is deliberately **not** test-gated: `vault diagnose --stub` exposes `StubEmbedder` in release builds to trace retrieval plumbing without TEI, and says so in its output. Its gate is `#[cfg(any(feature = "cli", test))]` — it ships in every release build that has a CLI, which is exactly when `--stub` exists, and is absent only from a `--no-default-features` library build where `diagnose` does not exist either. Don't "resolve" that asymmetry by making it `#[cfg(test)]` or by un-gating the router/classifier stubs.
 - **`~/.claude/settings.json` should reference vault by absolute path** (not `vault hook` resolved via PATH).
 
 ## v1 Scope Boundaries

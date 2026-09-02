@@ -8,13 +8,13 @@
 //! best-effort — every failure inside this module is swallowed, because
 //! fail-open applies to the logger too.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::Outcome;
-use crate::util::fs::{harden_dir, harden_file};
+use crate::util::fs::{harden_dir, harden_file, open_private_append};
 
 const LOG_FILE: &str = "hook.log";
 const ROTATED_FILE: &str = "hook.log.1";
@@ -63,11 +63,34 @@ struct Record<'a> {
     tokens: Option<u32>,
 }
 
+/// Where this record should be written.
+///
+/// `dir` is the loaded `Config`'s vault directory when there was one, and the
+/// fallback to `$HOME/.vault` is load-bearing rather than laziness: this
+/// function exists to record failures, and "`vault.toml` could not be loaded"
+/// is one of them. Reading the config unconditionally would silently stop
+/// logging exactly the errors the log exists to capture.
+///
+/// Today `hook::run` is the only caller and it always resolves `~/.vault`
+/// anyway, so the two agree. The parameter exists so they still agree once
+/// something passes an explicit directory — `vault hook --config <dir>`, or a
+/// consumer built on `Config::from_path`, which relocates `vault.db` but would
+/// otherwise leave the log behind in `$HOME`.
+fn log_dir(dir: Option<&Path>) -> Option<PathBuf> {
+    dir.map(Path::to_path_buf)
+        .or_else(crate::config::vault_dir_path)
+}
+
 /// Append one record for this invocation. Failures here are deliberately
 /// ignored — the hook must never fail (or block) because its own diagnostics
 /// couldn't be written.
-pub(crate) fn append_best_effort(outcome: &Outcome, tel: &Telemetry, total: Duration) {
-    let Some(dir) = crate::config::vault_dir_path() else {
+pub(crate) fn append_best_effort(
+    outcome: &Outcome,
+    tel: &Telemetry,
+    total: Duration,
+    dir: Option<&Path>,
+) {
+    let Some(dir) = log_dir(dir) else {
         return;
     };
     let now_secs = SystemTime::now()
@@ -134,7 +157,7 @@ fn append_to(dir: &Path, line: &str, max_bytes: u64) {
         let _ = fs::remove_file(&rotated);
         let _ = fs::rename(&path, &rotated);
     }
-    let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) else {
+    let Ok(mut f) = open_private_append(&path) else {
         return;
     };
     let _ = f.write_all(line.as_bytes());
@@ -176,6 +199,46 @@ fn iso8601_utc(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- log destination (code-review finding 8) -----
+
+    /// An explicit directory wins, so the log lands beside the database rather
+    /// than wherever `$HOME` points. Latent today — `hook::run` is the only
+    /// caller and it resolves `~/.vault` anyway — but `Config::from_path`
+    /// relocates `vault.db`, and without this the telemetry would stay behind.
+    #[test]
+    fn an_explicit_directory_is_used_verbatim() {
+        let explicit = Path::new("/srv/vault-data");
+        assert_eq!(log_dir(Some(explicit)), Some(explicit.to_path_buf()));
+    }
+
+    /// The fallback is load-bearing, not laziness. This module exists to record
+    /// failures, and "`vault.toml` could not be loaded" is one of them — that
+    /// path has no `Config` to ask, so it passes `None`. Dropping the fallback
+    /// would silently stop logging exactly the errors the log is for.
+    #[test]
+    fn no_config_still_resolves_a_destination() {
+        match crate::config::home_dir() {
+            Some(home) => assert_eq!(log_dir(None), Some(home.join(".vault"))),
+            // No `$HOME` either: returning `None` is correct — the caller then
+            // skips writing rather than guessing a path.
+            None => assert_eq!(log_dir(None), None),
+        }
+    }
+
+    /// An explicit directory is honoured even where `$HOME` would also resolve,
+    /// i.e. the fallback never overrides a caller that said where to write.
+    #[test]
+    fn the_fallback_never_overrides_an_explicit_directory() {
+        let explicit = Path::new("/srv/vault-data");
+        let chosen = log_dir(Some(explicit)).expect("explicit dir");
+        if let Some(home) = crate::config::home_dir() {
+            assert!(
+                !chosen.starts_with(home),
+                "explicit dir must not resolve under $HOME: {chosen:?}"
+            );
+        }
+    }
     use crate::hook::{SkipReason, Stage};
     use std::path::PathBuf;
 

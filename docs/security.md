@@ -187,6 +187,8 @@ Vault creates and maintains:
 ```
 ~/.vault/                  mode 0700  (user-only)
 ~/.vault/vault.db          mode 0600  (user-only read/write)
+~/.vault/vault.db-wal      mode 0600  (SQLite-created; inherits vault.db's mode)
+~/.vault/vault.db-shm      mode 0600  (SQLite-created; inherits vault.db's mode)
 ~/.vault/vault.toml        mode 0600
 ```
 
@@ -194,6 +196,25 @@ Vault creates and maintains:
 conventions). Permissions stop other local users from reading it; disk-level
 encryption (FileVault, BitLocker, dm-crypt) is the user's responsibility for
 stolen-laptop scenarios.
+
+The two WAL sidecars appeared when the store moved to `journal_mode=WAL`. They are
+worth naming explicitly because vault does **not** harden them: `util::fs::harden_file`
+runs on `vault.db`, and SQLite creates `-wal`/`-shm` itself, taking the main
+database's mode. Measured through `VaultStore::open` under `umask 022`, all three
+land at `0600` — the inheritance holds — but it is SQLite's behaviour rather than a
+vault-enforced invariant, so a future backend or SQLite change could weaken it
+without any vault code changing. `wal_sidecars_inherit_the_hardened_db_mode` in
+`src/store/sqlite_store.rs` measures all three modes through the real `open()` path
+and holds the store open so the sidecars still exist — that test, not this
+paragraph, is what keeps the claim true.
+
+The sidecars carry a second consequence. They exist only while a connection is open
+and are checkpointed away on a clean close, so `~/.vault/` usually shows just
+`vault.db` — but a crashed or still-running process leaves a `-wal` holding committed
+plaintext chunk content. Deleting `vault.db` alone therefore does not erase the index
+content from disk. SQLite discards an orphan WAL rather than replaying it, so this is
+a disclosure concern and not a corruption one; the fix is to always wipe with
+`rm ~/.vault/vault.db*`.
 
 ---
 

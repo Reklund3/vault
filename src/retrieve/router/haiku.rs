@@ -8,6 +8,7 @@ use crate::retrieve::RouterOutput;
 use crate::retrieve::router::{
     ROUTER_SYSTEM, Router, RouterError, build_user_prompt, parse_response,
 };
+use crate::types::Inventory;
 
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -24,7 +25,8 @@ const MAX_TOKENS: u32 = 256;
 pub(crate) struct HaikuRouter {
     model: String,
     api_key: String,
-    http: Client,
+    http: &'static Client,
+    timeout: Duration,
 }
 
 impl HaikuRouter {
@@ -37,14 +39,16 @@ impl HaikuRouter {
         timeout: Duration,
     ) -> Result<Self, RouterError> {
         let api_key = require_api_key(std::env::var("ANTHROPIC_API_KEY").ok())?;
-        let http = Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| RouterError::Transport(e.to_string()))?;
+        // One process-wide client (see `util::http`): the timeout was the only
+        // thing that ever differed between these, and it rides on the request.
+        let http = crate::util::http::shared().ok_or_else(|| {
+            RouterError::Transport("could not construct the shared HTTP client".to_string())
+        })?;
         Ok(Self {
             model: resolve_model(config.router_model()),
             api_key,
             http,
+            timeout,
         })
     }
 }
@@ -54,8 +58,8 @@ impl Router for HaikuRouter {
         "haiku"
     }
 
-    fn plan(&self, prompt: &str) -> Result<RouterOutput, RouterError> {
-        let user = build_user_prompt(prompt);
+    fn plan(&self, prompt: &str, inventory: &Inventory) -> Result<RouterOutput, RouterError> {
+        let user = build_user_prompt(prompt, inventory);
         let request = MessagesRequest {
             model: &self.model,
             max_tokens: MAX_TOKENS,
@@ -75,6 +79,7 @@ impl Router for HaikuRouter {
         let resp = self
             .http
             .post(ANTHROPIC_URL)
+            .timeout(self.timeout)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .json(&request)
@@ -264,7 +269,10 @@ mod tests {
         let config = Config::default();
         let router = HaikuRouter::from_config_with_timeout(&config, LIVE_TIMEOUT).expect("client");
         let out = router
-            .plan("How does the BuildRequest proto handle retries?")
+            .plan(
+                "How does the BuildRequest proto handle retries?",
+                &Inventory::default(),
+            )
             .expect("plan");
         let _ = out;
     }
@@ -278,7 +286,7 @@ mod tests {
         // produces that shape for a trivial prompt, so the skip path fires.
         let config = Config::default();
         let router = HaikuRouter::from_config_with_timeout(&config, LIVE_TIMEOUT).expect("client");
-        let out = router.plan("hi").expect("plan");
+        let out = router.plan("hi", &Inventory::default()).expect("plan");
         assert!(
             matches!(out, RouterOutput::Skip),
             "expected Skip for trivial prompt, got {:?}",

@@ -22,7 +22,8 @@ pub(crate) struct OpenAiCompatClassifier {
     model: String,
     api_key: String,
     auth: AuthHeader,
-    http: Client,
+    http: &'static Client,
+    timeout: Duration,
 }
 
 /// Auth header style: `Bearer` (AI Studio Gemini) or `XGoogApiKey` (Vertex
@@ -54,16 +55,18 @@ impl OpenAiCompatClassifier {
         let env_var = config.classifier_api_key_env();
         let api_key = require_api_key(std::env::var(env_var).ok(), env_var)?;
         let model = require_model(config.classifier_model())?;
-        let http = Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| ClassifyError::Transport(e.to_string()))?;
+        // One process-wide client (see `util::http`): the timeout was the only
+        // thing that ever differed between these, and it rides on the request.
+        let http = crate::util::http::shared().ok_or_else(|| {
+            ClassifyError::Transport("could not construct the shared HTTP client".to_string())
+        })?;
         Ok(Self {
             url: chat_completions_url(config.classifier_base_url()),
             model,
             api_key,
             auth: AuthHeader::parse(config.classifier_auth_header()),
             http,
+            timeout,
         })
     }
 }
@@ -87,7 +90,7 @@ impl Classifier for OpenAiCompatClassifier {
             ],
         };
 
-        let req = self.http.post(&self.url);
+        let req = self.http.post(&self.url).timeout(self.timeout);
         let req = match self.auth {
             AuthHeader::Bearer => req.header("Authorization", format!("Bearer {}", self.api_key)),
             AuthHeader::XGoogApiKey => req.header("x-goog-api-key", &self.api_key),

@@ -1,0 +1,63 @@
+# Golden retrieval fixtures — the ground truth review finding C2 asked for.
+#
+# `corpus` is the set of real source files indexed into a throwaway store before
+# the cases run. Real files, not synthetic ones: the point is to measure against
+# the corpus vault actually serves. Keep it small enough to embed quickly and
+# broad enough that a case has to discriminate.
+#
+# Each `[[case]]` asserts on chunk **labels**, never on content. Labels survive
+# ordinary edits; bodies do not, and a fixture that breaks on every refactor
+# gets deleted rather than fixed.
+
+corpus = [
+  "src/retrieve/mod.rs",
+  "src/retrieve/router/mod.rs",
+  "src/retrieve/hybrid.rs",
+  "src/retrieve/budget.rs",
+  "src/store/sqlite_store.rs",
+  "src/index/secrets.rs",
+  "src/parse/markdown.rs",
+  "src/vault.rs",
+  "src/config.rs",
+]
+
+# The prompt this whole tuning session ran on. Its answer is a private free
+# function plus two public ones, so it fails if the parser regresses to
+# exported-only, and it fails if the scoring arms go back out of balance.
+[[case]]
+name    = "router backend selection"
+prompt  = "how does the router function pick a backend?"
+topics  = ["routing", "backend selection"]
+expect  = ["fn resolve_backend", "fn build_router", "trait Router"]
+
+# The keyword arm's job. An exact identifier must reach its own definition,
+# not just the chunks that mention it most often.
+[[case]]
+name       = "exact type lookup"
+prompt     = "what fields does QueryPlan have?"
+type_names = ["QueryPlan"]
+expect     = ["struct QueryPlan", "QueryPlan::retain_indexed"]
+
+# Answer lives in a private free function. Pure regression guard for the
+# visibility gate — before 2026-08-23 these chunks did not exist.
+[[case]]
+name    = "private implementation detail"
+prompt  = "how is the FTS5 match query built from the plan?"
+topics  = ["FTS5", "match query"]
+expect  = ["fn build_match_query", "fn escape_fts_token"]
+
+# Cross-cutting concept with no single obvious home; the semantic arm has to
+# carry this one, since "secret" appears in several unrelated places.
+[[case]]
+name    = "secret scanning"
+prompt  = "how are credentials kept out of the index?"
+topics  = ["secrets", "credentials"]
+expect  = ["fn looks_like_secret"]
+
+# Scoring maths. Named after nothing in particular, so keyword matching is
+# weak and this leans on cosine.
+[[case]]
+name    = "score blending"
+prompt  = "how are the two retrieval scores combined into one ranking?"
+topics  = ["scoring", "ranking"]
+expect  = ["fn merge"]
